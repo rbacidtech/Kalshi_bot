@@ -86,7 +86,7 @@ class KalshiWebSocket:
 
     @property
     def _ws_url(self) -> str:
-        return _WS_DEMO if self.paper else _WS_LIVE
+        return _WS_LIVE
 
     # ── Public API ────────────────────────────────────────────────────────────
 
