@@ -1,8 +1,7 @@
 .env
 private_key.pem
 *.pem
-*.key
-output/
 __pycache__/
 .venv/
+output/
 *.pyc
