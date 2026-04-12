@@ -26,7 +26,7 @@ from kalshi_bot.auth      import KalshiAuth, NoAuth
 from kalshi_bot.client    import KalshiClient
 from kalshi_bot.state     import BotState, PositionState, TradeEvent
 from kalshi_bot.websocket import KalshiWebSocket
-from kalshi_bot.strategy  import fetch_signals, scan_fomc_markets
+from kalshi_bot.strategy  import fetch_signals, scan_all_markets
 from kalshi_bot.executor  import Executor
 from kalshi_bot.risk      import RiskManager, RiskConfig
 from kalshi_bot.logger    import setup_logging, DailySummary, CycleTimer
@@ -150,13 +150,13 @@ def run():
                 # Scan markets + register with WebSocket
                 markets = []
                 try:
-                    markets = scan_fomc_markets(client)
+                    markets = scan_all_markets(client)
                     ws.subscribe_tickers([m["ticker"] for m in markets])
                     for m in markets:
                         state.update_market(
                             m["ticker"],
                             title      = m.get("title", ""),
-                            last_price = m.get("last_price", 50),
+                            last_price = int(float(m.get("last_price_dollars") or m.get("yes_bid_dollars") or "0.50") * 100),
                         )
                 except Exception:
                     log.exception("Market scan failed.")
@@ -166,7 +166,13 @@ def run():
                 try:
                     signals = fetch_signals(
                         client,
-                        edge_threshold = cfg.EDGE_THRESHOLD,
+                        edge_threshold  = cfg.EDGE_THRESHOLD,
+                        fred_api_key    = os.getenv("FRED_API_KEY", "1f665e6cab7f604a5c4a9092c90ca0c1"),
+                        current_rate    = 3.75,
+                        enable_fomc     = True,
+                        enable_weather  = True,
+                        enable_economic = True,
+                        enable_sports   = True,
                         max_contracts  = cfg.MAX_CONTRACTS,
                         min_confidence = cfg.MIN_CONFIDENCE,
                     )

@@ -56,7 +56,8 @@ class KalshiClient:
         self.timeout     = timeout
         self.max_retries = max_retries
         self.backoff     = backoff
-        self._semaphore  = asyncio.Semaphore(concurrency)
+        self._concurrency = concurrency
+        self._semaphore = None
         self._session    = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
@@ -114,6 +115,10 @@ class KalshiClient:
         url      = self.base_url + path
         api_path = self._api_path(path)
 
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._concurrency)
+        if self._semaphore is None or self._semaphore._loop != asyncio.get_event_loop():
+            self._semaphore = asyncio.Semaphore(self._concurrency)
         async with self._semaphore:
             for attempt in range(self.max_retries + 1):
                 if attempt > 0:
