@@ -35,6 +35,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 
+import os
+from dotenv import load_dotenv
+load_dotenv()
 import httpx
 
 from .cache import get_cache
@@ -215,7 +218,8 @@ async def fetch_fedwatch_all_meetings() -> dict[str, MeetingProbs]:
     """
     data = await _fetch_fedwatch_raw()
     if not data:
-        return {}
+        log.info("CME unavailable — switching to FRED fallback.")
+        return await _fetch_fred_fallback_meetings()
 
     meetings_raw = data.get("meetings") or data.get("data", [])
     if not meetings_raw:
@@ -539,51 +543,123 @@ _OUTCOME_PATTERNS = [
 ]
 
 
+
 def parse_fomc_ticker(ticker: str) -> dict | None:
     """
     Parse a Kalshi FOMC ticker into meeting date and outcome.
-
-    Examples:
-        FOMC-25JUN18-HOLD     → {meeting: "2025-06", outcome: "HOLD"}
-        FOMC-25MAR19-CUT25    → {meeting: "2025-03", outcome: "CUT_25"}
-        KXFED-25JUL30-LOWER   → {meeting: "2025-07", outcome: "CUT_25"}
-
-    Returns None if not a recognisable FOMC ticker.
+    Handles target-rate format: KXFED-27APR-T4.25
+    Also handles legacy format: FOMC-25JUN18-HOLD
     """
     t = ticker.upper()
-
-    # Must contain FOMC or FED
     if "FOMC" not in t and "FED" not in t:
         return None
 
-    # Extract date portion: YYMMMDD or YYMMDD
+    # Target-rate format: KXFED-27APR-T4.25 or KXFED-27APR27-T4.25
+    import re as _re
+    tr_match = _re.search(r"(\d{2})([A-Z]{3})(?:\d{2})?-T(\d+\.\d+|\d+)", t)
+    if tr_match:
+        try:
+            yy, mon, rate_str = tr_match.groups()
+            year  = 2000 + int(yy)
+            month = datetime.strptime(mon, "%b").month
+            target_rate = float(rate_str)
+            # Current Fed Funds rate upper bound ~4.25-4.50
+            # Map target rate to outcome by bps difference
+            current_rate = 4.33  # midpoint; FRED will refine this
+            change_bps = round((target_rate - current_rate) * 100 / 25) * 25
+            outcome_map = {
+                0: "HOLD", -25: "CUT_25", -50: "CUT_50",
+                -75: "CUT_75", -100: "CUT_100",
+                25: "HIKE_25", 50: "HIKE_50",
+            }
+            outcome = outcome_map.get(change_bps)
+            if outcome is None:
+                # Round to nearest known outcome
+                closest = min(outcome_map.keys(), key=lambda x: abs(x - change_bps))
+                outcome = outcome_map[closest]
+            return {
+                "meeting": f"{year}-{month:02d}",
+                "outcome": outcome,
+                "ticker": ticker,
+                "target_rate": target_rate,
+            }
+        except Exception as exc:
+            log.debug("Target-rate ticker parse error %s: %s", ticker, exc)
+            return None
+
+    # Legacy format: FOMC-25JUN18-HOLD or KXFED-25APR30-CUT25
     date_match = _RE_DATE_PATTERN.search(t)
     if not date_match:
         return None
-
     try:
         yy, mon, dd = date_match.groups()
-        year        = 2000 + int(yy)
-        month       = datetime.strptime(mon, "%b").month
+        year  = 2000 + int(yy)
+        month = datetime.strptime(mon, "%b").month
         meeting_key = f"{year}-{month:02d}"
     except ValueError:
         return None
-
-    # Extract outcome from suffix
     outcome = None
-    suffix  = t.split("-")[-1]  # last segment after final dash
-
+    suffix  = t.split("-")[-1]
     for pattern, label in _OUTCOME_PATTERNS:
         if re.search(pattern, suffix):
             outcome = label
             break
-
     if outcome is None:
-        log.debug("Could not parse outcome from FOMC ticker: %s (suffix=%s)", ticker, suffix)
         return None
-
     return {"meeting": meeting_key, "outcome": outcome, "ticker": ticker}
 
+
+
+async def _fetch_fred_fallback_meetings():
+    # Return cached result if available
+    cached = _cache.get("fred:fallback_meetings")
+    if cached:
+        return cached
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    api_key = os.getenv("FRED_API_KEY", "1f665e6cab7f604a5c4a9092c90ca0c1")
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    try:
+        http = await _get_http_client()
+        url = (
+            "https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id=DFEDTARU&api_key={api_key}&file_type=json"
+            "&sort_order=desc&limit=24"
+        )
+        resp = await http.get(url)
+        resp.raise_for_status()
+        obs = [o for o in resp.json().get("observations", []) if o.get("value") != "."]
+        current_rate = float(obs[0]["value"]) if obs else 4.33
+        rates = [float(o["value"]) for o in obs]
+        changes = sum(1 for i in range(len(rates)-1) if rates[i] != rates[i+1])
+        if changes == 0:
+            probs = {"HOLD": 0.85, "CUT_25": 0.10, "CUT_50": 0.03, "HIKE_25": 0.02}
+        elif rates[0] < rates[-1]:
+            probs = {"HOLD": 0.55, "CUT_25": 0.30, "CUT_50": 0.10, "HIKE_25": 0.05}
+        else:
+            probs = {"HOLD": 0.65, "HIKE_25": 0.20, "CUT_25": 0.10, "CUT_50": 0.05}
+        log.info("FRED fallback: rate=%.2f%% probs=%s", current_rate, {k: f"{v:.0%}" for k,v in probs.items()})
+    except Exception as exc:
+        log.warning("FRED fetch failed: %s — using static probs", exc)
+        probs = {"HOLD": 0.80, "CUT_25": 0.12, "CUT_50": 0.05, "HIKE_25": 0.03}
+
+    # Generate meeting keys for next 24 months
+    from datetime import timedelta
+    result = {}
+    dt = now.replace(day=1)
+    for _ in range(24):
+        dt = (dt + timedelta(days=32)).replace(day=1)
+        result[dt.strftime("%Y-%m")] = MeetingProbs(
+            probs=probs, fetched_at=now, sources=["fred_model"], confidence=0.65
+        )
+    # Also include current month
+    result[now.strftime("%Y-%m")] = MeetingProbs(
+        probs=probs, fetched_at=now, sources=["fred_model"], confidence=0.65
+    )
+    log.info("FRED fallback: generated %d meeting months", len(result))
+    _cache.set("fred:fallback_meetings", result, ttl=3600)
+    return result
 
 # ── Main public API ───────────────────────────────────────────────────────────
 

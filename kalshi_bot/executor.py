@@ -18,6 +18,7 @@ CSV log now includes both entry and exit records.
 import csv
 import logging
 import datetime
+from datetime import timezone
 from pathlib import Path
 
 import requests

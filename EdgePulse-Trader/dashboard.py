@@ -120,7 +120,7 @@ session_pnl=c2d(state.get("session_pnl",0))
 unreal_pnl=c2d(state.get("unrealized_pnl",0))
 cycle_count=state.get("cycle_count",0)
 signals_raw=state.get("signals") or []
-markets_raw=state.get("markets") or {}
+markets_raw={k:v for k,v in (state.get("markets") or {}).items() if "KXFED" in k or "FOMC" in k}
 positions_raw=state.get("positions") or {}
 recent_trades_raw=state.get("recent_trades") or []
 
