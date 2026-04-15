@@ -93,6 +93,7 @@ async def intel_main() -> None:
 
     summary:           DailySummary   = DailySummary()
     markets_cache:     List[dict]     = []
+    fomc_cache:        List[dict]     = []   # KXFED markets — refreshed with markets_cache
     markets_last_scan: float          = 0.0
     intel_consumer     = f"{NODE_ID}-intel"
 
@@ -129,6 +130,15 @@ async def intel_main() -> None:
                     log.info("Market rescan: %d markets", len(markets_cache))
                 except Exception:
                     log.exception("Market scan failed.")
+                try:
+                    kxfed_resp = client.get(
+                        "/markets",
+                        params={"status": "open", "series_ticker": "KXFED", "limit": 200},
+                    )
+                    fomc_cache = kxfed_resp.get("markets", [])
+                    log.debug("FOMC cache refreshed: %d markets", len(fomc_cache))
+                except Exception:
+                    log.debug("FOMC cache refresh failed — close_time may be null")
 
             # ── Publish price snapshot to Redis (Exec uses this for exits) ────
             snapshot = PriceSnapshot(source_node=NODE_ID)
@@ -232,10 +242,12 @@ async def intel_main() -> None:
                     log.exception("BTC signal generation failed.")
 
             # ── Publish Kalshi signals to Redis ───────────────────────────────
-            # Pre-build close_time lookup from markets_cache (avoids O(n²) scan)
+            # Pre-build close_time lookup from both the generic market cache and
+            # the FOMC-specific cache (KXFED tickers come from a separate targeted
+            # fetch, not the generic scan_all_markets page).
             close_time_map = {
                 m["ticker"]: m.get("close_time") or m.get("expiration_time")
-                for m in markets_cache
+                for m in (*markets_cache, *fomc_cache)
             }
 
             published = 0
