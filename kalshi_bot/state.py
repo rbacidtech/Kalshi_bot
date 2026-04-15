@@ -171,7 +171,8 @@ class BotState:
             self.last_cycle_at = datetime.datetime.now(timezone.utc)
 
     def set_ws_connected(self, connected: bool):
-        self.ws_connected = connected
+        with self._lock:
+            self.ws_connected = connected
         self._emit("ws_status", connected)
 
     # ── Pub/sub for alerts and dashboard ──────────────────────────────────────

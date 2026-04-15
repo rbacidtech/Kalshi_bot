@@ -2,6 +2,9 @@
 requests>=2.31.0
 httpx>=0.27.0
 
+# Redis (EdgePulse distributed bus — requires redis>=4.2 for redis.asyncio)
+redis>=4.2.0
+
 # Auth
 cryptography>=42.0.0
 
@@ -16,6 +19,11 @@ websocket-client>=1.7.0
 
 # Dashboard
 flask>=3.0.0
+streamlit>=1.35.0
 
 # Alerts (optional)
 twilio>=8.0.0
+
+# EdgePulse additions
+anthropic>=0.40.0           # LLM policy agent (llm_agent.py)
+prometheus-client>=0.20.0   # Metrics server (ep_metrics.py)

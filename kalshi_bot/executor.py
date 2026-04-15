@@ -16,6 +16,7 @@ CSV log now includes both entry and exit records.
 """
 
 import csv
+import json
 import logging
 import datetime
 from datetime import timezone
@@ -67,6 +68,8 @@ class Executor:
 
         self._held: set[str]                     = set()   # entered this cycle
         self._positions: dict[str, dict]         = {}      # ticker → position info
+        self._positions_file = Path(trades_csv).parent / "paper_positions.json"
+        self._load_paper_positions()
         self._ensure_csv()
 
     # ── CSV ───────────────────────────────────────────────────────────────────
@@ -124,6 +127,17 @@ class Executor:
         if signal.ticker in self._held:
             log.debug("Skipping %s — already entered this cycle.", signal.ticker)
             return False
+        if signal.ticker in self._positions:
+            log.debug("Skipping %s — already in positions.", signal.ticker)
+            return False
+        # Hard exposure cap — stop new entries if total paper exposure > $12
+        total_exposure = sum(
+            p.get("entry_cents", 50) * p.get("contracts", 1) / 100
+            for p in self._positions.values()
+        )
+        if total_exposure > 800.00:
+            log.debug("Skipping %s — exposure cap reached ($%.2f > $800.00).", signal.ticker, total_exposure)
+            return False
 
         if self.paper:
             success = self._paper_entry(signal)
@@ -139,8 +153,9 @@ class Executor:
                 "fair_value":    signal.fair_value,
                 "meeting":       signal.meeting,
                 "outcome":       signal.outcome,
-                "entered_at":    datetime.datetime.now(timezone.utc),
+                "entered_at":    datetime.datetime.now(timezone.utc).isoformat(),
             }
+            self._save_paper_positions()
 
         return success
 
@@ -185,6 +200,84 @@ class Executor:
 
     # ── Exit management ───────────────────────────────────────────────────────
 
+
+    def _sync_positions_from_kalshi(self):
+        """On startup, load open positions from Kalshi so exits work after restarts."""
+        try:
+            resp = self.client.get("/portfolio/positions")
+            positions = resp.get("market_positions", [])
+            loaded = 0
+            for p in positions:
+                ticker = p.get("ticker", "")
+                net = p.get("position", 0)
+                if net == 0:
+                    continue
+                side = "yes" if net > 0 else "no"
+                contracts = abs(net)
+                avg_price = p.get("market_exposure", 0)
+                entry_cents = round((avg_price / contracts)) if contracts else 50
+                self._positions[ticker] = {
+                    "side": side,
+                    "contracts": contracts,
+                    "entry_cents": entry_cents,
+                    "fair_value": 0.5,
+                    "meeting": "",
+                    "outcome": "",
+                }
+                loaded += 1
+            if loaded:
+                log.info("Synced %d open positions from Kalshi on startup", loaded)
+        except Exception as e:
+            log.warning("Could not sync positions from Kalshi: %s", e)
+
+
+    def _load_paper_positions(self):
+        try:
+            if self._positions_file.exists():
+                self._positions = json.loads(self._positions_file.read_text())
+                if self._positions:
+                    log.info("Loaded %d paper positions from disk", len(self._positions))
+                    # Sync loaded positions into BotState so dashboard shows them
+                    from .state import PositionState
+                    import datetime
+                    for _ticker, _pos in self._positions.items():
+                        try:
+                            self.state.open_position(PositionState(
+                                ticker      = _ticker,
+                                side        = _pos.get("side", "yes"),
+                                contracts   = int(_pos.get("contracts", 1)),
+                                entry_cents = int(_pos.get("entry_cents", 50)),
+                                entry_time  = datetime.datetime.now(datetime.timezone.utc),
+                                fair_value  = float(_pos.get("fair_value", 0.5)),
+                            ))
+                        except Exception as _e:
+                            log.debug("State sync skipped %s: %s", _ticker, _e)
+            elif not self.paper:
+                resp = self.client.get("/portfolio/positions")
+                for p in resp.get("market_positions", []):
+                    net = p.get("position", 0)
+                    if net == 0: continue
+                    side = "yes" if net > 0 else "no"
+                    contracts = abs(net)
+                    exposure = p.get("market_exposure", 0)
+                    self._positions[p.get("ticker","")] = {
+                        "side": side, "contracts": contracts,
+                        "entry_cents": round(exposure/contracts) if contracts else 50,
+                        "fair_value": 0.5, "meeting": "", "outcome": "",
+                    }
+                if self._positions:
+                    log.info("Synced %d live positions from Kalshi", len(self._positions))
+        except Exception as e:
+            log.warning("Could not load positions: %s", e)
+
+    def _save_paper_positions(self):
+        try:
+            self._positions_file.parent.mkdir(parents=True, exist_ok=True)
+            self._positions_file.write_text(json.dumps(self._positions, indent=2))
+            log.debug("Saved %d positions to disk", len(self._positions))
+        except Exception as e:
+            log.warning("Could not save positions: %s", e, exc_info=True)
+
     def check_exits(self, current_markets: list[dict], current_signals: list[Signal]):
         """
         Review open positions each cycle and exit where warranted.
@@ -197,7 +290,13 @@ class Executor:
             return
 
         # Build all lookup maps once before the position loop — O(markets) not O(markets*positions)
-        price_map      = {m["ticker"]: m.get("last_price", 50) for m in current_markets}
+        price_map      = {
+            m["ticker"]: int(float(
+                m.get("last_price_dollars") or m.get("yes_bid_dollars")
+                or m.get("last_price") or m.get("yes_price") or "0.50"
+            ) * 100)
+            for m in current_markets
+        }
         close_time_map = {
             m["ticker"]: m.get("close_time") or m.get("expiration_time")
             for m in current_markets
@@ -241,12 +340,15 @@ class Executor:
                     log.debug('close_time parse error: %s', exc)
 
             # Take profit
-            if exit_reason is None and move_cents >= self.take_profit_cents:
-                exit_reason = f"take profit (+{move_cents}¢)"
+            fv_cents  = int(pos.get("fair_value", 0.80) * 100)
+            tp_target = max(self.take_profit_cents, int((fv_cents - entry_cents) * 0.50))
+            sl_pct   = 0.50 if entry_cents < 30 else 0.30 if entry_cents < 60 else 0.20
+            sl_cents = max(self.stop_loss_cents, int(entry_cents * sl_pct))
+            if exit_reason is None and move_cents >= tp_target:
+                exit_reason = f"take profit (+{move_cents}¢ of {tp_target}¢ target)"
 
-            # Stop loss
-            elif exit_reason is None and move_cents <= -self.stop_loss_cents:
-                exit_reason = f"stop loss ({move_cents}¢)"
+            elif exit_reason is None and move_cents <= -sl_cents:
+                exit_reason = f"stop loss ({move_cents}¢ of -{sl_cents}¢ threshold)"
 
             # Model reversal: updated fair value now favors the other side
             elif exit_reason is None and ticker in fv_map:
@@ -275,17 +377,19 @@ class Executor:
 
         # Build a minimal Signal for logging
         exit_signal = Signal(
-            ticker       = ticker,
-            title        = "",
-            meeting      = pos["meeting"],
-            outcome      = pos["outcome"],
-            side         = exit_side,
-            fair_value   = pos["fair_value"],
-            market_price = current_cents / 100,
-            edge         = 0.0,
-            contracts    = contracts,
-            confidence   = 0.0,
-            model_source = f"exit: {reason}",
+            ticker            = ticker,
+            title             = "",
+            category          = pos.get("category", "fomc"),
+            meeting           = pos.get("meeting", ""),
+            outcome           = pos.get("outcome", ""),
+            side              = exit_side,
+            fair_value        = pos.get("fair_value", 0.5),
+            market_price      = current_cents / 100,
+            edge              = 0.0,
+            fee_adjusted_edge = 0.0,
+            contracts         = contracts,
+            confidence        = 0.0,
+            model_source      = f"exit: {reason}",
         )
 
         if self.paper:
@@ -320,5 +424,6 @@ class Executor:
 
         # Remove from tracked positions and update shared state P&L
         del self._positions[ticker]
+        self._save_paper_positions()
         if self.state is not None:
             self.state.close_position(ticker, current_cents)

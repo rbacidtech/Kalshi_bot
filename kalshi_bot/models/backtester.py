@@ -172,13 +172,13 @@ class LiveBacktester:
             trade.resolved = True
 
             if trade.won:
-                # Profit: (100 - entry_price) * contracts - fees
-                profit          = (100 - trade.price_cents) * trade.contracts
-                trade.pnl_cents = profit - self.fee_cents * trade.contracts
+                # Profit: net winnings after 7% Kalshi fee on net winnings only
+                gross_win       = (100 - trade.price_cents) * trade.contracts
+                fee             = int(gross_win * self.fee_cents / 100)
+                trade.pnl_cents = gross_win - fee
             else:
-                # Loss: entry_price * contracts + fees
-                trade.pnl_cents = -(trade.price_cents * trade.contracts +
-                                    self.fee_cents * trade.contracts)
+                # Loss: only the cost of contracts — no fee charged on losing side
+                trade.pnl_cents = -(trade.price_cents * trade.contracts)
 
         return trades
 
@@ -198,7 +198,11 @@ class LiveBacktester:
         report.avg_edge     = sum(t.edge for t in resolved) / max(len(resolved), 1)
         report.total_pnl_cents = sum(t.pnl_cents for t in resolved)
         report.avg_pnl_cents   = report.total_pnl_cents / max(len(resolved), 1)
-        report.fee_total_cents = sum(t.contracts * self.fee_cents for t in resolved)
+        # Fee is only on winning trades: 7% of gross win
+        report.fee_total_cents = sum(
+            int((100 - t.price_cents) * t.contracts * self.fee_cents / 100)
+            for t in resolved if t.won
+        )
 
         # Max drawdown
         running = 0

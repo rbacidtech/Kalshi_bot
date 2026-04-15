@@ -27,7 +27,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+import httpx
+
 log = logging.getLogger(__name__)
+
+# ── Shared async HTTP client (one connection pool for the process lifetime) ────
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Return the process-wide httpx.AsyncClient, creating it on first call."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+    return _http_client
 
 # ── Fee constants ──────────────────────────────────────────────────────────────
 KALSHI_FEE_RATE   = 0.07    # 7% of net winnings
@@ -91,7 +104,7 @@ def _market_mid(market: dict) -> float:
     yes_bid = float(market.get("yes_bid_dollars") or 0)
     yes_ask = float(market.get("yes_ask_dollars") or 1)
     last    = float(market.get("last_price_dollars") or 0)
-    if yes_bid > 0 and yes_ask < 1:
+    if yes_bid > 0 and yes_ask <= 1.0 and yes_ask >= yes_bid:
         return (yes_bid + yes_ask) / 2.0
     return last if last > 0 else 0.50
 
@@ -219,9 +232,30 @@ def scan_fomc_directional(markets: list[dict], current_rate: float, max_contract
             # Hold probability from FRED trend (~85% for near-term)
             # Each 25bp away from current rate reduces probability
             if rate_diff_bps <= 0:
-                # Strike is at or below current rate — YES is very likely
-                # (rate is already above strike)
-                fair_yes = 0.88 + min(0.09, abs(rate_diff_bps) * 0.001)
+                # Calibrated: more cuts needed + more meetings out = lower confidence
+                cuts_to_fail = abs(rate_diff_bps) / 25.0
+                # More cuts needed to fail YES = higher confidence in YES
+                # 0 cuts to fail (T3.75): ~0.88 base
+                # 2 cuts to fail (T3.25): ~0.70
+                # 6 cuts to fail (T2.25): ~0.55
+                # 12 cuts to fail (T0.75): ~0.85 (very hard to drop that far)
+                if cuts_to_fail <= 3:
+                    base_fv = max(0.50, 0.88 - cuts_to_fail * 0.07)
+                else:
+                    base_fv = min(0.90, 0.55 + cuts_to_fail * 0.03)
+                try:
+                    _MM = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                    _p  = event.split("-")
+                    _yr = 2000 + int(_p[1][:2])
+                    _mo = _MM.get(_p[1][2:], 6)
+                    _now = datetime.now()
+                    _months_out = (_yr - _now.year) * 12 + (_mo - _now.month)
+                    _mtgs = max(1, round(_months_out / 1.5))
+                except Exception:
+                    _mtgs = 4
+                decay    = max(0.50, 1.0 - (_mtgs - 1) * 0.05)
+                fair_yes = price + (base_fv - price) * decay
             elif rate_diff_bps <= 25:
                 # Strike is 25bp above current — requires one hike
                 fair_yes = 0.12
@@ -284,15 +318,12 @@ WEATHER_SERIES = {
 
 async def fetch_noaa_forecast(wfo: str, x: int, y: int) -> Optional[dict]:
     """Fetch NOAA NWS hourly forecast for a grid point."""
-    import httpx
-    cache_key = f"noaa:{wfo}:{x}:{y}"
-
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as http:
-            url = f"https://api.weather.gov/gridpoints/{wfo}/{x},{y}/forecast/hourly"
-            resp = await http.get(url, headers={"User-Agent": "KalshiBot/1.0 (prediction-market-research)"})
-            if resp.status_code == 200:
-                return resp.json()
+        http = _get_http_client()
+        url  = f"https://api.weather.gov/gridpoints/{wfo}/{x},{y}/forecast/hourly"
+        resp = await http.get(url, headers={"User-Agent": "KalshiBot/1.0 (prediction-market-research)"})
+        if resp.status_code == 200:
+            return resp.json()
     except Exception as exc:
         log.debug("NOAA fetch failed for %s/%d,%d: %s", wfo, x, y, exc)
     return None
@@ -450,21 +481,20 @@ ECONOMIC_SERIES = {
 
 async def fetch_fred_series(series_id: str, api_key: str, limit: int = 3) -> Optional[list]:
     """Fetch recent observations from FRED."""
-    import httpx
     try:
-        async with httpx.AsyncClient(timeout=8.0) as http:
-            url = (
-                f"https://api.stlouisfed.org/fred/series/observations"
-                f"?series_id={series_id}&api_key={api_key}"
-                f"&file_type=json&sort_order=desc&limit={limit}"
-            )
-            resp = await http.get(url)
-            if resp.status_code == 200:
-                obs = [
-                    o for o in resp.json().get("observations", [])
-                    if o.get("value") != "."
-                ]
-                return obs
+        http = _get_http_client()
+        url  = (
+            f"https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id={series_id}&api_key={api_key}"
+            f"&file_type=json&sort_order=desc&limit={limit}"
+        )
+        resp = await http.get(url)
+        if resp.status_code == 200:
+            obs = [
+                o for o in resp.json().get("observations", [])
+                if o.get("value") != "."
+            ]
+            return obs
     except Exception as exc:
         log.debug("FRED %s fetch failed: %s", series_id, exc)
     return None
@@ -488,13 +518,15 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
         return signals
 
     # Fetch FRED data concurrently
-    tasks = {sid: fetch_fred_series(sid, fred_api_key) for sid in ECONOMIC_SERIES}
-    results = {}
-    for sid, coro in tasks.items():
-        try:
-            results[sid] = await coro
-        except Exception:
-            results[sid] = None
+    sids    = list(ECONOMIC_SERIES.keys())
+    fetched = await asyncio.gather(
+        *[fetch_fred_series(sid, fred_api_key) for sid in sids],
+        return_exceptions=True,
+    )
+    results = {
+        sid: (None if isinstance(val, Exception) else val)
+        for sid, val in zip(sids, fetched)
+    }
 
     for market in econ_markets:
         title = market.get("title", "").lower()
@@ -589,13 +621,12 @@ SPORT_SERIES = {
 
 async def fetch_espn_odds(sport: str, league: str) -> Optional[list]:
     """Fetch ESPN scoreboard with current odds/lines."""
-    import httpx
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as http:
-            url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
-            resp = await http.get(url)
-            if resp.status_code == 200:
-                return resp.json().get("events", [])
+        http = _get_http_client()
+        url  = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+        resp = await http.get(url)
+        if resp.status_code == 200:
+            return resp.json().get("events", [])
     except Exception as exc:
         log.debug("ESPN %s/%s fetch failed: %s", sport, league, exc)
     return None
@@ -742,8 +773,11 @@ def scan_all_markets(client, limit_per_page: int = 200) -> list[dict]:
             cursor = data.get("cursor")
             if not cursor or not page:
                 break
-            if len(markets) > 2000:  # safety cap
-                log.warning("Market scan capped at 2000 markets.")
+            if len(markets) > 5000:  # safety cap
+                # Sort by liquidity before truncating — keep highest volume markets
+                markets.sort(key=lambda m: m.get("volume", 0) + m.get("open_interest", 0), reverse=True)
+                markets = markets[:5000]
+                log.warning("Market scan capped at 5000 markets (sorted by liquidity).")
                 break
         except Exception as exc:
             log.warning("Market scan error: %s", exc)
@@ -766,11 +800,12 @@ async def fetch_signals_async(
     enable_weather:  bool  = True,
     enable_economic: bool  = True,
     enable_sports:   bool  = True,
+    markets_cache:   list  = None,
 ) -> list[Signal]:
     """
     Scan all enabled market categories and return fee-adjusted signals.
     """
-    all_markets = scan_all_markets(client)
+    all_markets = markets_cache if markets_cache else scan_all_markets(client)
     # Targeted KXFED fetch
     try:
         kxfed_data = client.get("/markets", params={"status": "open", "series_ticker": "KXFED", "limit": 200})
@@ -873,6 +908,7 @@ def fetch_signals(
     enable_weather:  bool  = True,
     enable_economic: bool  = True,
     enable_sports:   bool  = True,
+    markets_cache:   list  = None,
 ) -> list[Signal]:
     """Synchronous entry point. Creates fresh event loop each call to avoid semaphore issues."""
     return asyncio.run(fetch_signals_async(
@@ -886,4 +922,5 @@ def fetch_signals(
         enable_weather = enable_weather,
         enable_economic= enable_economic,
         enable_sports  = enable_sports,
+        markets_cache  = markets_cache,
     ))

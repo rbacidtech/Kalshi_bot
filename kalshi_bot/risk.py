@@ -53,6 +53,7 @@ class RiskManager:
         market_price: float,
         balance_cents: int,
         confidence: float = 1.0,
+        side: str = "yes",
     ) -> int:
         """
         Confidence-scaled Kelly sizing, net of fees.
@@ -61,6 +62,10 @@ class RiskManager:
         This means FedWatch+ZQ (conf≈0.90) sizes at 3x a single-source
         signal (conf≈0.70) for the same edge, automatically rewarding
         higher-quality information.
+
+        Kelly denominator depends on side:
+          YES: win amount = 1 - market_price  →  kelly_f = edge / (1 - market_price)
+          NO:  win amount = market_price       →  kelly_f = edge / market_price
         """
         if balance_cents <= 0:
             log.warning("Sizing skipped: balance unknown (balance_cents=%d). "
@@ -69,13 +74,16 @@ class RiskManager:
 
         net_edge = edge - (self.cfg.fee_cents / 100)
         if net_edge <= 0:
-            log.debug("Net edge %.4f after %.0f¢ fee is non-positive — no trade.", 
+            log.debug("Net edge %.4f after %.0f¢ fee is non-positive — no trade.",
                       edge, self.cfg.fee_cents)
             return 0
 
         effective_kelly = self.cfg.kelly_fraction * confidence
-        kelly_f         = net_edge / max(1 - market_price, 0.01)
-        bet_fraction    = kelly_f * effective_kelly
+        if side == "yes":
+            kelly_f = net_edge / max(1 - market_price, 0.01)
+        else:
+            kelly_f = net_edge / max(market_price, 0.01)
+        bet_fraction = kelly_f * effective_kelly
 
         price_cents  = max(int(market_price * 100), 1)
         max_by_kelly = int((balance_cents * bet_fraction) / price_cents)
