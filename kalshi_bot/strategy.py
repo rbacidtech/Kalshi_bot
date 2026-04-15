@@ -21,13 +21,20 @@ Tax reserve:
 
 import asyncio
 import logging
+import math as _math
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 
 import httpx
+
+from kalshi_bot.models.fomc import (
+    fair_value_with_confidence as _fomc_fair_value,
+    set_current_fed_rate       as _set_fomc_rate,
+    parse_fomc_ticker          as _parse_fomc_ticker,
+)
 
 log = logging.getLogger(__name__)
 
@@ -36,10 +43,23 @@ _http_client: Optional[httpx.AsyncClient] = None
 
 
 def _get_http_client() -> httpx.AsyncClient:
-    """Return the process-wide httpx.AsyncClient, creating it on first call."""
+    """Return the process-wide httpx.AsyncClient, creating it on first call.
+
+    keepalive_expiry=10 ensures stale server-side-closed connections are not
+    reused, which prevents multi-minute hangs when the far end sends FIN but
+    the OS hasn't detected the dead socket via TCP keepalive yet.
+    """
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+        _http_client = httpx.AsyncClient(
+            timeout         = 8.0,
+            follow_redirects= True,
+            limits          = httpx.Limits(
+                max_connections     = 20,
+                max_keepalive_connections = 10,
+                keepalive_expiry    = 10,   # discard idle connections after 10s
+            ),
+        )
     return _http_client
 
 # ── Fee constants ──────────────────────────────────────────────────────────────
@@ -100,17 +120,95 @@ def _fee_adjusted_edge(fair_value: float, market_price: float, side: str) -> flo
 
 
 def _market_mid(market: dict) -> float:
-    """Extract mid-price from new Kalshi API response format."""
+    """Extract mid-price from new Kalshi API response format.
+
+    Returns 0.0 (filtered out by all callers) when no real price data exists,
+    so markets with missing bid/ask/last never generate signals.
+    """
     yes_bid = float(market.get("yes_bid_dollars") or 0)
     yes_ask = float(market.get("yes_ask_dollars") or 1)
     last    = float(market.get("last_price_dollars") or 0)
     if yes_bid > 0 and yes_ask <= 1.0 and yes_ask >= yes_bid:
         return (yes_bid + yes_ask) / 2.0
-    return last if last > 0 else 0.50
+    return last if last > 0 else 0.0
 
 
 def _market_volume(market: dict) -> float:
     return float(market.get("volume_fp") or 0)
+
+
+# ── Crypto price model (log-normal) ───────────────────────────────────────────
+
+def _parse_crypto_ticker(ticker: str) -> Optional[dict]:
+    """
+    Parse a KXBTC or KXETH ticker into its components.
+
+    Examples:
+      KXBTC-26APR1512-T83799.99  →  asset=BTC, direction=above, threshold=83799.99
+      KXBTC-26APR1512-B74000     →  asset=BTC, direction=below, threshold=74000
+      KXETH-26APR1512-B1600      →  asset=ETH, direction=below, threshold=1600
+
+    Ticker suffix:
+      T<price>  = YES wins if price ends ABOVE threshold  (T = top / threshold above)
+      B<price>  = YES wins if price ends BELOW threshold  (B = below)
+    """
+    # Match KXBTC or KXETH tickers
+    m = re.match(
+        r"^(KXBTC|KXETH)-(\d{2})([A-Z]{3})(\d{2})(\d{2})-([TB])(\d+\.?\d*)$",
+        ticker,
+    )
+    if not m:
+        return None
+    asset_code, yr2, mon_str, day, hr, direction_char, price_str = m.groups()
+    asset = "BTC" if asset_code == "KXBTC" else "ETH"
+    direction = "above" if direction_char == "T" else "below"
+    threshold = float(price_str)
+
+    # Parse close time
+    month_map = {
+        "JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+        "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12,
+    }
+    mon = month_map.get(mon_str)
+    if not mon:
+        return None
+    year = 2000 + int(yr2)
+    try:
+        close_dt = datetime(year, mon, int(day), int(hr), 0, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+    return {
+        "asset":     asset,
+        "direction": direction,   # "above" or "below"
+        "threshold": threshold,
+        "close_dt":  close_dt,
+    }
+
+
+def _lognormal_prob_above(
+    spot:       float,
+    threshold:  float,
+    hours:      float,
+    annual_vol: float = 0.80,
+) -> float:
+    """
+    P(S_T > threshold) under log-normal dynamics.
+
+    Uses Black-Scholes binary call probability:
+      d = (ln(spot/K) + 0.5*σ²*t) / (σ*√t)
+      P(S_T > K) = N(d)
+    where t is in years.
+    """
+    if hours <= 0 or threshold <= 0 or spot <= 0:
+        return 0.5
+    t = max(hours / 8_760.0, 1 / 8_760.0)   # floor at 1 hour
+    sigma_t = annual_vol * _math.sqrt(t)
+    if sigma_t == 0:
+        return 1.0 if spot > threshold else 0.0
+    d = (_math.log(spot / threshold) + 0.5 * sigma_t ** 2) / sigma_t
+    # N(d) via error function: N(d) = 0.5*(1 + erf(d/sqrt(2)))
+    return 0.5 * (1.0 + _math.erf(d / _math.sqrt(2)))
 
 
 # ── FOMC Arbitrage Model ───────────────────────────────────────────────────────
@@ -198,23 +296,75 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
     return signals
 
 
-def scan_fomc_directional(markets: list[dict], current_rate: float, max_contracts: int) -> list[Signal]:
+async def scan_fomc_directional(
+    markets:       list[dict],
+    current_rate:  float,
+    max_contracts: int,
+    treasury_2y:   Optional[float] = None,
+) -> list[Signal]:
     """
-    Directional FOMC signals using FRED current rate as anchor.
+    Directional FOMC signals using CME FedWatch + ZQ futures + WSJ consensus.
 
-    Logic: The current rate IS the floor for "above X%" contracts.
-    - If current rate = 3.75%, then P(rate > 3.75%) should be HIGH (it already IS 3.75%)
-    - If current rate = 3.75%, then P(rate > 4.25%) should be LOW (requires 50bp hike)
+    Primary model: fair_value_with_confidence() from kalshi_bot.models.fomc
+      - FedWatch (60% weight) + ZQ futures (30%) + WSJ (10%)
+      - Confidence reflects source agreement and data freshness
+      - Divergence between sources → automatic confidence reduction
 
-    We compare market prices against what's implied by the current rate + FRED trend.
+    Fallback (when fomc model returns None): FRED rate-anchor linear decay.
+
+    Confidence is further adjusted by:
+      - FOMC meeting proximity  (_fomc_proximity_confidence)
+      - 2Y Treasury spread      (bond market's rate path consensus)
     """
     signals = []
     groups  = _group_fomc_by_meeting(markets)
-    days_per_meeting = 60  # approximate days to next meeting
+
+    # Keep parse_fomc_ticker in sync with the live rate passed in from FRED
+    _set_fomc_rate(current_rate)
+
+    # ── 2Y Treasury spread adjustment (additive delta, applied after proximity) ─
+    tsy_conf_adj = 0.0
+    if treasury_2y is not None:
+        spread_bps = (treasury_2y - current_rate) * 100
+        if spread_bps < -75:
+            tsy_conf_adj = +0.06
+        elif spread_bps < -40:
+            tsy_conf_adj = +0.03
+        elif spread_bps > 40:
+            tsy_conf_adj = -0.04
+        log.debug("2Y spread: %.1fbps → conf adj %+.2f", spread_bps, tsy_conf_adj)
+
+    # Pre-fetch fomc model probabilities for all tickers concurrently.
+    # Builds a flat list so we can run a single asyncio.gather().
+    all_markets_flat = [m for group in groups.values() for m in group]
+    fomc_results: dict[str, tuple] = {}  # ticker → (fair_yes, model_conf)
+
+    async def _fetch_one(ticker: str, price: float) -> None:
+        try:
+            fv, mc = await _fomc_fair_value(ticker, price)
+            if fv is not None:
+                fomc_results[ticker] = (fv, mc)
+        except Exception as exc:
+            log.debug("fomc model fetch failed for %s: %s", ticker, exc)
+
+    # Only fetch markets with a real price (≤0.01 = no bid, skip silently)
+    priceable = [m for m in all_markets_flat if _market_mid(m) > 0.01]
+    await asyncio.gather(*[
+        _fetch_one(m["ticker"], _market_mid(m))
+        for m in priceable
+    ])
+
+    model_hits   = len(fomc_results)
+    model_misses = len(priceable) - model_hits   # misses among priceable tickers only
+    log.info(
+        "FOMC directional: model hits=%d misses=%d/%d (priceable/total=%d/%d)",
+        model_hits, model_misses, len(priceable), len(priceable), len(all_markets_flat),
+    )
 
     for event, group in groups.items():
         for market in group:
-            strike = _extract_strike(market["ticker"])
+            ticker = market["ticker"]
+            strike = _extract_strike(ticker)
             if strike is None:
                 continue
 
@@ -225,50 +375,48 @@ def scan_fomc_directional(markets: list[dict], current_rate: float, max_contract
             if vol < MIN_LIQUIDITY_FP:
                 continue
 
-            # Compute fair value based on current rate vs strike
-            rate_diff_bps = (strike - current_rate) * 100
-
-            # Simple model: probability decays with distance from current rate
-            # Hold probability from FRED trend (~85% for near-term)
-            # Each 25bp away from current rate reduces probability
-            if rate_diff_bps <= 0:
-                # Calibrated: more cuts needed + more meetings out = lower confidence
-                cuts_to_fail = abs(rate_diff_bps) / 25.0
-                # More cuts needed to fail YES = higher confidence in YES
-                # 0 cuts to fail (T3.75): ~0.88 base
-                # 2 cuts to fail (T3.25): ~0.70
-                # 6 cuts to fail (T2.25): ~0.55
-                # 12 cuts to fail (T0.75): ~0.85 (very hard to drop that far)
-                if cuts_to_fail <= 3:
-                    base_fv = max(0.50, 0.88 - cuts_to_fail * 0.07)
-                else:
-                    base_fv = min(0.90, 0.55 + cuts_to_fail * 0.03)
-                try:
-                    _MM = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-                           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-                    _p  = event.split("-")
-                    _yr = 2000 + int(_p[1][:2])
-                    _mo = _MM.get(_p[1][2:], 6)
-                    _now = datetime.now()
-                    _months_out = (_yr - _now.year) * 12 + (_mo - _now.month)
-                    _mtgs = max(1, round(_months_out / 1.5))
-                except Exception:
-                    _mtgs = 4
-                decay    = max(0.50, 1.0 - (_mtgs - 1) * 0.05)
-                fair_yes = price + (base_fv - price) * decay
-            elif rate_diff_bps <= 25:
-                # Strike is 25bp above current — requires one hike
-                fair_yes = 0.12
-            elif rate_diff_bps <= 50:
-                # Two hikes needed
-                fair_yes = 0.04
-            elif rate_diff_bps <= 75:
-                fair_yes = 0.02
+            # ── Fair value: real model or FRED-anchor fallback ────────────────
+            if ticker in fomc_results:
+                fair_yes, model_conf = fomc_results[ticker]
+                # Apply proximity adjustment to model confidence, then 2Y delta
+                confidence = max(0.40, min(0.95,
+                    _fomc_proximity_confidence(model_conf) + tsy_conf_adj))
+                model_src  = "kalshi_implied+fred"
             else:
-                # Very far out — near zero
-                fair_yes = 0.01
+                # FRED rate-anchor fallback (unchanged from prior implementation)
+                rate_diff_bps = (strike - current_rate) * 100
+                if rate_diff_bps <= 0:
+                    cuts_to_fail = abs(rate_diff_bps) / 25.0
+                    if cuts_to_fail <= 3:
+                        base_fv = max(0.50, 0.88 - cuts_to_fail * 0.07)
+                    else:
+                        base_fv = min(0.90, 0.55 + cuts_to_fail * 0.03)
+                    try:
+                        _MM = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                               "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                        _p  = event.split("-")
+                        _yr = 2000 + int(_p[1][:2])
+                        _mo = _MM.get(_p[1][2:], 6)
+                        _now = datetime.now()
+                        _months_out = (_yr - _now.year) * 12 + (_mo - _now.month)
+                        _mtgs = max(1, round(_months_out / 1.5))
+                    except Exception:
+                        _mtgs = 4
+                    decay    = max(0.50, 1.0 - (_mtgs - 1) * 0.05)
+                    fair_yes = price + (base_fv - price) * decay
+                elif rate_diff_bps <= 25:
+                    fair_yes = 0.12
+                elif rate_diff_bps <= 50:
+                    fair_yes = 0.04
+                elif rate_diff_bps <= 75:
+                    fair_yes = 0.02
+                else:
+                    fair_yes = 0.01
+                # Fallback: proximity adjustment on 0.72 base, then 2Y delta
+                confidence = max(0.40, min(0.95,
+                    _fomc_proximity_confidence(0.72) + tsy_conf_adj))
+                model_src  = f"fred_anchor_{current_rate:.2f}%"
 
-            # Clip
             fair_yes = max(0.01, min(0.99, fair_yes))
 
             diff = fair_yes - price
@@ -284,8 +432,9 @@ def scan_fomc_directional(markets: list[dict], current_rate: float, max_contract
                 continue
 
             contracts = min(max_contracts, max(1, int(edge * 80)))
+            _parsed   = _parse_fomc_ticker(ticker)
             signals.append(Signal(
-                ticker            = market["ticker"],
+                ticker            = ticker,
                 title             = market.get("title", ""),
                 category          = "fomc",
                 side              = side,
@@ -294,12 +443,155 @@ def scan_fomc_directional(markets: list[dict], current_rate: float, max_contract
                 edge              = round(edge, 4),
                 fee_adjusted_edge = round(fee_edge, 4),
                 contracts         = contracts,
-                confidence        = 0.72,
-                model_source      = f"fred_anchor_{current_rate:.2f}%",
+                confidence        = round(confidence, 3),
+                model_source      = model_src,
                 meeting           = event,
+                outcome           = (_parsed or {}).get("outcome", ""),
             ))
 
     signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+
+    # Outcome distribution — helps diagnose model regime / signal concentration
+    if signals:
+        outcome_dist: dict[str, int] = {}
+        for s in signals:
+            outcome_dist[s.outcome or "?"] = outcome_dist.get(s.outcome or "?", 0) + 1
+        log.debug("FOMC outcome dist: %s", outcome_dist)
+
+    return signals
+
+
+# ── Crypto Price Range Scanner (KXBTC / KXETH) ────────────────────────────────
+
+# Annualised historical volatility estimates (conservative)
+_BTC_ANNUAL_VOL = 0.80   # ~80% — typical for BTC
+_ETH_ANNUAL_VOL = 0.90   # ~90% — slightly higher than BTC
+
+
+async def _fetch_eth_spot() -> Optional[float]:
+    """Fetch ETH-USD spot from Coinbase public API."""
+    try:
+        http  = _get_http_client()
+        resp  = await http.get("https://api.coinbase.com/v2/prices/ETH-USD/spot", timeout=5.0)
+        if resp.status_code == 200:
+            return float(resp.json()["data"]["amount"])
+    except Exception as exc:
+        log.debug("ETH spot fetch failed: %s", exc)
+    return None
+
+
+def scan_crypto_price_markets(
+    markets:      list[dict],
+    btc_spot:     Optional[float],
+    eth_spot:     Optional[float],
+    max_contracts: int = 5,
+) -> list[Signal]:
+    """
+    Score KXBTC and KXETH daily price-range markets using a log-normal model.
+
+    Each market is a binary bet: "Will BTC/ETH be above/below $X at time T?"
+    Fair value = P(spot_T > threshold) or P(spot_T < threshold) using log-normal dynamics.
+
+    Only generates signals when:
+      - Current spot price is within ~20% of the threshold (meaningful edge zone)
+      - Market has some bid/ask (not completely illiquid)
+      - Hours until close > 0.5 (not expiring in < 30 min)
+    """
+    signals = []
+    now     = datetime.now(timezone.utc)
+
+    crypto_markets = [
+        m for m in markets
+        if m.get("ticker","").startswith(("KXBTC-","KXETH-"))
+    ]
+    if not crypto_markets:
+        return signals
+
+    for market in crypto_markets:
+        ticker  = market.get("ticker","")
+        parsed  = _parse_crypto_ticker(ticker)
+        if not parsed:
+            continue
+
+        asset     = parsed["asset"]
+        direction = parsed["direction"]
+        threshold = parsed["threshold"]
+        close_dt  = parsed["close_dt"]
+
+        # Select spot price for this asset
+        spot = btc_spot if asset == "BTC" else eth_spot
+        if not spot or spot <= 0:
+            continue
+
+        # Hours until close
+        hours = (close_dt - now).total_seconds() / 3600
+        if hours < 0.5:
+            continue   # too close to expiry — skip
+
+        # Only model markets where threshold is within ±25% of spot
+        # (markets far out-of-range have near-0 or near-1 prices with no edge)
+        if threshold > spot * 1.25 or threshold < spot * 0.75:
+            continue
+
+        # Require a real two-sided market — skip phantom/illiquid quotes
+        yes_bid = float(market.get("yes_bid_dollars") or 0)
+        yes_ask = float(market.get("yes_ask_dollars") or 0)
+        liq     = float(market.get("liquidity_dollars") or 0)
+        if yes_bid <= 0 or yes_ask <= 0 or liq <= 0:
+            continue   # no real order book
+
+        price = (yes_bid + yes_ask) / 2.0
+        if price <= 0.01 or price >= 0.99:
+            continue   # no edge near certainty
+
+        # Log-normal fair value
+        annual_vol = _BTC_ANNUAL_VOL if asset == "BTC" else _ETH_ANNUAL_VOL
+        p_above    = _lognormal_prob_above(spot, threshold, hours, annual_vol)
+        fair_value = p_above if direction == "above" else (1.0 - p_above)
+
+        # Edge
+        if fair_value > price:
+            side = "yes"
+            edge = fair_value - price
+        else:
+            side = "no"
+            edge = price - fair_value   # buy NO at (1-price)
+            # For NO side, market_price is the YES price; fair_value is P(YES)
+
+        fee_edge = _fee_adjusted_edge(fair_value, price, side)
+        if fee_edge < 0.04:   # ~4¢ minimum net edge after fees
+            continue
+
+        # Confidence scales with how far we are from 50/50 and time remaining
+        # More time = more uncertainty = lower confidence
+        certainty   = abs(fair_value - 0.5) * 2   # 0 at 50%, 1 at certainty
+        time_factor = min(1.0, 1.0 / max(hours, 1))  # higher confidence near close
+        confidence  = min(0.95, 0.50 + 0.40 * certainty + 0.10 * time_factor)
+
+        signals.append(Signal(
+            ticker            = ticker,
+            title             = market.get("title","") or f"{asset} {'above' if direction=='above' else 'below'} ${threshold:,.0f}",
+            category          = "crypto_price",
+            side              = side,
+            fair_value        = fair_value,
+            market_price      = price,
+            edge              = edge,
+            fee_adjusted_edge = fee_edge,
+            contracts         = max_contracts,
+            confidence        = confidence,
+            model_source      = f"lognormal_{asset.lower()}_vol{int(annual_vol*100)}pct",
+            spread_cents      = int(abs(
+                float(market.get("yes_ask_dollars") or price + 0.02) -
+                float(market.get("yes_bid_dollars") or price - 0.02)
+            ) * 100),
+        ))
+        log.debug(
+            "Crypto %s %s %s@%.0f: spot=%.2f fair=%.3f mkt=%.3f edge=%.3f  %.1fh left",
+            asset, ticker, direction, threshold, spot, fair_value, price, fee_edge, hours,
+        )
+
+    signals.sort(key=lambda s: s.fee_adjusted_edge * s.confidence, reverse=True)
+    log.info("Crypto price scan: %d signals from %d markets", len(signals), len(crypto_markets))
     return signals
 
 
@@ -500,6 +792,91 @@ async def fetch_fred_series(series_id: str, api_key: str, limit: int = 3) -> Opt
     return None
 
 
+# ── FOMC meeting calendar ────────────────────────────────────────────────────
+# Second (decision) day of each two-day meeting through 2027.
+_FOMC_MEETINGS: list[date] = [
+    date(2025, 1, 29), date(2025, 3, 19), date(2025, 4, 30),
+    date(2025, 6, 18), date(2025, 7, 30), date(2025, 9, 17),
+    date(2025, 10, 29), date(2025, 12, 17),
+    date(2026, 1, 28), date(2026, 3, 18), date(2026, 4, 29),
+    date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
+    date(2026, 10, 28), date(2026, 12, 16),
+    date(2027, 1, 27), date(2027, 3, 17), date(2027, 4, 28),
+    date(2027, 6, 16), date(2027, 7, 28), date(2027, 9, 15),
+    date(2027, 10, 27), date(2027, 12, 15),
+]
+
+
+def _fomc_proximity_confidence(base: float = 0.72) -> float:
+    """
+    Adjust base FOMC confidence by proximity to the next meeting decision.
+
+      0–2 days after  : -0.15  (market repricing post-decision)
+      3+ days after   : 0      (settled)
+      > 45 days until : -0.10  (far out, high uncertainty)
+      15–45 days until: -0.05
+      4–14 days until : 0      (standard window)
+      0–3 days until  : +0.08  (near-final pricing, high certainty)
+    """
+    today   = date.today()
+    future  = [m for m in _FOMC_MEETINGS if m >= today]
+    past    = [m for m in _FOMC_MEETINGS if m < today]
+
+    if not future:
+        return base
+
+    next_mtg   = future[0]
+    days_until = (next_mtg - today).days
+
+    # Post-meeting repricing window
+    if past:
+        days_since = (today - past[-1]).days
+        if days_since <= 2:
+            return max(0.40, base - 0.15)
+
+    if days_until <= 3:
+        return min(0.95, base + 0.08)
+    elif days_until <= 14:
+        return base
+    elif days_until <= 45:
+        return max(0.55, base - 0.05)
+    else:
+        return max(0.50, base - 0.10)
+
+
+async def fetch_treasury_2y_yield(fred_api_key: str) -> Optional[float]:
+    """
+    Fetch the current 2-year Treasury constant maturity yield from FRED (DGS2).
+    Returns yield as a percentage (e.g. 3.85 means 3.85%), or None on failure.
+
+    The spread between 2Y yield and Fed Funds rate is the bond market's
+    consensus on the rate path:
+      2Y < Fed Funds  → market pricing cuts   → reinforces cut-side Kalshi signals
+      2Y > Fed Funds  → market pricing hikes  → reinforces hike-side signals
+      |spread| < 0.10 → neutral / uncertain
+    """
+    if not fred_api_key:
+        return None
+    try:
+        http = _get_http_client()
+        url  = (
+            "https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id=DGS2&api_key={fred_api_key}"
+            "&file_type=json&sort_order=desc&limit=3"
+        )
+        resp = await http.get(url, timeout=8.0)
+        if resp.status_code == 200:
+            obs = [o for o in resp.json().get("observations", [])
+                   if o.get("value", ".") != "."]
+            if obs:
+                yield_pct = float(obs[0]["value"])
+                log.info("FRED DGS2: 2Y Treasury yield = %.3f%%", yield_pct)
+                return yield_pct
+    except Exception as exc:
+        log.debug("FRED DGS2 fetch failed: %s", exc)
+    return None
+
+
 async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_contracts: int) -> list[Signal]:
     """Score economic threshold markets using FRED data."""
     if not fred_api_key:
@@ -528,15 +905,26 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
         for sid, val in zip(sids, fetched)
     }
 
+    # Sigmoid steepness per series.  One "scale unit" corresponds to the
+    # typical noise level for that indicator — values beyond ±2 scales from
+    # the threshold are treated as high-confidence (outcome nearly certain).
+    _ECON_SCALES: dict[str, float] = {
+        "CPIAUCSL": 0.30,    # 30 basis-points of CPI change
+        "UNRATE":   0.20,    # 20 bp of unemployment
+        "PAYEMS":   50.0,    # 50k payroll jobs (series in thousands)
+    }
+    _DEFAULT_SCALE = 0.25
+
     for market in econ_markets:
         title = market.get("title", "").lower()
         price = _market_mid(market)
         if price <= 0.01 or price >= 0.99:
             continue
 
-        fair_value = None
+        fair_value  = None
+        confidence  = 0.55
+        matched_sid = "fred"
 
-        # Match market to FRED series
         for sid, config in ECONOMIC_SERIES.items():
             if not any(kw in title for kw in config["keywords"]):
                 continue
@@ -544,32 +932,62 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
             if not obs:
                 continue
 
-            latest_val = float(obs[0]["value"])
-            prev_val   = float(obs[1]["value"]) if len(obs) > 1 else latest_val
+            # ── Multi-point weighted trend (exponential decay, up to 6 pts) ──
+            vals: list[float] = []
+            for o in obs[:6]:
+                try:
+                    vals.append(float(o["value"]))
+                except (ValueError, KeyError):
+                    pass
+            if not vals:
+                continue
 
-            # Extract threshold from title
-            thresh_match = re.search(r"(\d+\.?\d*)\s*%", market.get("title", ""))
+            latest_val = vals[0]
+
+            if len(vals) >= 3:
+                # Weighted least-squares linear trend (recent observations
+                # weighted 2× more than older ones via exponential decay w=0.5^i)
+                wts  = [0.5 ** i for i in range(len(vals))]
+                sw   = sum(wts)
+                mi   = sum(i * w for i, w in enumerate(wts)) / sw
+                mv   = sum(v * w for v, w in zip(vals, wts)) / sw
+                num  = sum(w * (i - mi) * (v - mv)
+                           for i, (v, w) in enumerate(zip(vals, wts)))
+                den  = sum(w * (i - mi) ** 2 for i, w in enumerate(wts))
+                slope = num / den if den > 0 else 0.0
+                projected = latest_val + slope * 0.5
+            elif len(vals) == 2:
+                projected = latest_val + (vals[0] - vals[1]) * 0.5
+            else:
+                projected = latest_val
+
+            # Extract threshold from title (handles "above 3.5%" or "below 200k")
+            thresh_match = re.search(r"(\d+\.?\d*)\s*[%k]?", market.get("title", ""))
             if not thresh_match:
                 continue
             threshold = float(thresh_match.group(1))
 
-            # Simple model: is current value above/below threshold?
-            # Adjust for trend
-            trend = latest_val - prev_val
-            projected = latest_val + trend * 0.5  # simple linear projection
+            # PAYEMS: FRED values are in thousands of persons; titles typically
+            # quote whole numbers like "above 200" meaning 200k jobs.
+            if sid == "PAYEMS" and threshold < 2_000:
+                threshold *= 1_000   # convert to same units as FRED series
 
-            if sid == "CPIAUCSL":
-                # CPI year-over-year — compare to threshold
-                fair_value = 0.75 if projected >= threshold else 0.25
-            elif sid == "UNRATE":
-                fair_value = 0.75 if projected >= threshold else 0.25
-            elif sid == "PAYEMS":
-                # Monthly job gains — convert to thousands if needed
-                fair_value = 0.70 if projected >= threshold * 1000 else 0.30
-            else:
-                fair_value = 0.60 if projected >= threshold else 0.40
+            # ── Sigmoid fair value ────────────────────────────────────────────
+            # P(projected > threshold) — smooth transition instead of binary 0.75/0.25
+            scale    = _ECON_SCALES.get(sid, _DEFAULT_SCALE)
+            x        = (projected - threshold) / scale
+            # Clip exponent to prevent overflow
+            fair_yes = 1.0 / (1.0 + _math.exp(-max(-20.0, min(20.0, x))))
 
-            break  # matched first series
+            # ── Distance-scaled confidence ────────────────────────────────────
+            # Far from threshold → outcome nearly certain → high confidence
+            # Near threshold     → coin-flip → low confidence
+            dist_sigma = abs(projected - threshold) / scale
+            confidence = round(min(0.85, 0.50 + 0.15 * min(dist_sigma, 2.0)), 3)
+
+            fair_value  = fair_yes
+            matched_sid = sid
+            break   # matched first relevant series
 
         if fair_value is None:
             continue
@@ -600,11 +1018,132 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
             edge              = round(edge, 4),
             fee_adjusted_edge = round(fee_edge, 4),
             contracts         = contracts,
-            confidence        = 0.62,
-            model_source      = "fred_economic",
+            confidence        = confidence,
+            model_source      = f"fred_{matched_sid}_sigmoid",
         ))
 
     signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+    return signals
+
+
+# ── GDP Scanner (KXGDP) ───────────────────────────────────────────────────────
+
+async def scan_gdp_markets(
+    markets:      list[dict],
+    fred_api_key: str = "",
+    max_contracts: int = 5,
+) -> list[Signal]:
+    """
+    Score KXGDP markets using the Atlanta Fed GDPNow real-time estimate (FRED: GDPNOW).
+
+    KXGDP tickers: KXGDP-26APR30-T4.5 = "Will Q1 2026 real GDP growth > 4.5%?"
+
+    GDPNow updates every few days as new economic data arrives and has ~0.9pp RMSE
+    near publication — significantly more accurate than a backward-looking trend model.
+    """
+    signals = []
+    gdp_markets = [m for m in markets if m.get("ticker","").startswith("KXGDP-")]
+    if not gdp_markets or not fred_api_key:
+        return signals
+
+    # Fetch Atlanta Fed GDPNow from FRED (series GDPNOW — updates intra-quarter)
+    gdp_estimate: Optional[float] = None
+    gdp_source = "gdpnow"
+    try:
+        http = _get_http_client()
+        url  = (
+            "https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id=GDPNOW&api_key={fred_api_key}"
+            "&file_type=json&sort_order=desc&limit=1"
+        )
+        resp = await http.get(url, timeout=8.0)
+        if resp.status_code == 200:
+            obs = [o for o in resp.json().get("observations", [])
+                   if o.get("value", ".") != "."]
+            if obs:
+                gdp_estimate = float(obs[0]["value"])
+                log.info("GDP model: GDPNow=%.2f%% (as-of %s)", gdp_estimate, obs[0]["date"])
+    except Exception as exc:
+        log.debug("FRED GDPNow fetch failed: %s — trying fallback", exc)
+
+    # Fallback: backward-looking weighted average of last 4 reported quarters
+    if gdp_estimate is None:
+        try:
+            url2 = (
+                "https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id=A191RL1Q225SBEA&api_key={fred_api_key}"
+                "&file_type=json&sort_order=desc&limit=4"
+            )
+            resp2 = await http.get(url2, timeout=8.0)
+            if resp2.status_code == 200:
+                obs2 = [float(o["value"]) for o in resp2.json().get("observations", [])
+                        if o.get("value", ".") != "."]
+                if obs2:
+                    weights      = [4, 3, 2, 1][:len(obs2)]
+                    weighted     = sum(v * w for v, w in zip(obs2, weights)) / sum(weights)
+                    gdp_estimate = weighted * 0.6 + 2.5 * 0.4
+                    gdp_source   = "fred_trend"
+                    log.info("GDP model (fallback): last_4q=%s  estimate=%.2f%%", obs2, gdp_estimate)
+        except Exception as exc2:
+            log.debug("FRED GDP fallback failed: %s", exc2)
+
+    if gdp_estimate is None:
+        log.debug("No GDP estimate available — skipping KXGDP scan")
+        return signals
+
+    # Uncertainty: GDPNow ~0.9pp RMSE; fallback trend model ~1.5pp
+    gdp_uncertainty = 0.9 if gdp_source == "gdpnow" else 1.5
+
+    for market in gdp_markets:
+        ticker = market.get("ticker","")
+        # Parse threshold from ticker: KXGDP-26APR30-T4.5 → 4.5
+        threshold_match = re.search(r"-T(\d+\.?\d*)$", ticker)
+        if not threshold_match:
+            continue
+        threshold = float(threshold_match.group(1))
+
+        price = _market_mid(market)
+        if price <= 0.01 or price >= 0.99:
+            continue
+
+        # P(GDP > threshold) using normal distribution around nowcast
+        z          = (gdp_estimate - threshold) / gdp_uncertainty
+        p_above    = 0.5 * (1.0 + _math.erf(z / _math.sqrt(2)))
+        fair_value = p_above   # YES = GDP growth > threshold
+
+        if fair_value > price:
+            side = "yes"
+            edge = fair_value - price
+        else:
+            side = "no"
+            edge = price - fair_value
+
+        fee_edge = _fee_adjusted_edge(fair_value, price, side)
+        if fee_edge < 0.04:
+            continue
+
+        confidence = min(0.85, 0.50 + abs(fair_value - 0.5))
+
+        signals.append(Signal(
+            ticker            = ticker,
+            title             = market.get("title","") or f"GDP growth > {threshold}%",
+            category          = "gdp",
+            side              = side,
+            fair_value        = fair_value,
+            market_price      = price,
+            edge              = edge,
+            fee_adjusted_edge = fee_edge,
+            contracts         = max_contracts,
+            confidence        = confidence,
+            model_source      = f"{gdp_source}_{gdp_estimate:.1f}pct",
+            spread_cents      = int(abs(
+                float(market.get("yes_ask_dollars") or price + 0.02) -
+                float(market.get("yes_bid_dollars") or price - 0.02)
+            ) * 100),
+        ))
+
+    if signals:
+        log.info("GDP scan: %d signals (nowcast=%.2f%%)", len(signals), gdp_estimate)
     return signals
 
 
@@ -754,36 +1293,67 @@ async def scan_sports_markets(markets: list[dict], max_contracts: int) -> list[S
 
 # ── Universal Market Scanner ─────────────────────────────────────────────────
 
+# Targeted series we have models for — fetched first, always included
+_TARGETED_SERIES = [
+    "KXFED",      # Fed rate (FOMC directional + arb)
+    "KXBTC",      # BTC daily price range
+    "KXETH",      # ETH daily price range
+    "KXGDP",      # GDP threshold
+    "KXHIGHNY", "KXLOWNY", "KXHIGHLA", "KXHIGHCHI", "KXHIGHDC", "KXRAINY",  # weather
+    "KXMLB", "KXNBA", "KXNHL", "KXNFL",   # sports championships
+]
+
 def scan_all_markets(client, limit_per_page: int = 200) -> list[dict]:
     """
-    Fetch ALL open Kalshi markets with cursor pagination.
-    Returns full list with new API field names intact.
+    Fetch open Kalshi markets.  Priority order:
+      1. Targeted series we have models for (fast, targeted API calls)
+      2. Generic pagination for additional discovery (capped at 1000)
+    Returns deduped list sorted by liquidity descending.
     """
-    markets = []
-    params  = {"status": "open", "limit": limit_per_page}
-    cursor  = None
+    markets    = []
+    seen_tickers = set()
 
-    while True:
+    def _add(ms):
+        for m in ms:
+            t = m.get("ticker","")
+            if t and t not in seen_tickers:
+                seen_tickers.add(t)
+                markets.append(m)
+
+    # 1. Targeted fetches
+    for series in _TARGETED_SERIES:
+        try:
+            data = client.get("/markets", params={"status":"open","series_ticker":series,"limit":200})
+            _add(data.get("markets",[]))
+        except Exception as exc:
+            log.debug("Targeted fetch failed for %s: %s", series, exc)
+
+    # 2. Discovery pagination (cap at 1000 generic markets, sorted by OI)
+    cursor = None
+    disc_count = 0
+    while disc_count < 1000:
+        params = {"status":"open","limit":limit_per_page}
         if cursor:
             params["cursor"] = cursor
         try:
             data   = client.get("/markets", params=params)
-            page   = data.get("markets", [])
-            markets.extend(page)
+            page   = data.get("markets",[])
+            _add(page)
             cursor = data.get("cursor")
+            disc_count += len(page)
             if not cursor or not page:
-                break
-            if len(markets) > 5000:  # safety cap
-                # Sort by liquidity before truncating — keep highest volume markets
-                markets.sort(key=lambda m: m.get("volume", 0) + m.get("open_interest", 0), reverse=True)
-                markets = markets[:5000]
-                log.warning("Market scan capped at 5000 markets (sorted by liquidity).")
                 break
         except Exception as exc:
             log.warning("Market scan error: %s", exc)
             break
 
-    log.info("Universal scan: %d total open markets", len(markets))
+    # Sort by liquidity descending so highest-quality markets are first
+    markets.sort(
+        key=lambda m: float(m.get("liquidity_dollars") or 0) + float(m.get("volume_fp") or 0),
+        reverse=True,
+    )
+
+    log.info("Universal scan: %d total open markets (%d targeted series)", len(markets), len(_TARGETED_SERIES))
     return markets
 
 
@@ -791,16 +1361,21 @@ def scan_all_markets(client, limit_per_page: int = 200) -> list[dict]:
 
 async def fetch_signals_async(
     client,
-    edge_threshold:  float = MIN_EDGE_GROSS,
-    max_contracts:   int   = 5,
-    min_confidence:  float = 0.60,
-    fred_api_key:    str   = "",
-    current_rate:    float = 3.75,
-    enable_fomc:     bool  = True,
-    enable_weather:  bool  = True,
-    enable_economic: bool  = True,
-    enable_sports:   bool  = True,
-    markets_cache:   list  = None,
+    edge_threshold:      float = MIN_EDGE_GROSS,
+    max_contracts:       int   = 5,
+    min_confidence:      float = 0.60,
+    fred_api_key:        str   = "",
+    current_rate:        float = 3.75,
+    treasury_2y:         Optional[float] = None,
+    enable_fomc:         bool  = True,
+    enable_weather:      bool  = True,
+    enable_economic:     bool  = True,
+    enable_sports:       bool  = True,
+    markets_cache:       list  = None,
+    btc_spot:            Optional[float] = None,
+    eth_spot:            Optional[float] = None,
+    enable_crypto_price: bool  = True,
+    enable_gdp:          bool  = True,
 ) -> list[Signal]:
     """
     Scan all enabled market categories and return fee-adjusted signals.
@@ -830,7 +1405,7 @@ async def fetch_signals_async(
     # 2. FOMC directional (FRED rate anchor)
     if enable_fomc:
         try:
-            dir_sigs = scan_fomc_directional(fomc_markets, current_rate, max_contracts)
+            dir_sigs = await scan_fomc_directional(fomc_markets, current_rate, max_contracts, treasury_2y=treasury_2y)
             dir_sigs = [s for s in dir_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
             all_signals.extend(dir_sigs)
             if dir_sigs:
@@ -871,6 +1446,31 @@ async def fetch_signals_async(
         except Exception as exc:
             log.warning("Sports scan failed: %s", exc)
 
+    # 6. Crypto price range (KXBTC / KXETH)
+    if enable_crypto_price and (btc_spot or eth_spot):
+        try:
+            # Fetch ETH spot if not provided
+            if eth_spot is None:
+                eth_spot = await _fetch_eth_spot()
+            crypto_sigs = scan_crypto_price_markets(all_markets, btc_spot, eth_spot, max_contracts)
+            crypto_sigs = [s for s in crypto_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            all_signals.extend(crypto_sigs)
+            if crypto_sigs:
+                log.info("Crypto price: %d signals", len(crypto_sigs))
+        except Exception as exc:
+            log.warning("Crypto price scan failed: %s", exc)
+
+    # 7. GDP
+    if enable_gdp:
+        try:
+            gdp_sigs = await scan_gdp_markets(all_markets, fred_api_key, max_contracts)
+            gdp_sigs = [s for s in gdp_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            all_signals.extend(gdp_sigs)
+            if gdp_sigs:
+                log.info("GDP: %d signals", len(gdp_sigs))
+        except Exception as exc:
+            log.warning("GDP scan failed: %s", exc)
+
     # Filter by min confidence
     all_signals = [s for s in all_signals if s.confidence >= 0.50]
 
@@ -886,13 +1486,15 @@ async def fetch_signals_async(
             seen.add(s.ticker)
 
     log.info(
-        "Total signals: %d (%d FOMC arb, %d FOMC dir, %d weather, %d economic, %d sports)",
+        "Total signals: %d (%d FOMC arb, %d FOMC dir, %d weather, %d economic, %d sports, %d crypto_price, %d gdp)",
         len(deduped),
         sum(1 for s in deduped if s.category == "arb"),
         sum(1 for s in deduped if s.category == "fomc"),
         sum(1 for s in deduped if s.category == "weather"),
         sum(1 for s in deduped if s.category == "economic"),
         sum(1 for s in deduped if s.category == "sports"),
+        sum(1 for s in deduped if s.category == "crypto_price"),
+        sum(1 for s in deduped if s.category == "gdp"),
     )
     return deduped
 
