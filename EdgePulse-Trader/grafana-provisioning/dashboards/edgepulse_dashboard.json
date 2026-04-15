@@ -1,0 +1,220 @@
+{
+  "title": "EdgePulse Trader",
+  "uid": "edgepulse-main",
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "BTC Price (USD)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "edgepulse_btc_price_usd",
+        "legendFormat": "BTC/USD"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 50000 },
+              { "color": "green",  "value": 80000 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "BTC RSI-14",
+      "type": "gauge",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "edgepulse_btc_rsi",
+        "legendFormat": "RSI"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "minVizWidth": 75,
+        "minVizHeight": 75
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 35 },
+              { "color": "green",  "value": 45 },
+              { "color": "yellow", "value": 65 },
+              { "color": "red",    "value": 75 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "BTC Z-Score",
+      "type": "stat",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "edgepulse_btc_z_score",
+        "legendFormat": "z"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": -1.5 },
+              { "color": "red",    "value": -2.5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Balance (cents)",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "edgepulse_balance_cents / 100",
+        "legendFormat": "Balance USD"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Open Positions",
+      "type": "stat",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "edgepulse_open_positions",
+        "legendFormat": "Positions"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Session P&L Edge",
+      "type": "stat",
+      "gridPos": { "x": 20, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "edgepulse_pnl_cents / 100",
+        "legendFormat": "P&L USD"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",   "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "BTC Price (time series)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "edgepulse_btc_price_usd",
+        "legendFormat": "BTC/USD"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "color": { "mode": "fixed", "fixedColor": "orange" }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Signals Published (rate/min)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(edgepulse_signals_total{asset_class='btc_spot'}[5m]) * 60",
+          "legendFormat": "BTC signals/min"
+        },
+        {
+          "expr": "rate(edgepulse_signals_total{asset_class='kalshi'}[5m]) * 60",
+          "legendFormat": "Kalshi signals/min"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Executions (fills vs rejects)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "rate(edgepulse_executions_total{status='filled'}[5m]) * 60",
+          "legendFormat": "fills/min"
+        },
+        {
+          "expr": "rate(edgepulse_executions_total{status='rejected'}[5m]) * 60",
+          "legendFormat": "rejects/min"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Intel Cycle Duration (p95)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 7 },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(edgepulse_cycle_duration_seconds_bucket[10m]))",
+        "legendFormat": "p95 cycle seconds"
+      }],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    }
+  ]
+}

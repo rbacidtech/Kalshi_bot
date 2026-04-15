@@ -86,7 +86,7 @@ class KalshiWebSocket:
 
     @property
     def _ws_url(self) -> str:
-        return _WS_LIVE
+        return _WS_DEMO if self.paper else _WS_LIVE
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ class KalshiWebSocket:
             on_close   = self._on_close,
             header     = self._auth_headers(),
         )
-        self._ws.run_forever(ping_interval=30, ping_timeout=10)
+        self._ws.run_forever(ping_interval=60, ping_timeout=20)
 
     def _auth_headers(self) -> list[str]:
         """
@@ -218,8 +218,9 @@ class KalshiWebSocket:
                     self._ws.send(msg)
                     log.debug("Subscribed to %s:%s", channel, ticker)
                 except Exception as exc:
-                    log.warning("Subscription failed for %s:%s — %s",
+                    log.warning("Subscription failed for %s:%s — %s. Aborting.",
                                 channel, ticker, exc)
+                    return
 
     # ── Message dispatcher ────────────────────────────────────────────────────
 
@@ -295,21 +296,22 @@ class KalshiWebSocket:
         if bids:
             yes_price = bids[0][0]    # best YES bid (cents)
         else:
-            yes_price = self.state.markets.get(ticker, {}) \
-                            and self.state.markets[ticker].yes_price or 50
+            yes_price = (self.state.markets[ticker].yes_price
+                         if ticker in self.state.markets else 50)
 
         if asks:
-            no_price  = asks[0][0]    # best NO bid (cents)
-            ask_yes   = 100 - no_price
+            no_price = asks[0][0]     # best NO bid (cents)
+            ask_yes  = 100 - no_price
         else:
-            ask_yes   = yes_price
+            no_price = 100 - yes_price
+            ask_yes  = yes_price
 
         spread = max(ask_yes - yes_price, 0)
 
         self.state.update_market(
             ticker,
             yes_price  = yes_price,
-            no_price   = no_price if asks else (100 - yes_price),
+            no_price   = no_price,
             last_price = yes_price,
             spread     = spread,
         )

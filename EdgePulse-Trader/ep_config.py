@@ -1,0 +1,45 @@
+"""
+ep_config.py — Shared runtime config, Redis key namespace, and sys.path bootstrap.
+
+Import this BEFORE any kalshi_bot.* imports in every ep_*.py file — the
+sys.path.insert calls here make the kalshi_bot package importable from any
+working directory.
+"""
+
+import logging
+import os
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── sys.path bootstrap ────────────────────────────────────────────────────────
+_here = Path(__file__).resolve().parent
+sys.path.insert(0, str(_here))          # EdgePulse-Trader/ — ep_* sibling modules
+sys.path.insert(0, str(_here.parent))   # Kalshi_bot/       — kalshi_bot package
+
+import kalshi_bot.config as cfg  # noqa: E402  (must follow sys.path setup)
+
+# ── Runtime config (environment-driven) ──────────────────────────────────────
+MODE          = os.getenv("MODE", "intel").lower()           # "intel" | "exec"
+NODE_ID       = os.getenv("NODE_ID", f"{MODE}-{os.uname().nodename}")
+REDIS_URL     = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+SIGNAL_TTL    = int(os.getenv("EP_SIGNAL_TTL_MS",  "30000"))   # 30 s
+STREAM_BLOCK  = int(os.getenv("EP_STREAM_BLOCK_MS", "5000"))    # 5 s blocking read
+EXIT_INTERVAL = int(os.getenv("EP_EXIT_INTERVAL_S", "60"))      # seconds between exit checks
+
+# ── Redis key namespace ───────────────────────────────────────────────────────
+EP_SIGNALS    = "ep:signals"      # STREAM  Intel → Exec
+EP_EXECUTIONS = "ep:executions"   # STREAM  Exec  → Intel
+EP_POSITIONS  = "ep:positions"    # HASH    ticker → position JSON (Exec writes)
+EP_PRICES     = "ep:prices"       # HASH    ticker → price JSON   (Intel writes)
+EP_BALANCE    = "ep:balance"      # HASH    node_id → balance JSON
+EP_SYSTEM     = "ep:system"       # STREAM  lifecycle events
+EP_CONFIG     = "ep:config"       # HASH    runtime overrides (ops + LLM)
+
+EXEC_GROUP    = "exec-consumers"   # consumer group on ep:signals
+INTEL_GROUP   = "intel-consumers"  # consumer group on ep:executions
+
+log = logging.getLogger("edgepulse")

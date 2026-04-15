@@ -241,9 +241,13 @@ async def fetch_fedwatch_all_meetings() -> dict[str, MeetingProbs]:
 
             # Try various date formats CME uses
             meeting_dt = None
+            date_str_stripped = str(date_str).strip()
             for fmt in ("%Y-%m-%d", "%Y-%m", "%b %Y", "%B %Y"):
+                # Limit to 10 chars to strip trailing timestamps (e.g. "2025-04-14T00:00:00Z")
+                # Python slices never error on short strings — short dates are passed through intact
+                snippet = date_str_stripped[:10]
                 try:
-                    meeting_dt = datetime.strptime(date_str[:10], fmt).replace(
+                    meeting_dt = datetime.strptime(snippet, fmt).replace(
                         tzinfo=timezone.utc
                     )
                     break
@@ -441,7 +445,8 @@ def _parse_wsj_html(html: str) -> dict[str, float] | None:
 
         if result:
             total = sum(result.values())
-            return {k: v / total for k, v in result.items()}
+            if total > 0:
+                return {k: min(1.0, max(0.0, v / total)) for k, v in result.items()}
 
     except Exception as exc:
         log.debug("WSJ parse error: %s", exc)

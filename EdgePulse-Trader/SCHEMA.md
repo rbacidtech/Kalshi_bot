@@ -1,0 +1,290 @@
+# EdgePulse-Trader — Redis Message Schema v1
+
+## Design principles
+
+| Principle | Implementation |
+|---|---|
+| Self-describing | Every message carries all fields needed to act on it — no foreign-key lookups |
+| Loss-tolerant | No ordering dependencies; duplicate delivery is safe (idempotent dedup on `signal_id`) |
+| TTL-gated | Exec discards any `SIGNAL` older than `ttl_ms` — never acts on stale edges |
+| Append-only audit | Streams are never mutated; consumer groups provide exactly-once processing |
+| Typed | `msg_type` field on every message; unknown types are silently dropped |
+
+---
+
+## Redis key layout
+
+```
+ep:signals          STREAM   Intel → Exec    edge opportunities
+ep:executions       STREAM   Exec  → Intel   fill confirmations
+ep:positions        HASH     Exec writes     ticker → position JSON
+ep:prices           HASH     Intel writes    ticker → price snapshot JSON
+ep:balance          HASH     both write      node_id → balance JSON
+ep:system           STREAM   both write      lifecycle events
+ep:config           HASH     ops writes      runtime override flags
+```
+
+### Consumer groups
+
+```
+ep:signals     →  consumer group "exec-consumers"   (Exec node reads)
+ep:executions  →  consumer group "intel-consumers"  (Intel node reads)
+```
+
+Both streams are capped at `MAXLEN ~= APPROX` so they never grow unbounded.
+
+---
+
+## Message types
+
+### 1. `SIGNAL` — edge opportunity
+
+Published by Intel to `ep:signals`. Exec must process or discard within `ttl_ms`.
+
+```jsonc
+{
+  // ── Identity ────────────────────────────────────────────────────────────
+  "signal_id":       "a3f7c2d1-...",   // UUIDv4 — deduplicate on this
+  "schema_version":  "1",
+  "msg_type":        "SIGNAL",
+  "source_node":     "intel-do-nyc3",
+  "ts_us":           1718000000000000, // microseconds since UNIX epoch (UTC)
+  "ttl_ms":          30000,            // Exec MUST discard if now > ts_us + ttl_ms*1000
+
+  // ── Classification ───────────────────────────────────────────────────────
+  "asset_class":     "kalshi",         // "kalshi" | "btc_spot" | "cme_btc_basis"
+  "strategy":        "fomc_directional",
+  // strategy values:
+  //   "fomc_directional"   — FRED-anchored fair value vs Kalshi price
+  //   "fomc_arb"           — monotonicity violation across T-level contracts
+  //   "fomc_weather"       — NOAA NWS temperature/precip model
+  //   "fomc_economic"      — FRED macro threshold model
+  //   "btc_mr"             — BTC mean-reversion z-score
+  //   "cme_btc_basis"      — CME futures vs spot basis (future)
+  "category":        "fomc",           // "fomc" | "arb" | "weather" | "mean_reversion" | "basis"
+
+  // ── Market ───────────────────────────────────────────────────────────────
+  "ticker":          "KXFED-27APR-T4.25",
+  "exchange":        "kalshi",         // "kalshi" | "coinbase" | "bybit" | "cme"
+  "side":            "yes",            // "yes" | "no"  (Kalshi)  "buy" | "sell" (BTC)
+
+  // ── Pricing ──────────────────────────────────────────────────────────────
+  "market_price":    0.72,    // current mid-price  (0–1 for Kalshi, USD for BTC)
+  "fair_value":      0.85,    // model-derived fair value (same units as market_price)
+  "edge":            0.13,    // abs(fair_value - market_price)  gross edge
+  "fee_adjusted_edge": 0.06,  // edge after estimated exchange fees
+
+  // ── Confidence & sizing ──────────────────────────────────────────────────
+  "confidence":      0.88,    // [0, 1]  model confidence
+  "suggested_size":  4,       // contracts / units from Kelly sizing on Intel
+  "kelly_fraction":  0.25,    // kelly_f used to produce suggested_size
+
+  // ── Risk flags ───────────────────────────────────────────────────────────
+  // Exec uses these as advisory. Unknown flags are treated as WARNING.
+  // Never fail-closed on unknown flags — Intel/Exec may be on different versions.
+  "risk_flags": [],
+  // Possible values:
+  //   "WIDE_SPREAD"       spread_cents > configured max
+  //   "LOW_LIQUIDITY"     volume below minimum threshold
+  //   "STALE_DATA"        model data > 10 min old (confidence already reduced)
+  //   "HIGH_CONFIDENCE"   confidence > 0.90 (positive flag — size up allowed)
+  //   "NEAR_EXPIRY"       < 24h to market resolution
+  //   "MODEL_DIVERGENCE"  FedWatch and ZQ futures disagree > 4%
+  //   "ARB_PARTNER"       this signal has a paired leg (see arb_partner field)
+
+  // ── Market microstructure ────────────────────────────────────────────────
+  "spread_cents":    4,       // bid-ask spread in cents (null if unknown)
+  "book_depth":      250,     // total quantity at best bid+ask
+
+  // ── Market timing ────────────────────────────────────────────────────────
+  "close_time":      "2025-05-07T16:00:00Z",  // RFC3339 market close/expiry
+  // Exec uses this to trigger pre-expiry exits (HOURS_BEFORE_CLOSE config).
+  // null for BTC-USD (no expiry).
+
+  // ── FOMC-specific (null for non-FOMC) ────────────────────────────────────
+  "meeting":         "2025-05",     // ISO year-month of FOMC meeting
+  "outcome":         "CUT_25",      // "HOLD" | "CUT_25" | "CUT_50" | "HIKE_25" etc.
+  "model_source":    "fedwatch+zq", // which data sources contributed
+  "arb_partner":     null,          // paired ticker for arb signals
+
+  // ── BTC mean-reversion (null for non-BTC) ────────────────────────────────
+  "btc_price":       null,   // current spot price in USD
+  "btc_z_score":     null,   // std deviations from rolling mean
+  "btc_lookback_m":  null,   // rolling window in minutes
+
+  // ── CME basis — future-ready (null until implemented) ────────────────────
+  "futures_ticker":  null,   // e.g. "BTCM5"
+  "basis_bps":       null,   // (futures_price - spot_price) / spot_price * 10000
+  "carry_rate":      null    // annualised basis rate
+}
+```
+
+---
+
+### 2. `EXECUTION_REPORT` — fill confirmation
+
+Published by Exec to `ep:executions` after every signal processed (filled OR rejected).
+Intel reads these to update stats and confirm dedup state is correct.
+
+```jsonc
+{
+  // ── Identity ────────────────────────────────────────────────────────────
+  "exec_id":         "b8e2a4f9-...",   // UUIDv4 — unique per report
+  "signal_id":       "a3f7c2d1-...",   // links back to SignalMessage.signal_id
+  "schema_version":  "1",
+  "msg_type":        "EXECUTION_REPORT",
+  "source_node":     "exec-qvps-chi",
+  "ts_us":           1718000000100000,
+
+  // ── Result ───────────────────────────────────────────────────────────────
+  "status": "filled",
+  // status values:
+  //   "filled"    — order placed (paper sim or live)
+  //   "rejected"  — risk gate blocked it (see reject_reason)
+  //   "expired"   — signal TTL had already passed when Exec read it
+  //   "duplicate" — ticker already in Redis positions at time of processing
+  //   "failed"    — HTTP or exchange error during order placement
+
+  "reject_reason": null,
+  // reject_reason values (set when status != "filled"):
+  //   "EXPIRED"             ttl_ms exceeded
+  //   "DUPLICATE"           ep:positions[ticker] already exists
+  //   "BALANCE_UNKNOWN"     could not read Intel balance from Redis
+  //   "RISK_GATE_SIZE"      Kelly sizing returned 0 contracts
+  //   "RISK_GATE_SPREAD"    spread_cents exceeded max_spread_cents
+  //   "RISK_GATE_EXPOSURE"  order would exceed market or total exposure limit
+  //   "RISK_GATE_DRAWDOWN"  daily drawdown limit hit — trading halted
+  //   "RISK_GATE_KALSHI"    generic Kalshi risk manager rejection
+  //   "UNKNOWN_ASSET_CLASS" asset_class not handled by this Exec version
+  //   "HTTP_ERROR"          network or exchange API error
+
+  // ── Fill details (set when status == "filled") ───────────────────────────
+  "ticker":       "KXFED-27APR-T4.25",
+  "asset_class":  "kalshi",
+  "side":         "yes",
+  "contracts":    4,
+  "fill_price":   0.72,   // actual fill price (may differ from signal market_price)
+  "order_id":     "kalshi-order-abc123",  // exchange order ID; "paper" for simulated
+  "mode":         "paper",  // "paper" | "live"
+
+  // ── Cost accounting ───────────────────────────────────────────────────────
+  "cost_cents":    288,   // fill_price * contracts * 100
+  "fee_cents":     20,    // estimated fee on this trade
+  "edge_captured": 0.13   // signal.edge at time of fill (for P&L attribution)
+}
+```
+
+---
+
+### 3. State entries in Redis Hashes (not stream messages)
+
+#### `ep:positions` (HASH — Exec writes, Intel reads for dedup)
+
+Key: `ticker`  
+Value: JSON object
+
+```jsonc
+{
+  "side":        "yes",
+  "contracts":   4,
+  "entry_cents": 72,
+  "fair_value":  0.85,
+  "meeting":     "2025-05",
+  "outcome":     "CUT_25",
+  "close_time":  "2025-05-07T16:00:00Z",  // RFC3339 — used for pre-expiry exits
+  "entered_at":  "2025-05-06T14:32:00Z"
+}
+```
+
+#### `ep:prices` (HASH — Intel writes, Exec reads for exit management)
+
+Key: `ticker`  
+Value: JSON object
+
+```jsonc
+{
+  "yes_price":  72,
+  "no_price":   28,
+  "spread":     4,
+  "last_price": 71,
+  "ts_us":      1718000000000000
+}
+```
+
+Exec uses `last_price` for take-profit / stop-loss calculations.
+Any entry older than 300s (5 min) should be treated as stale by Exec.
+
+#### `ep:balance` (HASH — both nodes write)
+
+Key: `node_id`  
+Value: JSON object
+
+```jsonc
+{
+  "balance_cents": 100000,
+  "mode":          "paper",
+  "ts_us":         1718000000000000
+}
+```
+
+Exec reads the Intel node's balance entry for risk sizing when it cannot
+access the exchange directly (common in paper mode).
+
+#### `ep:config` (HASH — ops writes for runtime overrides)
+
+```
+HALT_TRADING     "1"          # emergency stop — both nodes check this
+EDGE_THRESHOLD   "0.12"       # override config.py value at runtime
+MAX_CONTRACTS    "3"          # temporary size reduction
+```
+
+---
+
+### 4. `SYSTEM` events — `ep:system` stream
+
+Informational only. Neither Intel nor Exec acts on these; they are for monitoring.
+
+```jsonc
+{
+  "event_type": "INTEL_START",   // INTEL_START | INTEL_STOP | EXEC_START | EXEC_STOP
+                                 // DRAWDOWN_HALT | WS_RECONNECT | MARKET_RESCAN
+  "node":       "intel-do-nyc3",
+  "detail":     "mode=paper",
+  "ts_us":      1718000000000000
+}
+```
+
+---
+
+## Ordering guarantees and delivery semantics
+
+| Stream | Producer | Consumer group | Guarantee |
+|---|---|---|---|
+| `ep:signals` | Intel (1 producer) | `exec-consumers` | At-least-once delivery via XACK. Exec deduplicates on `ep:positions` hash. |
+| `ep:executions` | Exec (1 producer) | `intel-consumers` | At-least-once. Intel deduplicates on `exec_id` if needed. |
+| `ep:system` | Both | Read-only (monitoring) | Fire-and-forget. |
+
+### TTL semantics
+
+Signal TTL is enforced by Exec, not by Redis expiry. Redis Streams do not natively
+expire individual entries. Exec checks `(now_us - ts_us) > ttl_ms * 1000` and
+publishes an `ExecutionReport(status="expired")` without placing an order.
+
+This means Intel can always audit what happened to every signal it published.
+
+### Crash recovery
+
+If Exec crashes mid-processing, the unconsumed stream entries remain in the consumer
+group's PEL (Pending Entries List). On restart, Exec reads PEL entries first
+(`XREADGROUP ... ID "0"` instead of `">"`) and re-processes them. Because dedup
+is on `ep:positions`, re-processing a signal for a position already open produces
+an `ExecutionReport(status="duplicate")` — no double entry.
+
+---
+
+## Versioning
+
+`schema_version: "1"` is included in every message. When fields are added:
+- Add with a default value (backward compatible — old consumers skip unknown fields)
+- Increment version only for breaking changes (field removal or type change)
+- Consumers MUST ignore unknown fields rather than error

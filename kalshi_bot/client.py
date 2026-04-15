@@ -117,8 +117,6 @@ class KalshiClient:
 
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._concurrency)
-        if self._semaphore is None or self._semaphore._loop != asyncio.get_event_loop():
-            self._semaphore = asyncio.Semaphore(self._concurrency)
         async with self._semaphore:
             for attempt in range(self.max_retries + 1):
                 if attempt > 0:
@@ -146,4 +144,7 @@ class KalshiClient:
             paths   = [f"/markets/{t}/orderbook" for t in tickers]
             results = await client.get_many(paths)
         """
+        # Reset semaphore each call — asyncio.run() creates a new event loop each
+        # time fetch_signals is called, so the previous semaphore is stale.
+        self._semaphore = asyncio.Semaphore(self._concurrency)
         return await asyncio.gather(*[self._async_get(p) for p in paths])

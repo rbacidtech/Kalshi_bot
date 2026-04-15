@@ -10,6 +10,29 @@ from dotenv import load_dotenv
 load_dotenv()
 log = logging.getLogger(__name__)
 
+
+def _getenv_int(key: str, default: int) -> int:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        log.error("Config: %s=%r is not an integer, using default %d", key, val, default)
+        return default
+
+
+def _getenv_float(key: str, default: float) -> float:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        log.error("Config: %s=%r is not a float, using default %f", key, val, default)
+        return default
+
+
 # ── Credentials ───────────────────────────────────────────────────────────────
 API_KEY_ID       = os.getenv("KALSHI_API_KEY_ID", "")
 PRIVATE_KEY_PATH = Path(os.getenv("KALSHI_PRIVATE_KEY_PATH", "private_key.pem"))
@@ -26,33 +49,33 @@ BASE_URL = os.getenv("KALSHI_BASE_URL", "").strip() or _DEFAULT_URL
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 # Raised from 0.05 to 0.10 — minimum edge must exceed typical fee (7¢) plus margin
-EDGE_THRESHOLD   = float(os.getenv("KALSHI_EDGE_THRESHOLD", "0.10"))
-MAX_CONTRACTS    = int(os.getenv("KALSHI_MAX_CONTRACTS", "10"))
-POLL_INTERVAL    = int(os.getenv("KALSHI_POLL_INTERVAL", "120"))   # 2 min default for FOMC
-MIN_CONFIDENCE   = float(os.getenv("KALSHI_MIN_CONFIDENCE", "0.60"))
+EDGE_THRESHOLD   = _getenv_float("KALSHI_EDGE_THRESHOLD", 0.10)
+MAX_CONTRACTS    = _getenv_int("KALSHI_MAX_CONTRACTS", 10)
+POLL_INTERVAL    = _getenv_int("KALSHI_POLL_INTERVAL", 120)   # 2 min default for FOMC
+MIN_CONFIDENCE   = _getenv_float("KALSHI_MIN_CONFIDENCE", 0.60)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
 TRADES_CSV = OUTPUT_DIR / "trades.csv"
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
-HTTP_TIMEOUT  = int(os.getenv("KALSHI_HTTP_TIMEOUT", "10"))
-MAX_RETRIES   = int(os.getenv("KALSHI_MAX_RETRIES", "3"))
-RETRY_BACKOFF = float(os.getenv("KALSHI_RETRY_BACKOFF", "2.0"))
-CONCURRENCY   = int(os.getenv("KALSHI_CONCURRENCY", "10"))   # fewer needed for FOMC-only
+HTTP_TIMEOUT  = _getenv_int("KALSHI_HTTP_TIMEOUT", 10)
+MAX_RETRIES   = _getenv_int("KALSHI_MAX_RETRIES", 3)
+RETRY_BACKOFF = _getenv_float("KALSHI_RETRY_BACKOFF", 2.0)
+CONCURRENCY   = _getenv_int("KALSHI_CONCURRENCY", 10)   # fewer needed for FOMC-only
 
 # ── Risk ──────────────────────────────────────────────────────────────────────
-KELLY_FRACTION        = float(os.getenv("KALSHI_KELLY_FRACTION", "0.25"))
-MAX_MARKET_EXPOSURE   = float(os.getenv("KALSHI_MAX_MARKET_EXPOSURE", "0.05"))
-MAX_TOTAL_EXPOSURE    = float(os.getenv("KALSHI_MAX_TOTAL_EXPOSURE", "0.30"))  # tighter: FOMC only
-DAILY_DRAWDOWN_LIMIT  = float(os.getenv("KALSHI_DAILY_DRAWDOWN_LIMIT", "0.10"))
-MAX_SPREAD_CENTS      = int(os.getenv("KALSHI_MAX_SPREAD_CENTS", "10"))        # tighter for FOMC
-FEE_CENTS             = int(os.getenv("KALSHI_FEE_CENTS", "7"))
+KELLY_FRACTION        = _getenv_float("KALSHI_KELLY_FRACTION", 0.25)
+MAX_MARKET_EXPOSURE   = _getenv_float("KALSHI_MAX_MARKET_EXPOSURE", 0.05)
+MAX_TOTAL_EXPOSURE    = _getenv_float("KALSHI_MAX_TOTAL_EXPOSURE", 0.30)  # tighter: FOMC only
+DAILY_DRAWDOWN_LIMIT  = _getenv_float("KALSHI_DAILY_DRAWDOWN_LIMIT", 0.10)
+MAX_SPREAD_CENTS      = _getenv_int("KALSHI_MAX_SPREAD_CENTS", 10)        # tighter for FOMC
+FEE_CENTS             = _getenv_int("KALSHI_FEE_CENTS", 7)
 
 # ── Exit management ───────────────────────────────────────────────────────────
-TAKE_PROFIT_CENTS    = int(os.getenv("KALSHI_TAKE_PROFIT_CENTS", "20"))
-STOP_LOSS_CENTS      = int(os.getenv("KALSHI_STOP_LOSS_CENTS", "15"))
-HOURS_BEFORE_CLOSE   = float(os.getenv("KALSHI_HOURS_BEFORE_CLOSE", "24.0"))
+TAKE_PROFIT_CENTS    = _getenv_int("KALSHI_TAKE_PROFIT_CENTS", 20)
+STOP_LOSS_CENTS      = _getenv_int("KALSHI_STOP_LOSS_CENTS", 15)
+HOURS_BEFORE_CLOSE   = _getenv_float("KALSHI_HOURS_BEFORE_CLOSE", 24.0)
 
 
 def validate():
@@ -64,9 +87,9 @@ def validate():
         if not PRIVATE_KEY_PATH.exists():
             errors.append(f"Private key not found at '{PRIVATE_KEY_PATH}'.")
 
-    if EDGE_THRESHOLD < 0.08:
+    if not 0.08 <= EDGE_THRESHOLD <= 0.50:
         errors.append(
-            f"KALSHI_EDGE_THRESHOLD={EDGE_THRESHOLD} is below 0.08. "
+            f"KALSHI_EDGE_THRESHOLD={EDGE_THRESHOLD} must be between 0.08 and 0.50. "
             "With 7¢ fees, edges below 8¢ are likely unprofitable."
         )
     if MAX_CONTRACTS < 1:

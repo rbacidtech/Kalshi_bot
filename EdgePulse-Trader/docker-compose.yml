@@ -1,0 +1,73 @@
+# EdgePulse monitoring stack — DO Droplet (Intel node)
+#
+# Services:
+#   redis      — edge-bus (self-hosted; remove this block if using DO Managed Redis)
+#   prometheus — scrapes EdgePulse bot metrics on :9091
+#   grafana    — dashboards at http://<DO-IP>:3000  (admin / changeme)
+#
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f
+
+version: "3.9"
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "127.0.0.1:6379:6379"   # bind to loopback only — DO firewall blocks external
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+        --save 60 1
+        --save 300 10
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    ports:
+      - "127.0.0.1:9090:9090"   # accessible via SSH tunnel: ssh -L 9090:localhost:9090 root@<DO-IP>
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"    # allow hot config reload via POST /-/reload
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach bot process on the host
+    depends_on:
+      - redis
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "3000:3000"   # public — protect with DO firewall to your IP only
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=changeme    # CHANGE THIS
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana-provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
