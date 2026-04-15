@@ -183,8 +183,18 @@ async def intel_main() -> None:
                 log.exception("Signal generation failed.")
 
             # ── Dedup: skip tickers already held in Redis positions ───────────
+            # For arb signals both legs must be held to consider the pair complete.
+            # If only the primary is held (partner failed), re-publish so Exec can
+            # place the missing partner leg.
             current_positions = await bus.get_all_positions()
-            new_signals = [s for s in signals if s.ticker not in current_positions]
+            new_signals = [
+                s for s in signals
+                if s.ticker not in current_positions
+                or (
+                    getattr(s, "arb_partner", None)
+                    and s.arb_partner not in current_positions
+                )
+            ]
 
             # ── BTC mean-reversion signals ────────────────────────────────────
             if btc_strategy:
