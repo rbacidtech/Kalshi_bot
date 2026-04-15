@@ -16,9 +16,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── sys.path bootstrap ────────────────────────────────────────────────────────
+# After flattening, kalshi_bot/ and ep_*.py are siblings in the same directory.
+# A single insert covers both — no parent traversal needed.
 _here = Path(__file__).resolve().parent
-sys.path.insert(0, str(_here))          # EdgePulse-Trader/ — ep_* sibling modules
-sys.path.insert(0, str(_here.parent))   # Kalshi_bot/       — kalshi_bot package
+sys.path.insert(0, str(_here))          # /root/EdgePulse — kalshi_bot + ep_* modules
 
 import kalshi_bot.config as cfg  # noqa: E402  (must follow sys.path setup)
 
