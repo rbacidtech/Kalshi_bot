@@ -64,8 +64,49 @@ class RedisBus:
         Blocks up to STREAM_BLOCK ms waiting for new entries.
         Caller must call ack_signal(entry_id) after processing.
 
+        On startup, drains the PEL (pending entries from a prior crash) before
+        switching to ">" (new only). This ensures crash-recovery: any signal
+        that was delivered but not ACK'd before a crash is re-processed.
+
         On Redis error, logs and retries after 2 s — never raises.
         """
+        # ── Phase 1: drain PEL from any prior crash ───────────────────────────
+        # Read with ID "0" returns all pending (delivered-not-ACK'd) entries.
+        # Loop until PEL is empty, then fall through to live ">" reads.
+        log.info("consume_signals: draining PEL for consumer=%s", consumer_name)
+        while True:
+            try:
+                pending = await self._r.xreadgroup(
+                    groupname    = EXEC_GROUP,
+                    consumername = consumer_name,
+                    streams      = {EP_SIGNALS: "0"},   # "0" = pending entries
+                    count        = 100,
+                    block        = 0,   # non-blocking
+                )
+                if not pending:
+                    break
+                had_entries = False
+                for _stream, entries in pending:
+                    for entry_id, mapping in entries:
+                        had_entries = True
+                        try:
+                            sig = SignalMessage.from_redis(mapping)
+                            log.debug("PEL re-delivery: %s (age=%dms)",
+                                      sig.ticker,
+                                      (int(time.time() * 1_000_000) - sig.ts_us) // 1_000)
+                            yield entry_id, sig
+                        except Exception as exc:
+                            log.warning("Malformed PEL entry %s — acking: %s", entry_id, exc)
+                            await self.ack_signal(entry_id)
+                if not had_entries:
+                    break
+            except aioredis.RedisError as exc:
+                log.error("Redis PEL drain error: %s — retry in 2s", exc)
+                await asyncio.sleep(2)
+                break   # fall through to live reads; PEL will retry next restart
+        log.info("consume_signals: PEL drained, switching to live stream")
+
+        # ── Phase 2: live stream ──────────────────────────────────────────────
         while True:
             try:
                 results = await self._r.xreadgroup(

@@ -130,13 +130,15 @@ class Executor:
         if signal.ticker in self._positions:
             log.debug("Skipping %s — already in positions.", signal.ticker)
             return False
-        # Hard exposure cap — stop new entries if total paper exposure > $12
+        # Exposure guard — skip if in-memory positions already exceed $800.
+        # (The Redis-based UnifiedRiskEngine applies its own cap before this
+        # point; this is a last-resort safety net for the local position cache.)
         total_exposure = sum(
             p.get("entry_cents", 50) * p.get("contracts", 1) / 100
             for p in self._positions.values()
         )
         if total_exposure > 800.00:
-            log.debug("Skipping %s — exposure cap reached ($%.2f > $800.00).", signal.ticker, total_exposure)
+            log.debug("Skipping %s — local exposure cap reached ($%.2f).", signal.ticker, total_exposure)
             return False
 
         if self.paper:

@@ -202,6 +202,9 @@ async def _signal_consumer(
     log.info("Signal consumer started (consumer=%s)", consumer_name)
 
     async for entry_id, sig in bus.consume_signals(consumer_name):
+        # Clear per-signal held set — Redis ep:positions is the session dedup;
+        # _held prevents duplicate entry within a single atomic operation only.
+        executor.reset_cycle()
         try:
             report = await _process_signal(sig, bus, positions, risk_engine, executor)
             await bus.publish_execution(report)
@@ -362,6 +365,17 @@ async def exec_main() -> None:
         hours_before_close = cfg.HOURS_BEFORE_CLOSE,
         state              = None,   # no BotState on Exec — state lives in Redis
     )
+
+    # Sync executor in-memory positions from Redis on startup.
+    # Redis is authoritative; the file-backed positions may be stale after a crash.
+    redis_positions = await positions.get_all()
+    if redis_positions:
+        executor._positions = redis_positions
+        executor._save_paper_positions()
+        log.info("Startup: synced %d positions from Redis → executor", len(redis_positions))
+    else:
+        log.info("Startup: no Redis positions — executor loaded %d from disk",
+                 len(executor._positions))
 
     try:
         # Two concurrent tasks — neither blocks the other

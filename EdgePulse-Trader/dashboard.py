@@ -204,7 +204,7 @@ def fetch_all(r: redis.Redis) -> Dict[str, Any]:
         else:
             pos["_upnl"] = None
             pos["_cur"]  = None
-        if pos["_upnl"]:
+        if pos["_upnl"] is not None:
             open_upnl += pos["_upnl"]
 
     return {
@@ -319,16 +319,16 @@ with st.sidebar:
 
     # Controls
     auto_refresh = st.toggle("Auto-refresh (3s)", value=True)
-    if st.button("↻ Refresh", use_container_width=True):
+    if st.button("↻ Refresh", width="stretch"):
         st.rerun()
 
     if not err:
         if d["is_halted"]:
-            if st.button("▶ Resume", use_container_width=True, type="primary"):
+            if st.button("▶ Resume", width="stretch", type="primary"):
                 r.hset("ep:config", mapping={"HALT_TRADING": "0", "llm_halt_trading": "0"})
                 time.sleep(0.2); st.rerun()
         else:
-            if st.button("🛑 Halt", use_container_width=True):
+            if st.button("🛑 Halt", width="stretch"):
                 r.hset("ep:config", mapping={"HALT_TRADING": "1", "llm_halt_trading": "1"})
                 time.sleep(0.2); st.rerun()
 
@@ -426,7 +426,7 @@ with t_ov:
         ]
         st.dataframe(
             pd.DataFrame(ev_rows),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=min(38 * len(ev_rows) + 38, 460),
         )
@@ -490,7 +490,7 @@ with t_btc:
             "Edge":  f"{f.get('edge_captured', 0):.4f}",
             "Mode":  f.get("mode", "—"),
         } for f in btc_fills[:50]]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     else:
         st.caption(
             "No BTC fills this session. "
@@ -526,7 +526,7 @@ with t_kal:
             "Edge":    f"{f.get('edge_captured', 0):.3f}",
             "Mode":    f.get("mode", "—"),
         } for f in kal_fills[:50]]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=260)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=260)
     else:
         st.caption("No Kalshi fills yet — signals fire when edge ≥ EDGE_THRESHOLD and confidence ≥ MIN_CONFIDENCE.")
 
@@ -544,7 +544,7 @@ with t_kal:
             "Last":    f"{p.get('last_price', 0):.0f}¢",
             "Age":     ago(p.get("ts_us")),
         } for t, p in list(kal_prices.items())[:80]]
-        st.dataframe(pd.DataFrame(price_rows), use_container_width=True, hide_index=True, height=360)
+        st.dataframe(pd.DataFrame(price_rows), width="stretch", hide_index=True, height=360)
     else:
         st.caption("Price data populates once the Intel node's WebSocket connects.")
 
@@ -596,8 +596,8 @@ with t_pos:
                 pass
             return ""
 
-        styled = df.style.applymap(_colour_pnl, subset=["P&L ¢"])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        styled = df.style.map(_colour_pnl, subset=["P&L ¢"])
+        st.dataframe(styled, width="stretch", hide_index=True)
 
         # Per-position P&L bars
         positions_with_pnl = [(t, p) for t, p in positions.items() if p.get("_upnl") is not None]
@@ -672,7 +672,7 @@ with t_hist:
         } for f in fills]
         st.dataframe(
             pd.DataFrame(fill_rows),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=400,
         )
@@ -686,7 +686,7 @@ with t_hist:
                 "Ticker": rej.get("ticker",        "—"),
                 "Reason": rej.get("reject_reason", "—"),
             } for rej in rejects]
-            st.dataframe(pd.DataFrame(rej_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rej_rows), width="stretch", hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -702,11 +702,11 @@ with t_ctrl:
     ec1, ec2 = st.columns([1, 3])
     with ec1:
         if is_halted:
-            if st.button("▶ Resume trading", type="primary", use_container_width=True):
+            if st.button("▶ Resume trading", type="primary", width="stretch"):
                 r.hset("ep:config", mapping={"HALT_TRADING": "0", "llm_halt_trading": "0"})
                 time.sleep(0.2); st.rerun()
         else:
-            if st.button("🛑 Halt all trading", use_container_width=True):
+            if st.button("🛑 Halt all trading", width="stretch"):
                 r.hset("ep:config", mapping={"HALT_TRADING": "1", "llm_halt_trading": "1"})
                 time.sleep(0.2); st.rerun()
     with ec2:
@@ -796,14 +796,14 @@ with t_ctrl:
     if llm_keys:
         st.dataframe(
             pd.DataFrame([{"Parameter": k[4:], "Value": config[k]} for k in llm_keys]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=min(38 * len(llm_keys) + 38, 280),
         )
 
     lc1, lc2 = st.columns([1, 1])
     with lc1:
-        if st.button("▶ Run LLM now", use_container_width=True,
+        if st.button("▶ Run LLM now", width="stretch",
                       help="Launch llm_agent.py one-shot. Policy updates in ~10s."):
             try:
                 subprocess.Popen(
@@ -816,7 +816,7 @@ with t_ctrl:
             except Exception as exc:
                 st.error(f"Failed: {exc}")
     with lc2:
-        if st.button("✕ Clear LLM overrides", use_container_width=True,
+        if st.button("✕ Clear LLM overrides", width="stretch",
                       help="Delete all llm_* keys from ep:config, reverting to .env defaults."):
             keys_to_del = [k for k in r.hkeys("ep:config") if k.startswith("llm_")]
             if keys_to_del:

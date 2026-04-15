@@ -2,6 +2,9 @@
 private_key.pem
 *.pem
 __pycache__/
+**/__pycache__/
 .venv/
 output/
 *.pyc
+*.log
+*.jsonl
