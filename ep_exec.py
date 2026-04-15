@@ -154,7 +154,7 @@ async def _process_signal(
     if not executed:
         return _rejected("HTTP_ERROR")
 
-    # ── Write position to Redis ───────────────────────────────────────────────
+    # ── Write primary position to Redis ──────────────────────────────────────
     await positions.open(
         ticker      = sig.ticker,
         side        = sig.side,
@@ -172,6 +172,65 @@ async def _process_signal(
     metrics.signal_published(sig.asset_class, sig.strategy or "unknown", sig.side)
     log.info("Executed: %s %s ×%d @ %.4f  cost=$%.2f",
              sig.ticker, sig.side, contracts, sig.market_price, cost_cents / 100)
+
+    # ── ARB partner leg (atomic second leg for monotonicity arb) ─────────────
+    # When sig.arb_partner is set, the signal is a two-leg arb:
+    #   Primary : sig.ticker      side=yes  buy the underpriced YES
+    #   Partner : sig.arb_partner side=no   buy the overpriced NO (= sell YES)
+    # Execute the partner immediately in the same task — no await between legs
+    # means no other signal can slip between them.
+    if sig.arb_partner and "ARB_PARTNER" in (sig.risk_flags or []):
+        partner_already_open = await positions.exists(sig.arb_partner)
+        if not partner_already_open:
+            # Resolve partner NO price from Redis prices (Intel publishes each cycle)
+            partner_prices = await bus.get_prices([sig.arb_partner])
+            pdata          = partner_prices.get(sig.arb_partner, {})
+            # no_price = 1 - yes_price; fall back to complement of primary fair_value
+            partner_price = (
+                pdata.get("no_price")
+                or (1.0 - (pdata.get("yes_price") or sig.fair_value))
+            )
+            partner_price = max(0.01, min(0.99, float(partner_price)))
+
+            from kalshi_bot.strategy import Signal as KSignal
+            partner_sig = KSignal(
+                ticker            = sig.arb_partner,
+                title             = sig.arb_partner,
+                category          = sig.category or "arb",
+                side              = "no",
+                fair_value        = 1.0 - sig.fair_value,
+                market_price      = partner_price,
+                edge              = sig.edge,
+                fee_adjusted_edge = sig.fee_adjusted_edge,
+                contracts         = contracts,
+                confidence        = sig.confidence,
+                model_source      = f"arb_partner:{sig.ticker}",
+                meeting           = sig.meeting or "",
+                outcome           = sig.outcome or "",
+            )
+            executor.reset_cycle()
+            partner_ok = executor.execute(partner_sig)
+            if partner_ok:
+                await positions.open(
+                    ticker      = sig.arb_partner,
+                    side        = "no",
+                    contracts   = contracts,
+                    entry_cents = int(partner_price * 100),
+                    fair_value  = 1.0 - sig.fair_value,
+                    meeting     = sig.meeting or "",
+                    outcome     = sig.outcome or "",
+                    close_time  = sig.close_time or "",
+                )
+                cost_cents += int(partner_price * 100) * contracts
+                log.info("ARB partner: %s NO ×%d @ %.4f  (pair: %s)",
+                         sig.arb_partner, contracts, partner_price, sig.ticker)
+            else:
+                log.warning(
+                    "ARB partner leg FAILED for %s — primary %s is now an unhedged leg",
+                    sig.arb_partner, sig.ticker,
+                )
+        else:
+            log.debug("ARB partner %s already held — skipping second leg", sig.arb_partner)
 
     return ExecutionReport(
         signal_id     = sig.signal_id,
