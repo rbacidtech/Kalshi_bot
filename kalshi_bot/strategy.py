@@ -884,11 +884,17 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
 
     signals = []
 
-    # Filter to economic markets
+    # Filter to economic markets.
+    # Exclude KXGDP-prefixed tickers — those are GDP growth-rate threshold
+    # markets handled by scan_gdp_markets(), which uses GDPNow correctly.
+    # Including them here would apply the nominal GDP level series (FRED "GDP"
+    # in billions) against a mis-parsed threshold, producing a spurious ~0.98
+    # fair value for every KXGDP contract.
     econ_keywords = ["cpi", "inflation", "unemployment", "payroll", "jobs", "gdp", "fed"]
     econ_markets  = [
         m for m in markets
         if any(kw in m.get("title", "").lower() for kw in econ_keywords)
+        and not m.get("ticker", "").startswith("KXGDP")
         and _market_volume(m) >= 50
     ]
     if not econ_markets:
