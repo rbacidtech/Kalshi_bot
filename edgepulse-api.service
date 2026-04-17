@@ -1,0 +1,31 @@
+[Unit]
+Description=EdgePulse FastAPI Backend
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/root/EdgePulse/.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/EdgePulse/.venv/bin/uvicorn api.main:app \
+    --host 0.0.0.0 \
+    --port 8502 \
+    --workers 2 \
+    --log-level info \
+    --access-log \
+    --proxy-headers \
+    --forwarded-allow-ips=*
+
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/root/EdgePulse
+
+[Install]
+WantedBy=multi-user.target

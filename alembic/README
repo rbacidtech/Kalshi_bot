@@ -1,0 +1,13 @@
+Generic single-database async configuration with asyncpg.
+
+Generate a migration:
+    DATABASE_URL=postgresql+asyncpg://user:pass@host/edgepulse \
+        alembic revision --autogenerate -m "describe change"
+
+Apply migrations:
+    DATABASE_URL=postgresql+asyncpg://user:pass@host/edgepulse \
+        alembic upgrade head
+
+Rollback one step:
+    DATABASE_URL=postgresql+asyncpg://user:pass@host/edgepulse \
+        alembic downgrade -1

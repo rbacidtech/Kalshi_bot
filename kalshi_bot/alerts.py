@@ -269,19 +269,23 @@ class AlertManager:
             log.warning("SMS failed: %s", exc)
 
     def _send_email(self, subject: str, body: str):
+        import json, urllib.request, os
+        api_key = os.getenv("RESEND_API_KEY", "")
+        if not api_key:
+            return
         try:
-            msg            = MIMEMultipart()
-            msg["From"]    = self._email_from
-            msg["To"]      = self._email_to
-            msg["Subject"] = f"[Kalshi Bot] {subject}"
-            msg.attach(MIMEText(body, "plain"))
-
-            with smtplib.SMTP(self._smtp_host, self._smtp_port) as server:
-                server.starttls()
-                if self._smtp_password:
-                    server.login(self._smtp_user, self._smtp_password)
-                server.sendmail(self._email_from, self._email_to, msg.as_string())
-
+            payload = json.dumps({
+                "from":    "EdgePulse <onboarding@resend.dev>",
+                "to":      [self._email_to],
+                "subject": f"[EdgePulse] {subject}",
+                "text":    body,
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=payload,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=10)
             log.debug("Email sent to %s.", self._email_to)
         except Exception as exc:
             log.warning("Email failed: %s", exc)

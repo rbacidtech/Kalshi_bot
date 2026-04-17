@@ -54,13 +54,16 @@ class TestKellySizing:
         assert rm.size(edge=0.07, market_price=0.50, balance_cents=100_000) == 0
 
     def test_positive_edge_yes_side(self):
-        """With known values, verify formula gives a positive integer result."""
-        rm = make_risk(kelly_fraction=0.25, fee_cents=7, max_contracts=100,
+        """With known values, verify Kelly formula gives the correct uncapped result."""
+        rm = make_risk(kelly_fraction=0.25, fee_cents=7, max_contracts=200,
                        max_market_exposure=1.0)
         # net_edge = 0.20 - 0.07 = 0.13
         # kelly_f  = 0.13 / (1 - 0.50) = 0.26
         # bet_frac = 0.26 * 0.25 * 1.0 = 0.065
-        # max_kelly = int(100_000 * 0.065 / 50) = 130
+        # price_cents = 50
+        # max_by_kelly = int(100_000 * 0.065 / 50) = 130
+        # max_by_cap   = int(100_000 * 1.0 / 50) = 2000
+        # result = min(130, 2000, 200) = 130
         contracts = rm.size(
             edge=0.20, market_price=0.50, balance_cents=100_000,
             confidence=1.0, side="yes",

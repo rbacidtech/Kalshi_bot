@@ -7,6 +7,8 @@ Loads the private key once and exposes a single function:
 Kept separate so it can be unit-tested independently of HTTP logic.
 """
 
+import os
+import stat
 import time
 import base64
 import logging
@@ -36,6 +38,12 @@ class KalshiAuth:
     @staticmethod
     def _load_key(path: Path):
         """Load and return an RSA private key from a PEM file."""
+        st = os.stat(path)
+        if st.st_mode & (stat.S_IRGRP | stat.S_IROTH):
+            log.warning(
+                "Private key %s is group/world-readable (mode %o). "
+                "Run: chmod 600 %s", path, st.st_mode & 0o777, path
+            )
         with open(path, "rb") as f:
             key = serialization.load_pem_private_key(
                 f.read(), password=None, backend=default_backend()

@@ -17,7 +17,7 @@ services:
     image: redis:7-alpine
     restart: always
     ports:
-      - "127.0.0.1:6379:6379"   # bind to loopback only — DO firewall blocks external
+      - "6379:6379"   # bound to all interfaces — UFW restricts to QuantVPS IP only
     volumes:
       - redis-data:/data
     command: >
@@ -28,11 +28,34 @@ services:
         --appendfsync everysec
         --maxmemory 512mb
         --maxmemory-policy allkeys-lru
+        --requirepass 0yy_PSMK4ZuOm6rOl5edyUiZ-7uyHz7Ok7jxh4PJmzM
+        --rename-command FLUSHALL ""
+        --rename-command FLUSHDB ""
+        --activedefrag yes
+        --active-defrag-ignore-bytes 10mb
+        --active-defrag-threshold-lower 10
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "0yy_PSMK4ZuOm6rOl5edyUiZ-7uyHz7Ok7jxh4PJmzM", "ping"]
       interval: 10s
       timeout:  5s
       retries:  5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    ports:
+      - "127.0.0.1:5432:5432"   # localhost only — not exposed externally
+    environment:
+      POSTGRES_DB: edgepulse
+      POSTGRES_USER: edgepulse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edgepulse -d edgepulse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   prometheus:
     image: prom/prometheus:latest
@@ -58,7 +81,7 @@ services:
       - "3000:3000"   # public — protect with DO firewall to your IP only
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=changeme    # CHANGE THIS
+      - GF_SECURITY_ADMIN_PASSWORD=Ep2026!xK9mP
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_ROOT_URL=http://localhost:3000
     volumes:
@@ -71,3 +94,4 @@ volumes:
   redis-data:
   prometheus-data:
   grafana-data:
+  postgres-data:

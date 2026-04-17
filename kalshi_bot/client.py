@@ -107,13 +107,26 @@ class KalshiClient:
 
     # ── Async (concurrent order book fetching) ────────────────────────────────
 
-    async def _async_get(self, path: str, params: dict = None) -> dict | None:
+    async def _async_get(
+        self,
+        path: str,
+        params: dict = None,
+        timeout: float | None = None,
+    ) -> dict | None:
         """
         Single async GET with semaphore-limited concurrency.
         Returns None on failure so one bad market doesn't abort the batch.
+
+        `timeout` overrides self.timeout for this call (useful for bulk batch
+        requests where a shorter per-request timeout prevents the asyncio
+        event loop from blocking on hung httpx connection cleanup).
         """
         url      = self.base_url + path
         api_path = self._api_path(path)
+        # Use a shorter per-request timeout for async batch fetches so that
+        # individual requests fail naturally before asyncio.wait_for needs to
+        # cancel them (httpx cleanup after cancellation can block the event loop).
+        req_timeout = timeout if timeout is not None else self.timeout
 
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._concurrency)
@@ -124,7 +137,7 @@ class KalshiClient:
                 try:
                     headers = {**self.auth.sign("GET", api_path),
                                "Content-Type": "application/json"}
-                    async with httpx.AsyncClient(timeout=self.timeout) as http:
+                    async with httpx.AsyncClient(timeout=req_timeout) as http:
                         resp = await http.get(url, headers=headers, params=params)
                     if resp.status_code in _RETRYABLE:
                         continue
@@ -135,16 +148,27 @@ class KalshiClient:
                                 path, attempt + 1, exc)
         return None
 
-    async def get_many(self, paths: list[str]) -> list[dict | None]:
+    async def get_many(
+        self,
+        paths: list[str],
+        per_request_timeout: float | None = None,
+    ) -> list[dict | None]:
         """
         Fetch multiple paths concurrently.
         Returns results in the same order as input. None = fetch failed.
 
+        `per_request_timeout` sets a shorter httpx timeout for each request so
+        they fail naturally (via ConnectTimeout / ReadTimeout) rather than
+        requiring asyncio cancellation to tear them down.  Defaults to
+        self.timeout when omitted.
+
         Example:
             paths   = [f"/markets/{t}/orderbook" for t in tickers]
-            results = await client.get_many(paths)
+            results = await client.get_many(paths, per_request_timeout=5.0)
         """
         # Reset semaphore each call — asyncio.run() creates a new event loop each
         # time fetch_signals is called, so the previous semaphore is stale.
         self._semaphore = asyncio.Semaphore(self._concurrency)
-        return await asyncio.gather(*[self._async_get(p) for p in paths])
+        return await asyncio.gather(
+            *[self._async_get(p, timeout=per_request_timeout) for p in paths]
+        )

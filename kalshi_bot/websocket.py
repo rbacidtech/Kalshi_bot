@@ -153,7 +153,10 @@ class KalshiWebSocket:
             on_close   = self._on_close,
             header     = self._auth_headers(),
         )
-        self._ws.run_forever(ping_interval=60, ping_timeout=20)
+        # ping_interval=0 disables websocket-client's built-in RFC 6455 PING frames.
+        # Kalshi's server does not respond to these, causing spurious ping/pong
+        # timeouts every ~2.5 min. Application-level keepalive handles liveness.
+        self._ws.run_forever(ping_interval=0)
 
     def _auth_headers(self) -> list[str]:
         """
@@ -218,8 +221,9 @@ class KalshiWebSocket:
                     self._ws.send(msg)
                     log.debug("Subscribed to %s:%s", channel, ticker)
                 except Exception as exc:
-                    log.warning("Subscription failed for %s:%s — %s. Aborting.",
-                                channel, ticker, exc)
+                    # Socket closed mid-subscribe (normal during reconnect) — not a warning
+                    log.debug("Subscription failed for %s:%s — %s. Aborting.",
+                              channel, ticker, exc)
                     return
 
     # ── Message dispatcher ────────────────────────────────────────────────────
