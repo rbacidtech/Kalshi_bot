@@ -79,8 +79,8 @@ def _send_security_email(subject: str, body: str) -> None:
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             )
             urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning("Failed to send security email: %s", _e)
     threading.Thread(target=_send, daemon=True).start()
 
 
@@ -433,7 +433,7 @@ async def login(
 
     _send_security_email(
         "Admin Login",
-        f"Successful login from {request.client.host} at {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Successful login from {request.client.host} at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
     )
     _set_refresh_cookie(response, raw_refresh, settings)
     return _build_token_response(access_token)

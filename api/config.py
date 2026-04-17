@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     # ── Database ──────────────────────────────────────────────────────────────
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost/edgepulse"
+    database_url: str  # Required: set DATABASE_URL env var
 
     # ── Redis (trading state) ─────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
