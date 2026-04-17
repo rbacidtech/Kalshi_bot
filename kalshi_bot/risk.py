@@ -2,8 +2,12 @@
 risk.py — Position sizing and risk management for FOMC-focused bot.
 """
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -25,8 +29,23 @@ class RiskManager:
         self.cfg             = config
         self._start_balance  = None
         self._halted         = False
+        self._risk_day       = int(time.time() // 86400)
+        # Empirical Kelly cache — refreshed at most once per calendar day
+        self._kelly_cached:    float              = config.kelly_fraction
+        self._kelly_cache_day: Optional[datetime] = None
 
     def set_balance(self, balance_cents: int) -> None:
+        # Reset at UTC midnight
+        today = int(time.time() // 86400)
+        if self._risk_day != today:
+            self._start_balance = None
+            if self._halted:
+                log.warning(
+                    "Drawdown halt reset at UTC midnight — daily reset in effect."
+                )
+            self._halted = False
+            self._risk_day = today
+
         if self._start_balance is None:
             self._start_balance = balance_cents
             log.info("RiskManager: session balance set to $%.2f", balance_cents / 100)
@@ -39,13 +58,76 @@ class RiskManager:
                         "DRAWDOWN LIMIT HIT (%.1f%%). Trading halted.",
                         drawdown * 100,
                     )
+                    log.error(
+                        "DRAWDOWN HALT ACTIVATED — restart will clear this halt. "
+                        "Manual intervention required."
+                    )
                 self._halted = True
             else:
                 self._halted = False
 
     def reset_day(self):
+        if self._halted:
+            log.warning(
+                "reset_day() called — drawdown halt was manually cleared. "
+                "Ensure this is intentional before resuming trading."
+            )
         self._start_balance = None
         self._halted = False
+
+    async def calibrate_kelly(self, category: str = None) -> float:
+        """
+        Compute an empirical half-Kelly fraction from recent resolved trades.
+
+        Uses the last 90 days of trade history from ep_resolution_db.  Falls
+        back to the configured default (typically 0.25) when there is not yet
+        enough data (< 10 completed trades or win_rate < 0.10).
+
+        Result is cached per-instance for 24 hours so the I/O cost is
+        negligible even when called every sizing cycle.
+
+        Formula: Kelly = (p * odds - q) / odds  with odds=1.0 (binary markets),
+        then half-Kelly capped at [0.05, 0.40].
+        """
+        # Refresh at most once per calendar day
+        today = datetime.now(timezone.utc).date()
+        if self._kelly_cache_day is not None and self._kelly_cache_day == today:
+            return self._kelly_cached
+
+        default = self.cfg.kelly_fraction
+        try:
+            from ep_resolution_db import get_performance_summary
+            summary = await get_performance_summary(days=90)
+            total_trades = summary.get("total_trades", 0)
+            win_rate     = summary.get("win_rate")
+
+            if win_rate is None or win_rate < 0.10 or total_trades < 10:
+                log.debug(
+                    "calibrate_kelly: insufficient data "
+                    "(trades=%d win_rate=%s) — using default %.2f",
+                    total_trades, win_rate, default,
+                )
+                self._kelly_cached    = default
+                self._kelly_cache_day = today
+                return default
+
+            p    = win_rate
+            q    = 1.0 - p
+            odds = 1.0
+            kelly = (p * odds - q) / odds          # full Kelly
+            result = max(0.05, min(kelly * 0.5, 0.40))   # half-Kelly, capped
+            log.info(
+                "calibrate_kelly: trades=%d win_rate=%.3f "
+                "full_kelly=%.4f half_kelly=%.4f (capped=%.4f)",
+                total_trades, win_rate, kelly, kelly * 0.5, result,
+            )
+            self._kelly_cached    = result
+            self._kelly_cache_day = today
+            return result
+
+        except Exception as exc:
+            log.warning("calibrate_kelly failed (%s) — using default %.2f", exc, default)
+            return default
 
     def size(
         self,
@@ -72,20 +154,37 @@ class RiskManager:
                         "Is the balance REST call failing?", balance_cents)
             return 0
 
+        # Refresh empirical Kelly once per day in the background (non-blocking).
+        # _kelly_cached is seeded to cfg.kelly_fraction at construction; the
+        # first successful async refresh upgrades it to the data-driven value.
+        today = datetime.now(timezone.utc).date()
+        if self._kelly_cache_day != today:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.calibrate_kelly())
+            except RuntimeError:
+                pass   # no event loop — caller must await calibrate_kelly() manually
+
         net_edge = edge - (self.cfg.fee_cents / 100)
         if net_edge <= 0:
             log.debug("Net edge %.4f after %.0f¢ fee is non-positive — no trade.",
                       edge, self.cfg.fee_cents)
             return 0
 
-        effective_kelly = self.cfg.kelly_fraction * confidence
+        effective_kelly = self._kelly_cached * confidence
         if side == "yes":
             kelly_f = net_edge / max(1 - market_price, 0.01)
         else:
             kelly_f = net_edge / max(market_price, 0.01)
         bet_fraction = kelly_f * effective_kelly
 
-        price_cents  = max(int(market_price * 100), 1)
+        # For NO contracts the actual outlay per contract is (1 - market_price),
+        # not market_price. Using the YES price here would over-size NO positions.
+        if side == "no":
+            price_cents = max(100 - int(market_price * 100), 1)
+        else:
+            price_cents = max(int(market_price * 100), 1)
         max_by_kelly = int((balance_cents * bet_fraction) / price_cents)
         max_by_cap   = int((balance_cents * self.cfg.max_market_exposure) / price_cents)
 
@@ -99,6 +198,7 @@ class RiskManager:
         balance_cents: int,
         open_exposure_cents: int,
         spread_cents: int | None = None,
+        side: str = "yes",
     ) -> bool:
         if self._halted:
             return False
@@ -109,7 +209,10 @@ class RiskManager:
                      ticker, spread_cents, self.cfg.max_spread_cents)
             return False
 
-        order_cost = int(market_price * 100) * contracts
+        if side == "no":
+            order_cost = (100 - int(market_price * 100)) * contracts
+        else:
+            order_cost = int(market_price * 100) * contracts
         if balance_cents > 0:
             if order_cost / balance_cents > self.cfg.max_market_exposure:
                 log.info("Rejected %s — order exceeds market exposure limit.", ticker)

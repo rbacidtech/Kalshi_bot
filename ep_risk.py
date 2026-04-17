@@ -16,6 +16,7 @@ from ep_schema import SignalMessage
 _BTC_DAILY_LOSS_CAP  = 0.05   # halt BTC entries if session BTC loss > 5% of balance
 _BTC_EXPOSURE_CAP    = 0.30   # max BTC exposure as fraction of balance
 _BTC_RISK_PER_TRADE  = 0.02   # Kelly-substitute: risk 2% of balance per BTC trade
+BTC_UNIT             = 0.0001 # 1 contract = 0.0001 BTC (~$8.50 at $85k); makes sizing integer-safe
 
 
 class UnifiedRiskEngine:
@@ -62,6 +63,7 @@ class UnifiedRiskEngine:
                 balance_cents       = balance_cents,
                 open_exposure_cents = open_exposure,
                 spread_cents        = sig.spread_cents,
+                side                = sig.side,
             )
             return ok, (None if ok else "RISK_GATE_KALSHI")
         if sig.asset_class == "btc_spot":
@@ -70,17 +72,18 @@ class UnifiedRiskEngine:
 
     def record_btc_pnl(self, pnl_cents: int) -> None:
         """
-        Call after each BTC position closes.  Negative pnl_cents accumulates
-        toward the daily loss cap; positive pnl_cents is not credited back
-        (conservative: once losses hit the cap, no new BTC entries that day).
+        Call after each BTC position closes.  Negative pnl_cents adds to the
+        daily net-loss counter; positive pnl_cents reduces it (floor at 0).
+        This lets recovered wins un-halt the bot within the same session.
         """
         self._reset_daily_if_needed()
+        self._btc_daily_loss_cents = max(0, self._btc_daily_loss_cents - pnl_cents)
+        # positive pnl reduces loss counter; negative adds to it; floor at 0
         if pnl_cents < 0:
-            self._btc_daily_loss_cents += abs(pnl_cents)
             log.info(
-                "BTC daily loss updated: $%.2f / cap $%.2f",
+                "BTC daily net loss updated: $%.2f  (cap = %.0f%% of balance)",
                 self._btc_daily_loss_cents / 100,
-                self._btc_daily_loss_cents / 100,   # cap is computed at approve time
+                _BTC_DAILY_LOSS_CAP * 100,
             )
 
     # ── BTC ───────────────────────────────────────────────────────────────────
@@ -93,18 +96,28 @@ class UnifiedRiskEngine:
 
     def _size_btc(self, sig: SignalMessage, balance_cents: int) -> int:
         """
-        Size a BTC trade using a fixed 2% risk-per-trade fraction.
+        Size a BTC trade in BTC_UNIT increments (0.0001 BTC each).
 
-        Units = floor(risk_budget / price_per_unit)
-        For spot BTC: one "unit" is worth sig.market_price USD → * 100 cents.
+        risk_usd  = 2% of balance
+        contracts = floor(risk_usd / (btc_price * BTC_UNIT))
+
+        Example: $1,000 balance, BTC=$85,000
+          risk_usd  = $20
+          price/unit = $85,000 × 0.0001 = $8.50
+          contracts  = floor(20 / 8.50) = 2  (= 0.0002 BTC)
         """
         if not sig.btc_price or balance_cents <= 0:
             return 0
-        risk_cents = int(balance_cents * _BTC_RISK_PER_TRADE)
-        price_per_unit_cents = int(sig.btc_price * 100)
-        if price_per_unit_cents <= 0:
+        # TODO: Coinbase charges a 0.6% taker fee on each leg (entry + exit).
+        # Round-trip cost ≈ 1.2% of notional.  The effective edge used here
+        # (_BTC_RISK_PER_TRADE) does NOT yet subtract this fee, so sizing is
+        # slightly optimistic.  To fix: multiply risk_usd by (1 - 2*COINBASE_TAKER_FEE)
+        # where COINBASE_TAKER_FEE = 0.006, i.e. use risk_usd * 0.988 for sizing.
+        risk_usd          = (balance_cents / 100) * _BTC_RISK_PER_TRADE
+        price_per_unit_usd = sig.btc_price * BTC_UNIT
+        if price_per_unit_usd <= 0:
             return 0
-        return max(0, risk_cents // price_per_unit_cents)
+        return max(0, int(risk_usd / price_per_unit_usd))
 
     def _approve_btc(
         self, sig: SignalMessage, units: int,
@@ -134,8 +147,8 @@ class UnifiedRiskEngine:
                 )
                 return False, "RISK_GATE_DRAWDOWN"
 
-        # 30% total BTC exposure cap
-        order_cost = int(sig.market_price * units * 100)
+        # 30% total BTC exposure cap (units = BTC_UNIT increments, not whole BTC)
+        order_cost = int(sig.market_price * units * BTC_UNIT * 100)
         if balance_cents > 0 and (open_exposure + order_cost) / balance_cents > _BTC_EXPOSURE_CAP:
             return False, "RISK_GATE_EXPOSURE"
 

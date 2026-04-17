@@ -39,8 +39,37 @@ EP_PRICES     = "ep:prices"       # HASH    ticker → price JSON   (Intel write
 EP_BALANCE    = "ep:balance"      # HASH    node_id → balance JSON
 EP_SYSTEM     = "ep:system"       # STREAM  lifecycle events
 EP_CONFIG     = "ep:config"       # HASH    runtime overrides (ops + LLM)
+EP_HEALTH     = "ep:health"       # HASH    node_id → health JSON  (Intel writes)
 
 EXEC_GROUP    = "exec-consumers"   # consumer group on ep:signals
 INTEL_GROUP   = "intel-consumers"  # consumer group on ep:executions
 
 log = logging.getLogger("edgepulse")
+
+
+def validate() -> None:
+    """Check critical config at startup; warn on misconfiguration."""
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    if "localhost" in REDIS_URL and NODE_ID.startswith("exec"):
+        raise ValueError(
+            f"NODE_ID=exec but REDIS_URL points to localhost — "
+            f"exec node must point to intel node Redis"
+        )
+    if "@" not in REDIS_URL and "localhost" not in REDIS_URL and "127.0.0.1" not in REDIS_URL:
+        raise ValueError(
+            "REDIS_URL must include authentication credentials (redis://:password@host:port). "
+            "Unauthenticated remote Redis is a security risk."
+        )
+    if MODE not in ("intel", "exec", "both"):
+        raise ValueError(f"MODE must be 'intel' or 'exec', got {MODE!r}")
+    if not os.getenv("KALSHI_API_KEY_ID"):
+        _log.warning("KALSHI_API_KEY_ID not set — will run in paper mode only")
+    if not os.getenv("FRED_API_KEY"):
+        _log.warning("FRED_API_KEY not set — using demo key (rate-limited to 120 req/day)")
+    # NOTE: FRED does not support Authorization header auth — the key must be passed
+    # as an api_key query parameter. URLs containing the key are never logged.
+
+
+validate()
