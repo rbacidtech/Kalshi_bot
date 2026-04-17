@@ -13,7 +13,7 @@ import redis.asyncio as aioredis
 
 from ep_config import (
     EP_SIGNALS, EP_EXECUTIONS, EP_POSITIONS, EP_PRICES,
-    EP_BALANCE, EP_SYSTEM, EP_CONFIG,
+    EP_BALANCE, EP_SYSTEM, EP_CONFIG, EP_HEALTH,
     EXEC_GROUP, INTEL_GROUP, STREAM_BLOCK, log,
 )
 from ep_schema import ExecutionReport, PriceSnapshot, SignalMessage
@@ -33,23 +33,51 @@ class RedisBus:
             decode_responses       = False,   # keep raw bytes; decoded in helpers
             socket_keepalive       = True,
             socket_connect_timeout = 5,
+            socket_timeout         = 10,      # per-command read timeout; retry_on_timeout handles retries
             retry_on_timeout       = True,
         )
         await self._ensure_consumer_groups()
         log.info("Redis connected (node=%s)", self.node_id)
 
     async def _ensure_consumer_groups(self) -> None:
-        """Create streams + consumer groups idempotently."""
+        """Create streams + consumer groups idempotently.
+
+        Strategy: try mkstream=False first so we only create the stream when it
+        genuinely doesn't exist.  If the stream is missing (ERR no such key or
+        NOGROUP variant), retry with mkstream=True.  BUSYGROUP means the group
+        already exists — that's the happy path on every non-first startup.
+        """
         for stream, group in [
             (EP_SIGNALS,    EXEC_GROUP),
             (EP_EXECUTIONS, INTEL_GROUP),
         ]:
-            try:
-                await self._r.xgroup_create(stream, group, id="0", mkstream=True)
-                log.debug("Created consumer group %s on %s", group, stream)
-            except aioredis.ResponseError as exc:
-                if "BUSYGROUP" not in str(exc):
-                    raise   # unexpected — propagate
+            # EP_SIGNALS: id="$" — exec only processes NEW signals after join.
+            #   Replaying from 0 on fresh creation would dump the entire signal
+            #   history (thousands of entries) onto exec, causing duplicate orders.
+            # EP_EXECUTIONS: id="0" — intel replays from start to recover any
+            #   execution reports missed while intel was down (safe; read-only).
+            group_start_id = "$" if stream == EP_SIGNALS else "0"
+            for mkstream in (False, True):
+                try:
+                    await self._r.xgroup_create(stream, group, id=group_start_id, mkstream=mkstream)
+                    log.info(
+                        "Consumer group created: %s on %s (node=%s mkstream=%s)",
+                        group, stream, self.node_id, mkstream,
+                    )
+                    break   # success — move to next stream
+                except aioredis.ResponseError as exc:
+                    err = str(exc)
+                    if "BUSYGROUP" in err:
+                        # Group already exists — nothing to do
+                        break
+                    if not mkstream and (
+                        "no such key" in err.lower()
+                        or "requires the key to exist" in err.lower()
+                        or "MKSTREAM" in err
+                    ):
+                        # Stream doesn't exist yet; retry with mkstream=True
+                        continue
+                    raise   # unexpected error — propagate
 
     # ── Signal stream (Intel → Exec) ──────────────────────────────────────────
 
@@ -101,9 +129,10 @@ class RedisBus:
                 if not had_entries:
                     break
             except aioredis.RedisError as exc:
-                log.error("Redis PEL drain error: %s — retry in 2s", exc)
+                log.error("Redis PEL drain error: %s — retrying in 2s", exc)
                 await asyncio.sleep(2)
-                break   # fall through to live reads; PEL will retry next restart
+                # continue the loop — do not break; breaking silently drops
+                # unACK'd signals and they won't be retried until next restart
         log.info("consume_signals: PEL drained, switching to live stream")
 
         # ── Phase 2: live stream ──────────────────────────────────────────────
@@ -128,6 +157,26 @@ class RedisBus:
                                         entry_id, exc)
                             await self.ack_signal(entry_id)
 
+            except aioredis.ResponseError as exc:
+                if "NOGROUP" in str(exc):
+                    # Consumer group was lost (Intel restart can wipe it).
+                    # Recreate at "0" (stream start) so signals published
+                    # during the Intel restart window are replayed rather
+                    # than dropped.
+                    log.warning("Consumer group lost — recreating %s on %s",
+                                EXEC_GROUP, EP_SIGNALS)
+                    try:
+                        await self._r.xgroup_create(
+                            EP_SIGNALS, EXEC_GROUP, id="0", mkstream=True
+                        )
+                        log.info("Consumer group %s recreated at stream start (backlog replay)", EXEC_GROUP)
+                    except aioredis.ResponseError as _cg_exc:
+                        if "BUSYGROUP" not in str(_cg_exc):
+                            log.error("Failed to recreate consumer group: %s", _cg_exc)
+                    await asyncio.sleep(1)
+                else:
+                    log.error("Redis consume error: %s — retry in 2s", exc)
+                    await asyncio.sleep(2)
             except aioredis.RedisError as exc:
                 log.error("Redis consume error: %s — retry in 2s", exc)
                 await asyncio.sleep(2)
@@ -166,6 +215,62 @@ class RedisBus:
                         except Exception as exc:
                             log.debug("Malformed execution report: %s", exc)
                         await self._r.xack(EP_EXECUTIONS, INTEL_GROUP, entry_id)
+        except aioredis.ResponseError as exc:
+            if "NOGROUP" in str(exc):
+                log.warning(
+                    "intel-consumers group lost on ep:executions — recreating from id=0 "
+                    "(node=%s)", self.node_id,
+                )
+                recreated = False
+                for mkstream in (False, True):
+                    try:
+                        await self._r.xgroup_create(
+                            EP_EXECUTIONS, INTEL_GROUP, id="0", mkstream=mkstream
+                        )
+                        log.info(
+                            "intel-consumers group recreated on ep:executions at id=0 "
+                            "(mkstream=%s)", mkstream,
+                        )
+                        recreated = True
+                        break
+                    except aioredis.ResponseError as _cg_exc:
+                        cg_err = str(_cg_exc)
+                        if "BUSYGROUP" in cg_err:
+                            recreated = True
+                            break
+                        if not mkstream and (
+                            "no such key" in cg_err.lower()
+                            or "requires the key to exist" in cg_err.lower()
+                            or "MKSTREAM" in cg_err
+                        ):
+                            continue   # stream missing — retry with mkstream=True
+                        log.error(
+                            "Failed to recreate intel-consumers group: %s", _cg_exc
+                        )
+                        break
+                # Immediately retry the read so this cycle doesn't silently return [].
+                if recreated:
+                    try:
+                        results = await self._r.xreadgroup(
+                            groupname    = INTEL_GROUP,
+                            consumername = consumer_name,
+                            streams      = {EP_EXECUTIONS: ">"},
+                            count        = 50,
+                            block        = 0,
+                        )
+                        if results:
+                            for _stream, entries in results:
+                                for entry_id, mapping in entries:
+                                    try:
+                                        report = ExecutionReport.from_redis(mapping)
+                                        reports.append(report)
+                                    except Exception as exc2:
+                                        log.debug("Malformed execution report after recovery: %s", exc2)
+                                    await self._r.xack(EP_EXECUTIONS, INTEL_GROUP, entry_id)
+                    except aioredis.RedisError as _retry_exc:
+                        log.debug("consume_executions retry after recovery failed: %s", _retry_exc)
+            else:
+                log.debug("consume_executions error: %s", exc)
         except aioredis.RedisError as exc:
             log.debug("consume_executions error: %s", exc)
         return reports
@@ -188,8 +293,8 @@ class RedisBus:
             key = k.decode() if isinstance(k, bytes) else k
             try:
                 result[key] = json.loads(v)
-            except json.JSONDecodeError:
-                pass
+            except (json.JSONDecodeError, Exception) as _e:
+                log.warning("Corrupted position data for %s — skipping (will not dedup): %s", key, _e)
         return result
 
     # ── Price state (Intel writes, Exec reads for exits) ──────────────────────
@@ -254,6 +359,39 @@ class RedisBus:
             "ts_us":      int(time.time() * 1_000_000),
         })}, maxlen=1_000, approximate=True)
 
+    async def get_latest_heartbeat(self, node_prefix: str) -> Optional[float]:
+        """
+        Scan the ep:system stream (most-recent-first) for the latest HEARTBEAT
+        event from a node whose ID starts with `node_prefix`.
+
+        Returns the wall-clock timestamp (seconds, float) of the most recent
+        matching heartbeat, or None if no matching entry is found.
+
+        Reads up to the last 200 entries — sufficient for several hours of
+        60-second heartbeat cadence from both nodes.
+        """
+        try:
+            entries = await self._r.xrevrange(EP_SYSTEM, count=200)
+            for _entry_id, mapping in entries:
+                key     = b"payload" if b"payload" in mapping else "payload"
+                raw     = mapping.get(key)
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if (
+                    ev.get("event_type") == "HEARTBEAT"
+                    and str(ev.get("node", "")).startswith(node_prefix)
+                ):
+                    ts_us = ev.get("ts_us")
+                    if ts_us:
+                        return float(ts_us) / 1_000_000
+            return None
+        except Exception:
+            return None
+
     # ── BTC price history (rolling list for dashboard chart) ─────────────────
 
     async def push_btc_history(
@@ -275,6 +413,38 @@ class RedisBus:
         })
         await self._r.lpush("ep:btc_history", payload)
         await self._r.ltrim("ep:btc_history", 0, maxlen - 1)
+
+    # ── Health / connectivity ─────────────────────────────────────────────────
+
+    async def publish_health(self, summary: dict) -> None:
+        """
+        Write the health summary from ep_health.get_health_summary() into
+        the ep:health Redis hash.  Intel calls this every 60 seconds from
+        its heartbeat loop.
+
+        The hash field is the node_id so multi-node deployments each
+        contribute their own slice without overwriting each other.
+        """
+        try:
+            payload = json.dumps({**summary, "ts_us": int(time.time() * 1_000_000)})
+            await self._r.hset(EP_HEALTH, self.node_id, payload)
+        except Exception as exc:
+            log.warning("Failed to publish health summary: %s", exc)
+
+    async def ping(self) -> bool:
+        """
+        Test Redis connectivity.  Returns True if the server responds.
+
+        Call this from the intel heartbeat loop every 60 seconds.
+        Three consecutive failures should trigger a CRITICAL log — the caller
+        owns that counter and log call.
+        """
+        try:
+            result = await self._r.ping()
+            return bool(result)
+        except Exception as exc:
+            log.warning("Redis ping failed: %s", exc)
+            return False
 
     async def close(self) -> None:
         if self._r:

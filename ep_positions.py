@@ -27,7 +27,19 @@ class PositionStore:
         meeting:     str = "",
         outcome:     str = "",
         close_time:  str = "",
+        pending:     bool = False,
     ) -> None:
+        # Guard: never overwrite a confirmed (non-pending) position with a new
+        # pending pre-write.  This prevents crash-recovery pre-writes from
+        # clobbering live position data that was manually registered or entered
+        # by a previous cycle and still has a real Kalshi order behind it.
+        existing = (await self._bus.get_all_positions()).get(ticker)
+        if existing and not existing.get("pending", False):
+            log.debug(
+                "Position open skipped: %s already confirmed — not overwriting", ticker
+            )
+            return
+
         pos = {
             "side":        side,
             "contracts":   contracts,
@@ -37,6 +49,7 @@ class PositionStore:
             "outcome":     outcome,
             "close_time":  close_time,
             "entered_at":  datetime.now(timezone.utc).isoformat(),
+            "pending":     pending,
         }
         await self._bus.set_position(ticker, pos)
         log.debug("Position opened: %s  side=%s  contracts=%d", ticker, side, contracts)
@@ -55,10 +68,34 @@ class PositionStore:
     async def get_all(self) -> Dict[str, dict]:
         return await self._bus.get_all_positions()
 
+    async def update_fields(self, ticker: str, updates: dict) -> None:
+        """
+        Merge `updates` into an existing position without closing it.
+        Used for trailing-stop HWM, pre-expiry tranche counter, and
+        pending-position confirmation.
+        """
+        all_pos = await self._bus.get_all_positions()
+        pos = all_pos.get(ticker)
+        if pos is None:
+            return
+        pos.update(updates)
+        await self._bus.set_position(ticker, pos)
+
     async def total_exposure_cents(self) -> int:
-        """Sum of (entry_cents × contracts) across all open positions."""
+        """Sum of actual contract cost across all open positions.
+
+        entry_cents stores the YES market price (0–100) for all positions.
+        For NO contracts the capital deployed is (100 - entry_cents) per contract,
+        not entry_cents — using YES price would overstate cheap NOs and understate
+        in-the-money NOs, both causing wrong risk-gate decisions.
+        """
         positions = await self._bus.get_all_positions()
-        return sum(
-            p.get("entry_cents", 50) * p.get("contracts", 1)
-            for p in positions.values()
-        )
+        total = 0
+        for p in positions.values():
+            entry     = p.get("entry_cents", 50)
+            contracts = p.get("contracts", 1)
+            if p.get("side") == "no":
+                total += (100 - entry) * contracts
+            else:
+                total += entry * contracts
+        return total

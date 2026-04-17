@@ -84,6 +84,36 @@ class SignalMessage:
     basis_bps:      Optional[float] = None   # (futures - spot) / spot * 10_000
     carry_rate:     Optional[float] = None   # annualised carry
 
+    # ── Validation ───────────────────────────────────────────────────────────
+
+    def __post_init__(self) -> None:
+        """Validate signal fields on creation."""
+        # market_price must be in (0, 1) exclusive — only meaningful for Kalshi
+        # probability markets; skip for BTC/CME where market_price is a USD price.
+        if self.asset_class in ("kalshi",) or (
+            self.asset_class == "" and self.exchange == "kalshi"
+        ):
+            if not (0.0 < self.market_price < 1.0):
+                raise ValueError(
+                    f"SignalMessage.market_price={self.market_price} not in (0,1)"
+                )
+            # fair_value must be in [0, 1] for probability markets
+            if not (0.0 <= self.fair_value <= 1.0):
+                raise ValueError(
+                    f"SignalMessage.fair_value={self.fair_value} not in [0,1]"
+                )
+        # edge must be non-negative
+        if self.edge < 0:
+            raise ValueError(f"SignalMessage.edge={self.edge} is negative")
+        # side must be a recognised direction token
+        if self.side and self.side not in ("yes", "no", "buy", "sell"):
+            raise ValueError(f"SignalMessage.side={self.side!r} invalid")
+        # confidence in [0, 1]
+        if not (0.0 <= self.confidence <= 1.0):
+            raise ValueError(
+                f"SignalMessage.confidence={self.confidence} not in [0,1]"
+            )
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def is_expired(self) -> bool:
@@ -139,6 +169,23 @@ class ExecutionReport:
     cost_cents:    int   = 0     # fill_price * contracts * 100
     fee_cents:     int   = 0     # estimated Kalshi fee on this trade
     edge_captured: float = 0.0   # signal.edge at time of fill (P&L attribution)
+
+    # ── Validation ───────────────────────────────────────────────────────────
+
+    # Primary valid statuses (task spec).  "failed" is a legacy alias kept for
+    # backwards-compatibility with old stream entries; "unknown" is the dataclass
+    # default used when reconstructing partial records via from_redis().
+    _VALID_STATUSES = frozenset(
+        ("filled", "rejected", "duplicate", "expired", "error", "failed", "unknown")
+    )
+
+    def __post_init__(self) -> None:
+        """Validate execution report fields on creation."""
+        if self.status not in self._VALID_STATUSES:
+            raise ValueError(
+                f"ExecutionReport.status={self.status!r} must be one of "
+                f"{sorted(self._VALID_STATUSES)}"
+            )
 
     def to_redis(self) -> Dict[str, str]:
         return {"payload": json.dumps(asdict(self))}

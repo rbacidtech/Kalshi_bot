@@ -119,34 +119,29 @@ class Executor:
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
-    def execute(self, signal: Signal) -> bool:
+    def execute(self, signal: Signal) -> str:
         """
-        Enter a new position. Returns True if executed, False if skipped.
-        Skips if already holding this ticker this cycle.
+        Enter a new position.  Returns the Kalshi order_id on success (truthy),
+        "paper" for paper-mode entries, or "" on skip/failure (falsy).
+        Callers can use the return value directly in a boolean check.
         """
         if signal.ticker in self._held:
             log.debug("Skipping %s — already entered this cycle.", signal.ticker)
-            return False
+            return ""
         if signal.ticker in self._positions:
             log.debug("Skipping %s — already in positions.", signal.ticker)
-            return False
-        # Exposure guard — skip if in-memory positions already exceed $800.
-        # (The Redis-based UnifiedRiskEngine applies its own cap before this
-        # point; this is a last-resort safety net for the local position cache.)
-        total_exposure = sum(
-            p.get("entry_cents", 50) * p.get("contracts", 1) / 100
-            for p in self._positions.values()
-        )
-        if total_exposure > 800.00:
-            log.debug("Skipping %s — local exposure cap reached ($%.2f).", signal.ticker, total_exposure)
-            return False
+            return ""
+        # NOTE: the Redis-based UnifiedRiskEngine applies MAX_TOTAL_EXPOSURE
+        # against the real balance before reaching this point.  Do not add a
+        # redundant hard-dollar cap here — it would incorrectly block entries
+        # for live accounts whose balance exceeds the paper-mode default.
 
         if self.paper:
-            success = self._paper_entry(signal)
+            order_id = "paper" if self._paper_entry(signal) else ""
         else:
-            success = self._live_entry(signal)
+            order_id = self._live_entry(signal)
 
-        if success:
+        if order_id:
             # Track position for exit management
             self._positions[signal.ticker] = {
                 "side":          signal.side,
@@ -156,10 +151,11 @@ class Executor:
                 "meeting":       signal.meeting,
                 "outcome":       signal.outcome,
                 "entered_at":    datetime.datetime.now(timezone.utc).isoformat(),
+                "order_id":      order_id,
             }
             self._save_paper_positions()
 
-        return success
+        return order_id
 
     def _paper_entry(self, signal: Signal) -> bool:
         self._log_trade(signal, action="entry", order_id="paper", mode="paper")
@@ -173,8 +169,13 @@ class Executor:
         )
         return True
 
-    def _live_entry(self, signal: Signal) -> bool:
-        price_cents = int(signal.market_price * 100)
+    def _live_entry(self, signal: Signal) -> str:
+        """Place a live limit order. Returns the Kalshi order_id on success, "" on failure."""
+        market_price = signal.market_price
+        if not (0.01 <= market_price <= 0.99):
+            log.error("Price %s out of valid range [0.01, 0.99] — refusing order for %s", market_price, signal.ticker)
+            return ""
+        price_cents = int(market_price * 100)
         price_key   = "yes_price" if signal.side == "yes" else "no_price"
         payload = {
             "action":  "buy",
@@ -186,7 +187,14 @@ class Executor:
         }
         try:
             resp     = self.client.post("/portfolio/orders", payload)
-            order_id = resp.get("order", {}).get("order_id", "unknown")
+            order_id = resp.get("order", {}).get("order_id")
+            if not order_id:
+                # HTTP 200 but no order object — API returned an error body
+                log.error(
+                    "Entry FAILED for %s: no order_id in response — %s",
+                    signal.ticker, resp,
+                )
+                return ""
             self._log_trade(signal, "entry", order_id, "live")
             self._held.add(signal.ticker)
             log.info(
@@ -195,10 +203,13 @@ class Executor:
                 signal.ticker[:38], signal.side, signal.contracts,
                 price_cents, order_id,
             )
-            return True
+            return order_id
         except requests.HTTPError as exc:
+            log.error("Entry FAILED for %s: HTTP %s", signal.ticker, exc)
+            return ""
+        except Exception as exc:
             log.error("Entry FAILED for %s: %s", signal.ticker, exc)
-            return False
+            return ""
 
     # ── Exit management ───────────────────────────────────────────────────────
 
@@ -402,14 +413,14 @@ class Executor:
                 ticker[:38], exit_side, contracts, current_cents, reason,
             )
         else:
-            price_key = "yes_price" if exit_side == "yes" else "no_price"
-            payload   = {
-                "action":  "buy",
-                "type":    "market",     # use market order to ensure fill on exit
-                "ticker":  ticker,
-                "side":    exit_side,
-                "count":   contracts,
-                price_key: current_cents,
+            # Market order: no price field — Kalshi rejects market orders that
+            # include a price.  (Entry orders use limit type with a price.)
+            payload = {
+                "action": "buy",
+                "type":   "market",
+                "ticker": ticker,
+                "side":   exit_side,
+                "count":  contracts,
             }
             try:
                 resp     = self.client.post("/portfolio/orders", payload)
@@ -421,6 +432,9 @@ class Executor:
                     ticker[:38], exit_side, contracts, current_cents, reason, order_id,
                 )
             except requests.HTTPError as exc:
+                log.error("Exit FAILED for %s: HTTP %s", ticker, exc)
+                return   # don't remove from positions if exit failed
+            except Exception as exc:
                 log.error("Exit FAILED for %s: %s", ticker, exc)
                 return   # don't remove from positions if exit failed
 

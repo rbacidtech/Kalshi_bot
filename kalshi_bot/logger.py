@@ -15,6 +15,8 @@ Usage:
 """
 
 import json
+import os
+import stat
 import time
 import logging
 import logging.handlers
@@ -48,14 +50,22 @@ def setup_logging(log_dir: Path = Path("output/logs"), level: int = logging.INFO
     ))
     root.addHandler(console)
 
-    # JSON file: structured, rotated at midnight, keep 30 days
+    # JSON file: structured, rotated at midnight, keep 7 days
+    # (30 days accumulated ~7 GB during active paper testing; 7 is enough for
+    # post-trade audit and avoids filling the VPS disk in live mode)
     json_path = log_dir / "kalshi_bot.jsonl"
     file_handler = logging.handlers.TimedRotatingFileHandler(
-        json_path, when="midnight", backupCount=30, encoding="utf-8"
+        json_path, when="midnight", backupCount=7, encoding="utf-8"
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(_JsonFormatter())
     root.addHandler(file_handler)
+
+    # Tighten log file permissions to 640 (owner rw, group r, others none)
+    try:
+        os.chmod(file_handler.baseFilename, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+    except OSError:
+        pass  # File may not exist yet on first run; rotation will handle it
 
     logging.getLogger("kalshi_bot").info(
         "Logging initialised — JSON log at %s", json_path
