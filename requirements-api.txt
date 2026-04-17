@@ -1,0 +1,37 @@
+# EdgePulse API — FastAPI SaaS backend
+# Install with: pip install -r requirements-api.txt
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# ── Database (async PostgreSQL) ───────────────────────────────────────────────
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0
+alembic>=1.13.0
+
+# ── Validation & settings ─────────────────────────────────────────────────────
+pydantic>=2.7.0
+pydantic[email]>=2.7.0          # EmailStr support
+pydantic-settings>=2.3.0
+email-validator>=2.1.0          # required by pydantic[email]
+
+# ── Auth & security ───────────────────────────────────────────────────────────
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+bcrypt==4.0.1                   # passlib 1.7.4 is incompatible with bcrypt 5.x
+cryptography>=42.0.0            # AES-256-GCM
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+slowapi>=0.1.9
+limits>=3.7.0                   # slowapi backend
+
+# ── Redis (position/price proxy) ──────────────────────────────────────────────
+redis>=4.2.0                    # includes redis.asyncio
+
+# ── HTTP (Kalshi API calls in verify endpoint) ────────────────────────────────
+requests>=2.31.0
+httpx>=0.27.0
+
+# ── Multipart form support (OAuth2 login) ────────────────────────────────────
+python-multipart>=0.0.9

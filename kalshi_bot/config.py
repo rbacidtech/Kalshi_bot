@@ -76,6 +76,10 @@ FEE_CENTS             = _getenv_int("KALSHI_FEE_CENTS", 7)
 TAKE_PROFIT_CENTS    = _getenv_int("KALSHI_TAKE_PROFIT_CENTS", 20)
 STOP_LOSS_CENTS      = _getenv_int("KALSHI_STOP_LOSS_CENTS", 15)
 HOURS_BEFORE_CLOSE   = _getenv_float("KALSHI_HOURS_BEFORE_CLOSE", 24.0)
+TRAILING_STOP_CENTS  = _getenv_int("KALSHI_TRAILING_STOP_CENTS", 12)   # exit if profit retreats 12¢ from peak
+# Max positions open for the same FOMC meeting date (prevents correlated overexposure).
+# Example: with HOLD at 3.75%, T2.75/T3.00/T3.25 YES are all positively correlated.
+MAX_POSITIONS_PER_MEETING = _getenv_int("KALSHI_MAX_POSITIONS_PER_MEETING", 4)
 
 
 def validate():

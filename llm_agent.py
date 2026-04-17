@@ -83,15 +83,40 @@ Output format (strict JSON, no prose, no markdown fences):
   "notes":          "<one-sentence rationale, under 120 chars>"
 }
 
+Context fields you receive:
+- category_stats: per-signal-category fills/rejects/pnl/avg_confidence.
+    avg_conf < 0.60 in a category → model producing weak signals, reduce scale_factor.
+    If fomc fills dominate, that is normal — FOMC is the primary signal source.
+- reject_breakdown: reject-reason prefix counts (RISK=risk gate, EXPIRED=stale signals,
+    MEETING=no FOMC meeting within window, SERIES=series exposure cap hit).
+    MEETING/SERIES rejects are NORMAL and expected — the FOMC strategy filters most
+    markets by meeting date and caps exposure per rate series (KXFED). Do NOT reduce
+    scale_factor or max_contracts due to high MEETING or SERIES reject counts alone.
+    High EXPIRED → signals arrive stale, no action needed.
+    High RISK (from risk gate, not SERIES) with negative PnL → reduce max_contracts.
+- Kalshi fills: FOMC limit orders are placed at limit prices into illiquid markets.
+    They may rest unfilled for days/weeks — this is NORMAL. zero fills + resting orders
+    does NOT mean the strategy is failing. Check open_positions for resting orders.
+- model_sources: which model generated the most fills (kalshi_implied+fred vs fred_anchor).
+    fred_anchor = CME FedWatch was unavailable; treat those signals with lower weight.
+- btc_fear_greed: 0–100 (0=extreme fear, 100=extreme greed).
+    > 75 and BTC PnL negative → consider btc_enabled=false or lower scale.
+    < 25 and shorts profitable → fear-driven bottom; ease z_threshold slightly.
+- btc_funding_rate: perpetual swap funding. > 0.0015 → crowded longs. < -0.0015 → crowded shorts.
+- btc_enabled: disable ONLY if BTC exchange API is confirmed unavailable. Do NOT disable
+    due to unfilled FOMC limit orders or Kalshi-only rejects.
+
 Policy rules:
 - TIGHTEN signals (raise RSI bounds, raise z_threshold) when:
-    recent PnL is negative, drawdown > 10%, BTC volatility is spiking (|z| > 2.5).
+    recent PnL is negative, drawdown > 10%, BTC volatility spiking (|z| > 2.5),
+    OR any category shows avg_conf < 0.58 with negative PnL.
 - LOOSEN signals (lower RSI bounds, lower z_threshold) when:
-    recent PnL is strongly positive, calm low-vol markets.
-- Set halt_trading=true ONLY for: systemic data errors, drawdown > 20%, or clear exchange outage.
+    recent PnL is strongly positive, calm low-vol markets, all categories avg_conf > 0.70.
+- Set halt_trading=true ONLY for: systemic data errors, drawdown > 20%, or exchange outage.
 - scale_factor adjusts position sizing relative to Kelly (0.5 = half size, 1.5 = 50% more).
+- Default scale_factor=1.0. Reduce only if drawdown > 10% OR consistent negative edge fills.
 - Never set kelly_fraction > 0.40 — reckless above this level.
-- When uncertain or data is sparse, default to: scale_factor=0.7, RSI 30/70, z_threshold=1.8.
+- When uncertain or data is sparse, default to: scale_factor=1.0, RSI 30/70, z_threshold=1.8.
 - Return ONLY valid JSON. No explanation, no prose, no markdown.
 """
 
@@ -150,27 +175,93 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
         for t, p in list(positions.items())[:10]
     ]
 
-    # Recent execution reports (fills vs rejects)
-    execs_raw      = await r.xrevrange(EP_EXECUTIONS, count=50)
-    fills          = 0
-    rejects        = 0
-    pnl_edge_sum   = 0.0
+    # Recent execution reports — break down by category, exit reason, and confidence
+    execs_raw    = await r.xrevrange(EP_EXECUTIONS, count=100)
+    fills        = 0
+    rejects      = 0
+    pnl_edge_sum = 0.0
+
+    # Per-category stats: {category: {fills, rejects, pnl, conf_sum, conf_n}}
+    cat_stats: Dict[str, Any] = {}
+    # Exit reason breakdown: {reason_prefix: count}
+    exit_reasons: Dict[str, int] = {}
+    # Model source hits
+    model_hits: Dict[str, int] = {}
+
     for _, mapping in execs_raw:
         try:
             payload = mapping.get(b"payload") or mapping.get("payload")
             if not payload:
                 continue
             rep = json.loads(payload)
+            ac   = rep.get("asset_class", "kalshi")
+            cat  = rep.get("category", ac)
+            stat = cat_stats.setdefault(cat, {
+                "fills": 0, "rejects": 0, "pnl": 0.0, "conf_sum": 0.0, "conf_n": 0
+            })
+
             if rep.get("status") == "filled":
-                fills       += 1
-                pnl_edge_sum += float(rep.get("edge_captured", 0))
+                fills        += 1
+                edge          = float(rep.get("edge_captured", 0))
+                pnl_edge_sum += edge
+                stat["fills"]    += 1
+                stat["pnl"]      += edge
+                conf = rep.get("confidence")
+                if conf is not None:
+                    stat["conf_sum"] += float(conf)
+                    stat["conf_n"]   += 1
+                # Track exit reasons
+                exit_r = rep.get("reject_reason") or ""
+                if not exit_r:
+                    # Infer from edge sign: positive = exit win, negative = exit loss
+                    # (real reason not stored on exit reports, only on entry rejects)
+                    pass
+                src = rep.get("model_source", "")
+                if src:
+                    model_hits[src] = model_hits.get(src, 0) + 1
             elif rep.get("status") in ("rejected", "expired"):
-                rejects += 1
+                rejects     += 1
+                stat["rejects"] += 1
+                reason = rep.get("reject_reason", "other")
+                # Group by prefix (RISK_GATE_*, EXPIRED, DUPLICATE, LLM_*)
+                prefix = reason.split("_")[0] if "_" in reason else reason
+                exit_reasons[prefix] = exit_reasons.get(prefix, 0) + 1
         except Exception:
             pass
+
     ctx["recent_fills"]    = fills
     ctx["recent_rejects"]  = rejects
-    ctx["recent_pnl_edge"] = round(pnl_edge_sum, 4)   # sum of edge deltas
+    ctx["recent_pnl_edge"] = round(pnl_edge_sum, 4)
+
+    # Summarise per-category stats with avg confidence
+    cat_summary = {}
+    for cat, s in cat_stats.items():
+        avg_conf = round(s["conf_sum"] / s["conf_n"], 3) if s["conf_n"] > 0 else None
+        cat_summary[cat] = {
+            "fills":    s["fills"],
+            "rejects":  s["rejects"],
+            "pnl":      round(s["pnl"], 4),
+            "avg_conf": avg_conf,
+        }
+    ctx["category_stats"]  = cat_summary
+    ctx["reject_breakdown"] = exit_reasons
+    ctx["model_sources"]   = dict(sorted(model_hits.items(), key=lambda x: -x[1])[:5])
+
+    # BTC sentiment (fear/greed + funding rate, published by ep_btc.py into ep:prices)
+    btc_full_raw = prices_raw.get(b"BTC-USD") or prices_raw.get("BTC-USD")
+    if btc_full_raw:
+        try:
+            btc_full = json.loads(btc_full_raw)
+            fg = btc_full.get("fear_greed")
+            fr = btc_full.get("funding_rate")
+            if fg is not None:
+                ctx["btc_fear_greed"]   = fg
+            if fr is not None:
+                ctx["btc_funding_rate"] = fr
+        except Exception:
+            pass
+    ctx.setdefault("btc_fear_greed",   None)
+    ctx.setdefault("btc_funding_rate", None)
 
     # Last 5 system lifecycle events
     events_raw = await r.xrevrange(EP_SYSTEM, count=10)
@@ -251,6 +342,9 @@ async def run_once(
         print(f"[llm_agent] Anthropic API error: {exc}", flush=True)
         return None
 
+    if not response.content or not getattr(response.content[0], "text", None):
+        print("[llm_agent] ERROR: empty response content", flush=True)
+        return None
     raw = response.content[0].text.strip()
 
     # Strip markdown code fences if Claude added them despite instructions
@@ -272,7 +366,8 @@ async def run_once(
     }
     missing = required - set(policy.keys())
     if missing:
-        print(f"[llm_agent] WARNING: policy missing keys: {missing}", flush=True)
+        print(f"[llm_agent] ERROR: policy missing required keys: {missing} — skipping write", flush=True)
+        return None
 
     await _write_policy(r, policy)
 

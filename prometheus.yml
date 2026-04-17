@@ -22,7 +22,7 @@ scrape_configs:
   # Replace <QUANT_VPS_IP> with the actual QuantVPS private/public IP
   - job_name: "edgepulse-exec"
     static_configs:
-      - targets: ["<QUANT_VPS_IP>:9092"]
+      - targets: ["172.93.213.88:9092"]
         labels:
           node: "exec-qvps-chi"
     metrics_path: /metrics

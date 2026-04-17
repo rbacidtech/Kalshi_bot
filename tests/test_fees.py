@@ -85,11 +85,23 @@ class TestFeeAdjustedEdge:
         assert edge_low > edge_high
 
     def test_symmetry_near_zero(self):
-        """At fair == market (no model edge), both sides should be negative."""
+        """At no model edge, both sides should yield negative EV after fees.
+
+        Convention for _fee_adjusted_edge:
+          YES side: fair_value = P(YES wins), market_price = YES price
+          NO  side: fair_value = P(NO wins) = 1 - P(YES), market_price = YES price
+
+        "No model edge" means the side's winning probability == its cost:
+          YES: fair_value (P(YES))  == YES cost == market_price
+          NO:  fair_value (P(NO))   == NO  cost == 1 - market_price
+        """
         for price in (0.30, 0.50, 0.70):
-            for side in ("yes", "no"):
-                edge = _fee_adjusted_edge(price, price, side)
-                assert edge < 0, f"Expected negative EV at fair==market price={price} side={side}"
+            # YES side: fair == market → only fees
+            edge_yes = _fee_adjusted_edge(price, price, "yes")
+            assert edge_yes < 0, f"Expected negative EV at fair==market price={price} side=yes"
+            # NO side: P(NO wins) = 1 - price == NO cost = 1 - price → only fees
+            edge_no = _fee_adjusted_edge(1 - price, price, "no")
+            assert edge_no < 0, f"Expected negative EV at fair==market price={price} side=no"
 
 
 class TestSignalNetPayout:

@@ -43,11 +43,6 @@ class _Noop:
     def observe(self, *_, **__): pass
 
 
-@contextmanager
-def _noop_timer():
-    yield
-
-
 class EdgePulseMetrics:
     """
     Thread-safe Prometheus metrics wrapper.
@@ -111,12 +106,24 @@ class EdgePulseMetrics:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self, port: int = 9091) -> None:
-        """Start the Prometheus HTTP metrics server (idempotent)."""
+        """Start the Prometheus HTTP metrics server (idempotent).
+
+        A port conflict (e.g. rapid systemd restart before the OS releases the
+        socket) is logged as a warning but does NOT crash the process — metrics
+        are non-critical and the trading loop must continue regardless.
+        """
         if self._null or self._started:
             return
-        start_http_server(port)
-        self._started = True
-        log.info("Prometheus metrics server listening on :%d/metrics", port)
+        try:
+            start_http_server(port)
+            self._started = True
+            log.info("Prometheus metrics server listening on :%d/metrics", port)
+        except OSError as exc:
+            log.warning(
+                "Prometheus metrics server could not bind to port %d (%s) — "
+                "metrics will be unavailable this session but trading continues.",
+                port, exc,
+            )
 
     # ── Per-event helpers ─────────────────────────────────────────────────────
 
@@ -165,6 +172,12 @@ class EdgePulseMetrics:
             self.btc_rsi.set(rsi)
         if z is not None:
             self.btc_z_score.set(z)
+
+    def observe_cycle(self, elapsed_s: float) -> None:
+        """Record one cycle's wall-clock duration to the histogram."""
+        if self._null:
+            return
+        self.cycle_duration.observe(elapsed_s)
 
     @contextmanager
     def cycle_timer(self):
