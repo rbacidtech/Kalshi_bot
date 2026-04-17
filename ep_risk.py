@@ -3,7 +3,7 @@ ep_risk.py — UnifiedRiskEngine: single approval gate for all asset classes.
 
 Kalshi logic delegates to kalshi_bot.risk.RiskManager (unchanged).
 BTC sizing uses 2% risk-per-trade; daily loss cap is 5% of balance; total
-BTC exposure is capped at 30% of balance.  CME basis is future-ready stub.
+BTC exposure is capped at 80% of balance.  CME basis is future-ready stub.
 """
 
 import time
@@ -14,7 +14,7 @@ from kalshi_bot.risk import RiskManager
 from ep_schema import SignalMessage
 
 _BTC_DAILY_LOSS_CAP  = 0.05   # halt BTC entries if session BTC loss > 5% of balance
-_BTC_EXPOSURE_CAP    = 0.30   # max BTC exposure as fraction of balance
+_BTC_EXPOSURE_CAP    = 0.80   # max BTC exposure as fraction of balance
 _BTC_RISK_PER_TRADE  = 0.02   # Kelly-substitute: risk 2% of balance per BTC trade
 BTC_UNIT             = 0.0001 # 1 contract = 0.0001 BTC (~$8.50 at $85k); makes sizing integer-safe
 
