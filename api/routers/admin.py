@@ -273,8 +273,8 @@ async def get_stats(
     return {
         "total_users": total_users,
         "active_users": active_users,
-        "users_per_tier": users_per_tier,
-        "total_positions_deployed_cents": total_positions_cents,
+        "users_by_tier": users_per_tier,
+        "total_deployed_cents": total_positions_cents,
     }
 
 
