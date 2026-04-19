@@ -1,6 +1,24 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth } from './lib/auth'
-import { useEffect } from 'react'
+import { useEffect, Component, type ReactNode } from 'react'
+
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null }
+  static getDerivedStateFromError(error: Error) { return { error } }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 32, color: '#f87171', fontFamily: 'monospace', background: '#0a0f1e', minHeight: '100vh' }}>
+          <p style={{ fontWeight: 'bold', fontSize: 16 }}>Page crashed — check browser console</p>
+          <pre style={{ marginTop: 12, fontSize: 12, opacity: 0.8, whiteSpace: 'pre-wrap' }}>
+            {(this.state.error as Error).message}
+          </pre>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
 import Layout from './components/Layout'
 import LoginPage from './pages/LoginPage'
 import RegisterPage from './pages/RegisterPage'
@@ -50,6 +68,7 @@ export default function App() {
   }, [])
 
   return (
+    <ErrorBoundary>
     <BrowserRouter>
       <Routes>
         <Route path="/login"    element={<LoginPage />} />
@@ -66,5 +85,6 @@ export default function App() {
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>
     </BrowserRouter>
+    </ErrorBoundary>
   )
 }
