@@ -28,7 +28,9 @@ api.interceptors.response.use(
       } catch {
         localStorage.removeItem('ep_access')
         localStorage.removeItem('ep_refresh')
-        window.location.href = '/login'
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login'
+        }
       }
     }
     return Promise.reject(err)
@@ -68,12 +70,15 @@ export const subscriptions = {
 
 export const performance = {
   summary: (days: number) => api.get('/performance', { params: { days } }),
+  history: (hours = 24)   => api.get('/performance/history', { params: { hours } }),
 }
 
 export const controls = {
   getConfig:   () => api.get('/controls/config'),
   patchConfig: (cfg: Record<string, unknown>) => api.patch('/controls/config', cfg),
   getStatus:   () => api.get('/controls/status'),
+  aiSuggest:   (config: Record<string, unknown>, question: string, perf?: Record<string, unknown>) =>
+    api.post('/controls/ai-suggest', { config, question, performance: perf ?? {} }),
 }
 
 export const admin = {
