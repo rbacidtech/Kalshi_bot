@@ -413,14 +413,18 @@ class Executor:
                 ticker[:38], exit_side, contracts, current_cents, reason,
             )
         else:
-            # Market order: no price field — Kalshi rejects market orders that
-            # include a price.  (Entry orders use limit type with a price.)
+            # Sell the contracts we own (same side as entry).
+            # Kalshi has no true market orders — all sells require a limit price.
+            # Use the current market price so the order rests at fair value.
+            price_field = "yes_price" if side == "yes" else "no_price"
+            price_val   = current_cents if side == "yes" else (100 - current_cents)
             payload = {
-                "action": "buy",
-                "type":   "market",
-                "ticker": ticker,
-                "side":   exit_side,
-                "count":  contracts,
+                "action":    "sell",
+                "type":      "limit",
+                "ticker":    ticker,
+                "side":      side,
+                "count":     contracts,
+                price_field: price_val,
             }
             try:
                 resp     = self.client.post("/portfolio/orders", payload)
@@ -429,10 +433,15 @@ class Executor:
                 log.info(
                     "[LIVE  EXIT ] %-38s  side=%-3s  contracts=%-2d  "
                     "price=%d¢  reason=%s  order_id=%s",
-                    ticker[:38], exit_side, contracts, current_cents, reason, order_id,
+                    ticker[:38], side, contracts, current_cents, reason, order_id,
                 )
             except requests.HTTPError as exc:
-                log.error("Exit FAILED for %s: HTTP %s", ticker, exc)
+                body = ""
+                try:
+                    body = exc.response.text[:300]
+                except Exception:
+                    pass
+                log.error("Exit FAILED for %s: HTTP %s — %s", ticker, exc, body)
                 return   # don't remove from positions if exit failed
             except Exception as exc:
                 log.error("Exit FAILED for %s: %s", ticker, exc)

@@ -17,7 +17,7 @@ class RiskConfig:
     max_contracts:        int   = 10
     kelly_fraction:       float = 0.25
     max_market_exposure:  float = 0.05
-    max_total_exposure:   float = 0.30
+    max_total_exposure:   float = 0.80
     daily_drawdown_limit: float = 0.10
     max_spread_cents:     int   = 10
     fee_cents:            int   = 7

@@ -25,7 +25,12 @@ class Settings(BaseSettings):
     master_encryption_key: str  # 64 hex chars = 32 bytes
 
     # ── CORS ──────────────────────────────────────────────────────────────────
-    allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    allowed_origins: list[str] = [
+        "https://edgepulse.us",
+        "https://www.edgepulse.us",
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ]
 
     # ── Rate limits ───────────────────────────────────────────────────────────
     rate_limit_auth: str = "5/minute"       # login / register

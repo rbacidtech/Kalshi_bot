@@ -866,11 +866,74 @@ def _compute_vol_mult(buf: deque) -> tuple:
         return 1.65, "extreme"
 
 
+async def _write_pnl_snapshot(bus: "RedisBus") -> None:
+    """Read live metrics from Redis and persist a P&L snapshot to Postgres."""
+    import json as _json
+    try:
+        # Balance from ep:balance
+        balance_cents: int | None = None
+        raw_bal = await bus._r.hgetall("ep:balance")
+        for k, v in raw_bal.items():
+            key = k if isinstance(k, str) else k.decode()
+            if "intel" in key.lower() or "kalshi" in key.lower():
+                try:
+                    balance_cents = int(_json.loads(v).get("balance_cents", 0))
+                    break
+                except Exception:
+                    pass
+
+        # Deployed / unrealized / count from ep:positions
+        deployed_cents = 0
+        unrealized_pnl_cents = 0
+        position_count = 0
+        raw_pos = await bus._r.hgetall("ep:positions")
+        for _, pv in raw_pos.items():
+            try:
+                pos = _json.loads(pv if isinstance(pv, str) else pv.decode())
+                entry = int(pos.get("entry_cents", 0))
+                contracts = int(pos.get("contracts", 0))
+                side = pos.get("side", "yes")
+                cost = (entry * contracts // 100) if side == "yes" else ((100 - entry) * contracts // 100)
+                deployed_cents += cost
+                pnl = pos.get("unrealized_pnl_cents")
+                if pnl is not None:
+                    unrealized_pnl_cents += int(pnl)
+                position_count += 1
+            except Exception:
+                pass
+
+        # Realized P&L from ep:performance (string key, not hash)
+        realized_pnl_cents: int | None = None
+        try:
+            raw_perf_str = await bus._r.get("ep:performance")
+            if raw_perf_str:
+                perf_data = _json.loads(raw_perf_str)
+                realized_pnl_cents = int(float(perf_data.get("total_pnl_cents", 0) or 0))
+        except Exception:
+            pass
+
+        from ep_pnl_snapshots import write_snapshot
+        await write_snapshot(
+            balance_cents=balance_cents,
+            deployed_cents=deployed_cents or None,
+            unrealized_pnl_cents=unrealized_pnl_cents,
+            realized_pnl_cents=realized_pnl_cents,
+            position_count=position_count or None,
+        )
+    except Exception as exc:
+        log.debug("_write_pnl_snapshot: %s", exc)
+
+
 async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
     """Publish a HEARTBEAT event to ep:system every `interval` seconds."""
+    from ep_health import get_health_summary
+    from ep_pnl_snapshots import ensure_table
+    await ensure_table()
     while True:
         await asyncio.sleep(interval)
         await bus.publish_system_event("HEARTBEAT")
+        await bus.publish_health(get_health_summary())
+        await _write_pnl_snapshot(bus)
 
 
 async def intel_main() -> None:
@@ -978,6 +1041,11 @@ async def intel_main() -> None:
         current_dgs10 = float(_dgs10_raw) if _dgs10_raw else None
     except Exception:
         current_dgs10 = None
+    try:
+        _move_raw = await bus._r.hget("ep:macro", "move_index")
+        current_move: Optional[float] = float(_move_raw) if _move_raw else None
+    except Exception:
+        current_move = None
     _rate_last_day: str = __import__("datetime").date.today().isoformat()
     intel_consumer        = f"{NODE_ID}-intel"
     _last_perf_publish:     float        = 0.0
@@ -988,11 +1056,8 @@ async def intel_main() -> None:
     _cb_client = CoinbaseTradeClient() if os.getenv("COINBASE_API_KEY_NAME") else None
 
     # ── Startup GDP risk check ────────────────────────────────────────────────
-    # For each open KXGDP-26APR30-T* YES position, warn if GDPNow is more than
-    # 0.50pp below the strike.  These bets resolve as immediate losses if GDPNow
-    # doesn't recover before the April 30 release.  Does NOT auto-tombstone —
-    # that requires canceling the live Kalshi order first (use cancel_and_tombstone
-    # from ep_exec.py after manual operator review).
+    # Startup GDP risk check: warn and queue cut-loss signals for offside positions.
+    # Threshold: >0.75pp gap for both YES (GDPNow < strike) and NO (GDPNow > strike).
     if _fred_key:
         try:
             import httpx as _httpx
@@ -1017,26 +1082,29 @@ async def intel_main() -> None:
             if _gdp_now_val is not None:
                 _open_positions = await bus.get_all_positions()
                 for _pos_ticker, _pos_data in _open_positions.items():
-                    # Only check KXGDP-{YY}{MON}{DD}-T{N} YES positions
                     if not _re.match(r"^KXGDP-\d{2}[A-Z]{3}\d{2}-T[\d.]+$", _pos_ticker):
-                        continue
-                    if _pos_data.get("side", "").lower() != "yes":
                         continue
                     if _pos_data.get("contracts", 1) == 0:
                         continue
                     _strike_match = _re.search(r"-T(\d+\.?\d*)$", _pos_ticker)
                     if not _strike_match:
                         continue
-                    _strike = float(_strike_match.group(1))
-                    # Warn if GDPNow is more than 0.50pp below the strike
-                    if _gdp_now_val < (_strike - 0.50):
-                        _delta = _strike - _gdp_now_val
+                    _strike   = float(_strike_match.group(1))
+                    _pos_side = _pos_data.get("side", "yes").lower()
+                    # gap > 0 means position is offside vs GDPNow
+                    _gap = (_strike - _gdp_now_val) if _pos_side == "yes" else (_gdp_now_val - _strike)
+                    if _gap > 0.50:
                         log.warning(
-                            "GDP RISK WARNING: %s YES position resting — "
-                            "GDPNow %.1f%% is %.1f%% below strike %.1f%%. "
-                            "Consider tombstoning if GDPNow doesn't recover before April 30.",
-                            _pos_ticker, _gdp_now_val, _delta, _strike,
+                            "GDP RISK WARNING: %s %s — GDPNow %.2f%% is %.2f%% against strike %.1f%%.",
+                            _pos_ticker, _pos_side.upper(), _gdp_now_val, _gap, _strike,
                         )
+                    if _gap > 0.75:
+                        await bus._r.set(
+                            f"ep:cut_loss:{_pos_ticker}",
+                            f"startup: GDPNow={_gdp_now_val:.2f}% vs strike={_strike:.1f}% ({_pos_side})",
+                            ex=300,
+                        )
+                        log.warning("GDP CUT-LOSS signal written at startup: %s", _pos_ticker)
         except Exception as _gdp_exc:
             log.debug("Startup GDP risk check failed (non-fatal): %s", _gdp_exc)
 
@@ -1059,9 +1127,11 @@ async def intel_main() -> None:
                     _fr_raw   = await bus._r.hget("ep:macro", "fed_rate")
                     _vix_raw  = await bus._r.hget("ep:macro", "vix")
                     _d10_raw  = await bus._r.hget("ep:macro", "dgs10")
+                    _mv_raw   = await bus._r.hget("ep:macro", "move_index")
                     if _fr_raw:  current_fed_rate = float(_fr_raw)
                     if _vix_raw: current_vix      = float(_vix_raw)
                     if _d10_raw: current_dgs10    = float(_d10_raw)
+                    if _mv_raw:  current_move     = float(_mv_raw)
                 except Exception as _mac_exc:
                     log.debug("ep:macro re-read failed (non-fatal): %s", _mac_exc)
 
@@ -1414,7 +1484,10 @@ async def intel_main() -> None:
             # place the missing partner leg.
             current_positions = await bus.get_all_positions()
 
-            # ── GDP auto-tombstone: deeply underwater positions near expiry ────
+            # ── GDP cut-loss: write ep:cut_loss when signal has reversed ─────────
+            # Triggers for both YES (GDPNow < strike - 0.75pp) and NO (GDPNow > strike + 0.75pp)
+            # within 14 days of expiry.  Exec _exit_checker consumes the key: sells
+            # filled positions via the normal exit path; cancels resting orders via tombstone.
             _gdp_now_cached: Optional[float] = None
             for _at_ticker, _at_data in list(current_positions.items()):
                 if not _at_ticker.startswith("KXGDP-"):
@@ -1425,16 +1498,17 @@ async def intel_main() -> None:
                 if not _at_strike_m:
                     continue
                 _at_strike = float(_at_strike_m.group(1))
+                _at_side   = _at_data.get("side", "yes").lower()
                 try:
                     if _gdp_now_cached is None:
-                        _fred_key = os.getenv("FRED_API_KEY", "")
-                        if _fred_key:
+                        _fred_key_cl = os.getenv("FRED_API_KEY", "")
+                        if _fred_key_cl:
                             import httpx as _httpx_at
                             async with _httpx_at.AsyncClient(timeout=8.0) as _hc:
                                 _gr = await _hc.get(
                                     # FRED requires api_key as query param; no header auth supported — accepted risk
                                     "https://api.stlouisfed.org/fred/series/observations"
-                                    f"?series_id=GDPNOW&api_key={_fred_key}"
+                                    f"?series_id=GDPNOW&api_key={_fred_key_cl}"
                                     "&file_type=json&sort_order=desc&limit=1"
                                 )
                             if _gr.status_code == 200:
@@ -1442,30 +1516,80 @@ async def intel_main() -> None:
                                           if o.get("value", ".") != "."]
                                 if _g_obs:
                                     _gdp_now_cached = float(_g_obs[0]["value"])
-                    if _gdp_now_cached is not None and (_at_strike - _gdp_now_cached) > 2.0:
-                        _at_date_m = _re.search(r"KXGDP-(\d{2})([A-Z]{3})(\d{2})", _at_ticker)
-                        if _at_date_m:
-                            _mo = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-                                   "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-                            _at_mo = _mo.get(_at_date_m.group(2))
-                            if _at_mo:
-                                from datetime import datetime as _dt, timezone as _tz
-                                _at_exp = _dt(2000 + int(_at_date_m.group(1)),
-                                              _at_mo, int(_at_date_m.group(3)),
-                                              tzinfo=_tz.utc)
-                                _at_days = (_at_exp - _dt.now(_tz.utc)).days
-                                if 0 <= _at_days <= 7:
-                                    log.warning(
-                                        "AUTO-TOMBSTONE: %s GDPNow=%.2f%% is %.2f%% below "
-                                        "strike=%.1f%% with %d days left — writing ep:tombstone",
-                                        _at_ticker, _gdp_now_cached,
-                                        _at_strike - _gdp_now_cached, _at_strike, _at_days,
-                                    )
-                                    await bus._r.set(
-                                        f"ep:tombstone:{_at_ticker}", "auto", ex=86400
-                                    )
+                    if _gdp_now_cached is None:
+                        continue
+                    _at_gap = (_at_strike - _gdp_now_cached) if _at_side == "yes" \
+                              else (_gdp_now_cached - _at_strike)
+                    if _at_gap <= 0.75:
+                        continue
+                    _at_date_m = _re.search(r"KXGDP-(\d{2})([A-Z]{3})(\d{2})", _at_ticker)
+                    if not _at_date_m:
+                        continue
+                    _mo_map = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                               "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                    _at_mo = _mo_map.get(_at_date_m.group(2))
+                    if not _at_mo:
+                        continue
+                    from datetime import datetime as _dt, timezone as _tz
+                    _at_exp  = _dt(2000 + int(_at_date_m.group(1)),
+                                   _at_mo, int(_at_date_m.group(3)), tzinfo=_tz.utc)
+                    _at_days = (_at_exp - _dt.now(_tz.utc)).days
+                    if 0 <= _at_days <= 14:
+                        if not await bus._r.exists(f"ep:cut_loss:{_at_ticker}"):
+                            log.warning(
+                                "GDP CUT-LOSS: %s %s — GDPNow=%.2f%% is %.2f%% against "
+                                "strike=%.1f%% with %d days left",
+                                _at_ticker, _at_side.upper(),
+                                _gdp_now_cached, _at_gap, _at_strike, _at_days,
+                            )
+                            await bus._r.set(
+                                f"ep:cut_loss:{_at_ticker}",
+                                f"GDPNow={_gdp_now_cached:.2f}% vs strike={_at_strike:.1f}% ({_at_side})",
+                                ex=300,
+                            )
                 except Exception as _at_exc:
-                    log.debug("Auto-tombstone check failed for %s: %s", _at_ticker, _at_exc)
+                    log.debug("GDP cut-loss check failed for %s: %s", _at_ticker, _at_exc)
+
+            # ── VIX-based confidence gating for FOMC directional signals ─────────
+            # High equity vol → wider uncertainty around Fed policy path → FOMC
+            # model probabilities are less reliable.  Arb signals (monotonicity /
+            # butterfly) are model-agnostic so they are exempted.
+            _vix_now = float(current_vix or 0)
+            if _vix_now >= 35:
+                _vix_mult = 0.80
+            elif _vix_now >= 25:
+                _vix_mult = 0.90
+            else:
+                _vix_mult = 1.00
+
+            if _vix_mult < 1.0:
+                _vix_fomc_count = sum(
+                    1 for s in signals
+                    if s.category == "fomc"
+                    and not s.model_source.endswith("_arb")
+                )
+                for s in signals:
+                    if s.category == "fomc" and not s.model_source.endswith("_arb"):
+                        s.confidence = round(s.confidence * _vix_mult, 3)
+                log.info(
+                    "VIX=%.1f → FOMC directional confidence scaled by %.2f× (%d signal(s))",
+                    _vix_now, _vix_mult, _vix_fomc_count,
+                )
+
+            # ── MOVE bond-vol penalty (additive, stacks on top of VIX scaling) ──
+            # MOVE > 120 reflects elevated rate uncertainty beyond what VIX captures;
+            # apply an additional −0.05 confidence haircut on FOMC directional signals.
+            _move_now = float(current_move or 0)
+            if _move_now > 120:
+                _move_fomc_count = 0
+                for s in signals:
+                    if s.category == "fomc" and not s.model_source.endswith("_arb"):
+                        s.confidence = round(max(0.10, s.confidence - 0.05), 3)
+                        _move_fomc_count += 1
+                log.info(
+                    "MOVE=%.1f > 120 → additional −0.05 FOMC directional confidence penalty (%d signal(s))",
+                    _move_now, _move_fomc_count,
+                )
 
             new_signals = [
                 s for s in signals

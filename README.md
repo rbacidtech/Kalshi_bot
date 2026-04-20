@@ -2,7 +2,7 @@
 
 Distributed algorithmic trading system for CFTC-regulated prediction markets (Kalshi) and BTC spot (Coinbase). Separates signal generation from order execution across two nodes connected by a Redis message bus.
 
-**Live status:** Both nodes running. ~21 open Kalshi positions. BTC pipeline enabled.
+**Live status:** Both nodes running. ~23 open Kalshi positions. BTC pipeline enabled.
 
 ---
 
@@ -38,6 +38,9 @@ Distributed algorithmic trading system for CFTC-regulated prediction markets (Ka
                           │  ep:health      │  hash:   data source health
                           │  ep:cooldown:*  │  keys:   stop-loss cooldowns
                           │  ep:stopcnt:*   │  keys:   escalation counters
+                          │  ep:cut_loss:*  │  keys:   fundamental cut-loss signals (300s TTL)
+                          │  ep:tombstone:* │  keys:   cancel-resting-order signals
+                          │  ep:bot:config  │  string: dashboard UI state (full JSON)
                           └─────────────────┘
 ```
 
@@ -65,7 +68,7 @@ Exec (event-driven):
   4. Write position to ep:positions (pending=True)
   5. fill_poll_loop confirms fill every 90s → fill_confirmed=True
   6. Exit checker (every 60s): take-profit / stop-loss / pre-expiry /
-     resolution-driven exits
+     resolution-driven / cut-loss-intel exits
 ```
 
 ---
@@ -238,10 +241,13 @@ Exec checks all open positions every 60 seconds:
 |------|-----------|--------|
 | Take-profit | Current price ≥ entry + `KALSHI_TAKE_PROFIT_CENTS` (20¢) | Close 100% |
 | Stop-loss | Current price ≤ entry − `KALSHI_STOP_LOSS_CENTS` (15¢) | Close 100%, start cooldown |
+| Cut-loss (intel) | Intel writes `ep:cut_loss:{ticker}` (fundamental reversal) | Sell limit at market; cancel+tombstone if resting |
 | Pre-expiry tranche 1 | ≤24h to close_time | Close 50% |
 | Pre-expiry tranche 2 | ≤2h to close_time | Close remaining |
 | Resolution-driven | Known outcome against position | Exit immediately |
 | Post-resolution cleanup | Market closed >2h | Remove stale position |
+
+**Cut-loss signals** are written by Intel (currently GDP only) when GDPNow diverges >0.75pp against the held position within 14 days of expiry. The key has a 300s TTL; Exec consumes it on the next 60s exit-checker tick. For filled positions: places a `sell limit` order at the current market price. For resting orders: `cancel_and_tombstone`.
 
 **P&L convention:** `entry_cents` always stores the YES-market price × 100 for both YES and NO positions. For NO positions: `move_cents = entry_cents − current_yes_price_cents`.
 
@@ -309,11 +315,23 @@ systemctl daemon-reload && systemctl enable --now edgepulse-exec
 
 ### Ongoing Code Sync
 
+Always use `deploy.sh` — never `scp` individual files manually, as node divergence causes silent bugs.
+
 ```bash
-rsync -avz --checksum /root/EdgePulse/ep_*.py quantvps:/root/EdgePulse/
-rsync -avz --checksum /root/EdgePulse/kalshi_bot/ quantvps:/root/EdgePulse/kalshi_bot/
-systemctl restart edgepulse && ssh quantvps "systemctl restart edgepulse-exec"
+# Sync + restart both nodes (standard deploy)
+./deploy.sh
+
+# Restart Intel only (config change, no code change)
+./deploy.sh --intel
+
+# Sync + restart Exec only
+./deploy.sh --exec
+
+# Sync without restarting (inspect before restart)
+./deploy.sh --sync
 ```
+
+`deploy.sh` rsyncs `ep_*.py`, `kalshi_bot/`, and `edgepulse_launch.py` to quantvps, verifies `ep_exec.py` checksum, then restarts both systemd services.
 
 ---
 
@@ -462,7 +480,8 @@ Metrics scraped from `:9091` (Intel) and `:9092` (Exec). Includes signal counts,
 
 | Issue | Status |
 |-------|--------|
-| KXGDP-26APR30-T2.5 YES | ⚠️ GDPNow 1.31% vs 2.5% strike, expires Apr 30 — consider tombstoning |
+| KXGDP-26APR30-T2.5 YES | ⚠️ Cut-loss sell order placed at 31¢ (order_id: 8eb50b0f). Resting — fills if a buyer appears before Apr 30. |
+| KXGDP-26APR30-T1.0 NO | ⚠️ GDPNow 1.31% > 1.0% strike (0.31pp gap) — below 0.75pp cut-loss threshold; holding to expiry Apr 30. |
 | Arb multi-leg execution | `arb.py` detects opportunities; executor places only one leg |
 | CME basis strategy | `asset_class = "cme_btc_basis"` is a stub — returns 0 contracts |
 | BTC LONG needs USD cash | Only $0.49 USD available; SELL signals work with existing BTC |

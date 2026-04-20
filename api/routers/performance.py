@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.database import get_db
 from api.dependencies import get_current_active_user as require_auth
 
 router = APIRouter(prefix="/performance", tags=["performance"])
@@ -70,3 +74,42 @@ async def get_performance(
         "avg_hold_time_hours": 0.0,
         "sharpe_daily": None,
     }
+
+
+@router.get("/history", summary="P&L snapshot history for charting")
+async def get_pnl_history(
+    hours: int = Query(24, ge=1, le=720),
+    _user=Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns bucketed P&L snapshots (one per hour) over the requested window.
+    Used by the dashboard sparkline chart.
+    """
+    from api.models import PnlSnapshot
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    try:
+        result = await db.execute(
+            select(PnlSnapshot)
+            .where(PnlSnapshot.ts >= since)
+            .order_by(PnlSnapshot.ts.asc())
+        )
+        rows = result.scalars().all()
+        # Bucket by hour — keep the last snapshot per hour
+        buckets: dict[str, dict] = {}
+        for row in rows:
+            ts = row.ts if isinstance(row.ts, datetime) else datetime.fromisoformat(str(row.ts))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            bucket = ts.strftime("%Y-%m-%dT%H:00:00Z")
+            buckets[bucket] = {
+                "ts": ts.isoformat(),
+                "balance_cents": row.balance_cents,
+                "deployed_cents": row.deployed_cents,
+                "unrealized_pnl_cents": row.unrealized_pnl_cents,
+                "realized_pnl_cents": row.realized_pnl_cents,
+                "position_count": row.position_count,
+            }
+        return list(buckets.values())
+    except Exception:
+        return []

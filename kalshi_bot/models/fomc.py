@@ -518,69 +518,74 @@ async def _fetch_fedwatch_raw() -> dict | None:
                 )
                 combined_payload = [item for sub in results for item in sub]
 
-            if combined_payload:
-                data = _normalize_cme_api_response({"payload": combined_payload})
-                if data:
-                    # ── Real-time endpoint: intraday update for next meeting ───
-                    # GET /fedwatch_rt/v1/forecasts/latest returns the same schema
-                    # as the EOD endpoint but refreshes throughout the trading day.
-                    # We use it to override the NEXT meeting's probabilities only
-                    # (most liquid contract; intraday moves matter most there).
-                    # Cache TTL = 60 s (vs 300 s for EOD).  On 403/404 we silently
-                    # continue with EOD data — do NOT break existing functionality.
-                    _rt_url = "https://markets.api.cmegroup.com/fedwatch_rt/v1/forecasts/latest"
-                    try:
-                        rt_resp = await http.get(
-                            _rt_url,
-                            params={"meetingDt": fetch_dates[0]} if fetch_dates else {},
-                            headers={**cme_headers,
-                                     "CME-Request-ID": f"ep-fw-rt-{int(time.time())}"},
-                        )
-                        if rt_resp.status_code == 200:
-                            rt_payload = rt_resp.json().get("payload", [])
-                            rt_data    = _normalize_cme_api_response({"payload": rt_payload}) if rt_payload else None
-                            if rt_data and rt_data.get("meetings"):
-                                # Merge: replace first meeting in EOD data with RT data
-                                rt_meetings = {
-                                    m["meetingDate"]: m
-                                    for m in rt_data.get("meetings", [])
-                                }
-                                merged = []
-                                for m in data.get("meetings", []):
-                                    md = m.get("meetingDate", "")
-                                    if md in rt_meetings:
-                                        merged.append(rt_meetings[md])
-                                        log.info(
-                                            "FedWatch RT: overriding EOD probs for next "
-                                            "meeting %s with intraday data", md,
-                                        )
-                                    else:
-                                        merged.append(m)
-                                data = {"meetings": merged}
-                        elif rt_resp.status_code in (403, 404):
-                            log.debug(
-                                "FedWatch RT endpoint returned %d — using EOD data",
-                                rt_resp.status_code,
+                if combined_payload:
+                    data = _normalize_cme_api_response({"payload": combined_payload})
+                    if data:
+                        # ── Real-time endpoint: intraday update for next meeting ───
+                        # GET /fedwatch_rt/v1/forecasts/latest returns the same schema
+                        # as the EOD endpoint but refreshes throughout the trading day.
+                        # We use it to override the NEXT meeting's probabilities only
+                        # (most liquid contract; intraday moves matter most there).
+                        # Cache TTL = 60 s (vs 300 s for EOD).  On 403/404 we silently
+                        # continue with EOD data — do NOT break existing functionality.
+                        _rt_url = "https://markets.api.cmegroup.com/fedwatch_rt/v1/forecasts/latest"
+                        try:
+                            rt_resp = await http.get(
+                                _rt_url,
+                                params={"meetingDt": fetch_dates[0]} if fetch_dates else {},
+                                headers={**cme_headers,
+                                         "CME-Request-ID": f"ep-fw-rt-{int(time.time())}"},
                             )
-                        else:
-                            log.debug(
-                                "FedWatch RT endpoint: unexpected status %d",
-                                rt_resp.status_code,
-                            )
-                    except Exception as rt_exc:
-                        log.debug("FedWatch RT fetch failed (non-fatal): %s", rt_exc)
+                            if rt_resp.status_code == 200:
+                                rt_payload = rt_resp.json().get("payload", [])
+                                rt_data    = _normalize_cme_api_response({"payload": rt_payload}) if rt_payload else None
+                                if rt_data and rt_data.get("meetings"):
+                                    # Merge: replace first meeting in EOD data with RT data
+                                    rt_meetings = {
+                                        m["meetingDate"]: m
+                                        for m in rt_data.get("meetings", [])
+                                    }
+                                    merged = []
+                                    for m in data.get("meetings", []):
+                                        md = m.get("meetingDate", "")
+                                        if md in rt_meetings:
+                                            merged.append(rt_meetings[md])
+                                            log.info(
+                                                "FedWatch RT: overriding EOD probs for next "
+                                                "meeting %s with intraday data", md,
+                                            )
+                                        else:
+                                            merged.append(m)
+                                    data = {"meetings": merged}
+                            elif rt_resp.status_code in (403, 404):
+                                log.debug(
+                                    "FedWatch RT endpoint returned %d — using EOD data",
+                                    rt_resp.status_code,
+                                )
+                            else:
+                                log.debug(
+                                    "FedWatch RT endpoint: unexpected status %d",
+                                    rt_resp.status_code,
+                                )
+                        except Exception as rt_exc:
+                            log.debug("FedWatch RT fetch failed (non-fatal): %s", rt_exc)
 
-                    # Cache with standard EOD TTL (RT data was already merged in)
-                    _cache.set(cache_key, data, ttl=_TTL_FEDWATCH)
-                    log.info(
-                        "FedWatch fetched via authenticated CME API — %d/%d meetings",
-                        len(data.get("meetings", [])), len(fetch_dates),
-                    )
-                    return data
-                log.warning("CME authenticated API: payload received but no parseable meetings")
-            else:
-                log.warning("CME authenticated API: all %d meeting requests returned empty",
-                            len(fetch_dates))
+                        # Cache with standard EOD TTL (RT data was already merged in)
+                        _cache.set(cache_key, data, ttl=_TTL_FEDWATCH)
+                        log.info(
+                            "FedWatch fetched via authenticated CME API — %d/%d meetings",
+                            len(data.get("meetings", [])), len(fetch_dates),
+                        )
+                        try:
+                            from ep_health import health as _health
+                            _health.mark_ok("cme_fedwatch")
+                        except ImportError:
+                            pass
+                        return data
+                    log.warning("CME authenticated API: payload received but no parseable meetings")
+                else:
+                    log.warning("CME authenticated API: all %d meeting requests returned empty",
+                                len(fetch_dates))
         except Exception as exc:
             log.warning("CME authenticated fetch failed: %s — falling back to public URLs", exc)
 

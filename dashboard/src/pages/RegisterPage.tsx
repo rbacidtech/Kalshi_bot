@@ -72,46 +72,35 @@ export default function RegisterPage() {
   }
 
   return (
-    <div
-      className="min-h-screen flex items-center justify-center bg-surface-0 px-4 py-10"
-      style={{
-        background: 'radial-gradient(circle at 50% 30%, rgba(59,130,246,0.05) 0%, transparent 60%), #020817',
-      }}
-    >
-      <div className="w-full max-w-md animate-fadeIn">
-        {/* Card */}
-        <div className="card p-8 shadow-2xl">
-          {/* Logo + Heading */}
-          <div className="flex flex-col items-center mb-8">
-            <div className="flex items-center gap-3 mb-3">
-              <svg
-                width="32"
-                height="32"
-                viewBox="0 0 32 32"
-                fill="none"
-                xmlns="http://www.w3.org/2000/svg"
-                aria-hidden="true"
-              >
-                <rect width="32" height="32" rx="8" fill="#3b82f6" fillOpacity="0.15" />
-                <polygon
-                  points="18,4 10,18 15,18 14,28 22,14 17,14"
-                  fill="#3b82f6"
-                />
-              </svg>
-              <span className="text-2xl font-semibold tracking-tight text-slate-100">
-                EdgePulse
-              </span>
-            </div>
-            <h1 className="text-lg font-semibold text-slate-100 mb-1">
-              Create your account
-            </h1>
-            <p className="text-sm text-muted text-center">
-              Start trading with EdgePulse signals
-            </p>
+    <div className="min-h-screen flex items-center justify-center px-4 py-10" style={{ background: '#0a0f1e' }}>
+
+      <div className="pointer-events-none fixed inset-0 overflow-hidden" aria-hidden>
+        <div className="absolute top-[-20%] left-[50%] -translate-x-1/2 w-[600px] h-[600px] rounded-full opacity-20"
+          style={{ background: 'radial-gradient(circle, #6366f1 0%, transparent 70%)' }} />
+      </div>
+
+      <div className="relative w-full max-w-sm animate-fadeIn">
+
+        {/* Brand */}
+        <div className="flex flex-col items-center mb-8">
+          <div
+            className="w-14 h-14 rounded-2xl flex items-center justify-center text-2xl mb-4"
+            style={{ background: 'linear-gradient(135deg, #3b82f6 0%, #6366f1 100%)', boxShadow: '0 0 32px rgba(99,102,241,0.5)' }}
+          >
+            🚀
           </div>
+          <h1 className="text-2xl font-bold text-white tracking-tight">EdgePulse</h1>
+          <p className="text-sm text-slate-500 mt-1">Create your account</p>
+        </div>
+
+        {/* Card */}
+        <div
+          className="bg-surface-1 border border-border rounded-2xl p-7"
+          style={{ borderTopColor: '#6366f1', borderTopWidth: 3, boxShadow: '0 24px 48px rgba(0,0,0,0.4)' }}
+        >
 
           {/* Form */}
-          <form onSubmit={handleSubmit} noValidate className="space-y-5">
+          <form onSubmit={handleSubmit} noValidate className="space-y-4">
             {/* Email */}
             <div>
               <label htmlFor="email" className="label">
@@ -237,12 +226,9 @@ export default function RegisterPage() {
           </form>
 
           {/* Footer link */}
-          <p className="mt-6 text-center text-xs text-muted">
+          <p className="mt-5 text-center text-xs text-slate-600">
             Already have an account?{' '}
-            <Link
-              to="/login"
-              className="text-accent-blue hover:text-blue-400 font-medium transition-colors"
-            >
+            <Link to="/login" className="text-accent-blue hover:text-blue-400 font-semibold transition-colors">
               Sign in
             </Link>
           </p>

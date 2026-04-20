@@ -57,6 +57,8 @@ export const useAuth = create<AuthState>()(
           const { data } = await authApi.me()
           set({ user: data, loading: false })
         } catch {
+          localStorage.removeItem('ep_access')
+          localStorage.removeItem('ep_refresh')
           set({ user: null, loading: false })
         }
       },

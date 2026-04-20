@@ -10,6 +10,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Index,
+    Integer,
     JSON,
     LargeBinary,
     String,
@@ -218,3 +219,22 @@ class RefreshToken(Base):
     ip_address: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     user: Mapped[User] = relationship("User", back_populates="refresh_tokens")
+
+
+class PnlSnapshot(Base):
+    __tablename__ = "pnl_snapshots"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[str] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+    balance_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    deployed_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    unrealized_pnl_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    realized_pnl_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    position_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String, nullable=False, server_default="intel")
+
+    __table_args__ = (Index("ix_pnl_snapshots_ts", "ts"),)

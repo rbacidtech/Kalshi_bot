@@ -708,13 +708,38 @@ async def _exit_checker(
                     log.info("Auto-tombstone triggered for %s — calling cancel_and_tombstone",
                              _t_ticker)
                     await bus._r.delete(f"ep:tombstone:{_safe_key(_t_ticker)}")
-                    await cancel_and_tombstone(_t_ticker, bus, positions, executor)
+                    await cancel_and_tombstone(_t_ticker, executor.client, positions, executor)
             except Exception as _tomb_exc:
                 log.debug("Tombstone consumer error (non-fatal): %s", _tomb_exc)
 
             current_positions = await positions.get_all()
             if not current_positions:
                 continue
+
+            # ── Cut-loss consumer: Intel signals a fundamental reversal ──────────
+            # ep:cut_loss:{ticker} written by Intel when GDPNow (or future signals)
+            # strongly contradict the held position.  Filled positions are sold via
+            # the normal exit path; resting orders are canceled and tombstoned.
+            _cutloss_tickers: set = set()
+            try:
+                _cl_keys = await bus._r.keys("ep:cut_loss:*")
+                for _clk in _cl_keys:
+                    _clk_s  = _clk.decode() if isinstance(_clk, bytes) else _clk
+                    _cl_t   = _clk_s.replace("ep:cut_loss:", "")
+                    _cl_why = await bus._r.get(_clk_s) or "signal_reversed"
+                    await bus._r.delete(_clk_s)
+                    _cl_pos = current_positions.get(_cl_t)
+                    if not _cl_pos or _cl_pos.get("contracts", 1) == 0:
+                        continue
+                    if not _cl_pos.get("fill_confirmed", True):
+                        log.info("Cut-loss: %s resting order → cancel_and_tombstone (%s)",
+                                 _cl_t, _cl_why)
+                        await cancel_and_tombstone(_cl_t, executor.client, positions, executor)
+                    else:
+                        log.warning("Cut-loss queued for exit: %s (%s)", _cl_t, _cl_why)
+                        _cutloss_tickers.add(_cl_t)
+            except Exception as _cle:
+                log.debug("Cut-loss consumer error (non-fatal): %s", _cle)
 
             # ── Redis config overrides (written by dashboard → ep:config) ─────
             _ov_tp  = await bus.get_config_override("override_take_profit_cents")
@@ -768,9 +793,14 @@ async def _exit_checker(
                                 "RESOLVED AGAINST: %s outcome=%s — exiting immediately",
                                 ticker, _outcome,
                             )
+                            _contracts_r = pos.get("contracts_filled") or pos.get("contracts", 1)
                             try:
-                                executor._exit_position(ticker, pos, _exit_cents,
-                                                        f"resolved_against ({_outcome})")
+                                executor._exit_position(
+                                    ticker,
+                                    {**pos, "contracts": _contracts_r},
+                                    _exit_cents,
+                                    f"resolved_against ({_outcome})",
+                                )
                             except KeyError:
                                 log.warning(
                                     "Resolution exit: %s not in executor._positions "
@@ -783,7 +813,6 @@ async def _exit_checker(
                                 _move_r = _exit_cents - pos["entry_cents"]
                             else:
                                 _move_r = pos["entry_cents"] - _exit_cents
-                            _contracts_r = pos.get("contracts_filled") or pos.get("contracts", 1)
                             _pnl_r = (_move_r * _contracts_r - cfg.FEE_CENTS * _contracts_r) / 100
                             await bus.publish_execution(ExecutionReport(
                                 ticker        = ticker,
@@ -867,6 +896,8 @@ async def _exit_checker(
                 entry_cents = pos["entry_cents"]
                 side        = pos["side"]
                 contracts   = pos.get("contracts_filled") or pos.get("contracts", 1)
+                if contracts == 0:
+                    continue  # tombstone — skip silently
                 asset_class = "btc_spot" if ticker == "BTC-USD" else "kalshi"
 
                 # Guard: back off from tickers where the last exit API call failed,
@@ -1067,6 +1098,10 @@ async def _exit_checker(
                         elif side == "sell" and current_cents > be_cents:
                             exit_reason = f"breakeven_stop ({current_cents}¢ > be={be_cents}¢)"
 
+                # ── Cut-loss (Intel fundamental reversal) ────────────────────
+                if exit_reason is None and ticker in _cutloss_tickers:
+                    exit_reason = f"cut_loss_intel (signal_reversed, pnl={move_cents:+d}¢)"
+
                 # ── Take-profit / stop-loss ───────────────────────────────────
                 if exit_reason is None and move_cents >= take_profit_cents:
                     exit_reason = f"take_profit (+{move_cents}¢)"
@@ -1129,7 +1164,15 @@ return cnt
                         # position and cause the divergence handler to loop forever).
                         _kalshi_exit_ok = False
                         try:
-                            executor._exit_position(ticker, pos, current_cents, exit_reason)
+                            # Pass contracts explicitly so _exit_position uses the
+                            # right count even when pos["contracts"]=0 (tombstone)
+                            # but contracts_filled is set from a prior fill_poll run.
+                            executor._exit_position(
+                                ticker,
+                                {**pos, "contracts": contracts},
+                                current_cents,
+                                exit_reason,
+                            )
                             _kalshi_exit_ok = ticker not in executor._positions
                         except KeyError:
                             log.warning(

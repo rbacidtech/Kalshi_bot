@@ -116,14 +116,19 @@ function StatCard({
   label,
   value,
   children,
+  accent,
 }: {
-  icon: ReactNode
-  label: string
-  value?: ReactNode
+  icon:     ReactNode
+  label:    string
+  value?:   ReactNode
   children?: ReactNode
+  accent?:  string
 }) {
   return (
-    <div className="card flex flex-col gap-3">
+    <div
+      className="bg-surface-1 border border-border rounded-xl p-5 flex flex-col gap-3"
+      style={accent ? { borderTopColor: accent, borderTopWidth: 3, boxShadow: `0 4px 24px ${accent}14` } : undefined}
+    >
       <div className="flex items-center gap-2 text-muted">
         {icon}
         <span className="text-xs font-medium uppercase tracking-wide">{label}</span>
@@ -318,6 +323,7 @@ export default function AdminPage() {
         <StatCard
           icon={<Users size={15} strokeWidth={1.75} />}
           label="Total Users"
+          accent="#60a5fa"
           value={
             statsQuery.isLoading ? (
               <span className="inline-block w-16 h-6 rounded bg-surface-3 animate-pulse align-middle" />
@@ -331,6 +337,7 @@ export default function AdminPage() {
         <StatCard
           icon={<UserCheck size={15} strokeWidth={1.75} />}
           label="Active Users"
+          accent="#34d399"
           value={
             statsQuery.isLoading ? (
               <span className="inline-block w-16 h-6 rounded bg-surface-3 animate-pulse align-middle" />
@@ -344,6 +351,7 @@ export default function AdminPage() {
         <StatCard
           icon={<DollarSign size={15} strokeWidth={1.75} />}
           label="Total Deployed"
+          accent="#fbbf24"
           value={
             statsQuery.isLoading ? (
               <span className="inline-block w-28 h-6 rounded bg-surface-3 animate-pulse align-middle" />
@@ -360,6 +368,7 @@ export default function AdminPage() {
         <StatCard
           icon={<Users size={15} strokeWidth={1.75} />}
           label="By Tier"
+          accent="#a78bfa"
         >
           {statsQuery.isLoading ? (
             <div className="space-y-2">
