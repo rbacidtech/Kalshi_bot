@@ -112,7 +112,20 @@ Published by Intel to `ep:signals`. Exec must process or discard within `ttl_ms`
   "meeting":         "2025-05",     // ISO year-month of FOMC meeting
   "outcome":         "CUT_25",      // "HOLD" | "CUT_25" | "CUT_50" | "HIKE_25" etc.
   "model_source":    "fedwatch+zq", // which data sources contributed
-  "arb_partner":     null,          // paired ticker for arb signals
+  "arb_partner":     null,          // paired ticker for 2-leg arb signals
+
+  // ── Multi-leg arb (null for single-leg signals) ───────────────────────────
+  // Set by scan_fomc_arb() for butterfly spread signals. Exec dispatches to
+  // executor.execute_arb_legs() which places all legs atomically. On partial
+  // fill, already-placed legs are best-effort cancelled.
+  "arb_legs": null,
+  // arb_legs structure when set (butterfly example):
+  // [
+  //   {"ticker": "KXFED-26JUN-T3.50", "side": "yes", "price": 0.30},  // buy leg A
+  //   {"ticker": "KXFED-26JUN-T3.75", "side": "no",  "price": 0.65},  // sell leg B (overpriced middle)
+  //   {"ticker": "KXFED-26JUN-T4.00", "side": "yes", "price": 0.18}   // buy leg C
+  // ]
+  // Each arb leg position in ep:positions carries "arb_id" and "arb_leg_index" metadata fields.
 
   // ── BTC mean-reversion (null for non-BTC) ────────────────────────────────
   "btc_price":       null,   // current spot price in USD

@@ -191,16 +191,20 @@ class MeetingProbs:
     """
     Probability distribution over rate outcomes for one FOMC meeting.
 
-    probs:      dict of outcome label → probability, sums to ~1.0
-                e.g. {"HOLD": 0.72, "CUT_25": 0.24, "CUT_50": 0.04}
-    fetched_at: UTC timestamp of when this data was retrieved
-    sources:    which data sources contributed
-    confidence: 0-1 score reflecting source agreement and freshness
+    probs:        dict of outcome label → probability, sums to ~1.0
+                  e.g. {"HOLD": 0.72, "CUT_25": 0.24, "CUT_50": 0.04}
+    fetched_at:   UTC timestamp of when this data was retrieved
+    sources:      which data sources contributed
+    confidence:   0-1 score reflecting source agreement and freshness
+    data_quality: "ok" under normal conditions; "fallback_only" when running on
+                  FRED static anchor with no CME / ZQ / SR1 / SR3 futures data.
+                  Logged by downstream callers to assist in diagnosing bad signals.
     """
-    probs:      dict[str, float]
-    fetched_at: datetime
-    sources:    list[str]
-    confidence: float = 0.90
+    probs:        dict[str, float]
+    fetched_at:   datetime
+    sources:      list[str]
+    confidence:   float = 0.90
+    data_quality: str   = "ok"
 
     def age_seconds(self) -> float:
         return (datetime.now(timezone.utc) - self.fetched_at).total_seconds()
@@ -1021,7 +1025,9 @@ def _fuse_sources(
     wsj:             dict[str, float] | None,
     kalshi_implied:  dict[str, float] | None = None,
     fedwatch_source: str = "fedwatch",
-) -> tuple[dict[str, float], float, list[str]]:
+    kalshi_market_price: float | None = None,
+    model_fair_value:    float | None = None,
+) -> tuple[dict[str, float], float, list[str], str]:
     """
     Combine probability estimates from multiple sources.
 
@@ -1035,13 +1041,20 @@ def _fuse_sources(
       FedWatch:  60%, ZQ futures: 30%, WSJ: 10%  (legacy weights)
 
     Args:
-      fedwatch_source: label for the primary external source slot.  One of:
+      fedwatch_source:      label for the primary external source slot.  One of:
         "fedwatch"     — real CME FedWatch JSON (conf 0.90 solo)
         "fred_futures" — FRED FF1/FF2/FF3 market-implied rates (conf 0.80 solo)
         "fred_model"   — FRED DFEDTARU + heuristic probs (conf 0.70 solo)
+      kalshi_market_price:  current Kalshi YES mid-price for this contract (0-1),
+                            used for sanity-checking model fair value divergence.
+      model_fair_value:     blended model fair-value for this contract (0-1),
+                            compared against kalshi_market_price to detect large
+                            model vs market divergence when in fallback mode.
 
     Returns:
-      (blended_probs, confidence_score, source_list)
+      (blended_probs, confidence_score, source_list, data_quality)
+      data_quality is "fallback_only" when running on FRED static anchor with no
+      genuine forward-looking futures data; "ok" otherwise.
     """
     available = {}
     sources   = []
@@ -1066,7 +1079,7 @@ def _fuse_sources(
         sources.append("wsj")
 
     if not available:
-        return {"HOLD": 1.0}, 0.20, ["none"]
+        return {"HOLD": 1.0}, 0.20, ["none"], "fallback_only"
 
     # Renormalise weights to available sources
     total_w = sum(w for _, w in available.values())
@@ -1081,6 +1094,17 @@ def _fuse_sources(
     total = sum(blended.values())
     if total > 0:
         blended = {k: v / total for k, v in blended.items()}
+
+    # Determine data_quality flag: "fallback_only" when running on FRED static
+    # anchor only — no genuine forward-looking futures or Kalshi market data.
+    # Any real futures source (fedwatch, sr1_sofr, sofr_sr3, fred_futures) or
+    # Kalshi-implied prices qualify as "ok".
+    _fallback_only = (
+        fedwatch_source == "fred_model"
+        and not kalshi_implied
+        and not zq_probs
+    )
+    data_quality = "fallback_only" if _fallback_only else "ok"
 
     # Compute confidence
     if kalshi_implied:
@@ -1127,7 +1151,7 @@ def _fuse_sources(
                     divergence, DIVERGENCE_THRESHOLD, confidence,
                 )
 
-    return blended, confidence, sources
+    return blended, confidence, sources, data_quality
 
 
 # ── Ticker parsing ────────────────────────────────────────────────────────────
@@ -2420,11 +2444,17 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
             else:
                 fw_source_label = "fedwatch"
 
-            blended, confidence, sources = _fuse_sources(
+            blended, confidence, sources, data_quality = _fuse_sources(
                 fw_mp.probs, zq_probs_dict, wsj_for_meeting,
                 kalshi_implied  = kalshi_probs,
                 fedwatch_source = fw_source_label,
             )
+            if data_quality == "fallback_only":
+                log.warning(
+                    "FOMC meeting %s: running on FRED static anchor only "
+                    "(data_quality=fallback_only) — no genuine forward-looking data",
+                    mk,
+                )
 
             # ── SOFR SR3 cross-validation: anchor low-confidence distributions ──
             # When the primary sources yield confidence < 0.80 AND we have a SOFR
@@ -2499,17 +2529,18 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
                         mk,
                     )
                     # Revert: re-run fusion without macro adjustment (blended already set)
-                    blended, confidence, sources = _fuse_sources(
+                    blended, confidence, sources, data_quality = _fuse_sources(
                         fw_mp.probs, zq_probs_dict, wsj_for_meeting,
                         kalshi_implied  = kalshi_probs,
                         fedwatch_source = fw_source_label,
                     )
 
             new_probs[mk] = MeetingProbs(
-                probs      = blended,
-                fetched_at = now,
-                sources    = sources,
-                confidence = confidence,
+                probs        = blended,
+                fetched_at   = now,
+                sources      = sources,
+                confidence   = confidence,
+                data_quality = data_quality,
             )
 
         if new_probs:
@@ -2539,16 +2570,25 @@ def _cumulative_yes_prob(target_rate: float, mp: "MeetingProbs") -> float:
     OUTCOME_BPS levels (HOLD, CUT_25, …).  Summing the point probabilities for all
     outcomes whose implied final rate is ≥ T gives the correct cumulative P(YES).
 
-    The model only resolves outcomes down to CUT_100 (4 × 25 bp cuts from the
-    current rate).  Strikes more than 100 bp below current therefore include all
-    model outcomes and return a probability close to 1.0 — which is correct (e.g.
-    P(rate ≥ 1.00%) from 3.75% is essentially certain in any realistic scenario).
+    Fix: Only sum outcomes where the resulting rate falls within one 25 bp tick of
+    the target (i.e., the outcome rate is in [target_rate - 0.25, ∞)).  This
+    prevents deep-OTM strikes (e.g. T=2.00% when current=4.25%) from collecting
+    every outcome label and wrongly returning ~0.99.
+
+    Hard clamp: returned probabilities are bounded to [0.05, 0.95] so the model
+    never claims absolute certainty at the tails, preserving meaningful edge.
     """
-    return max(0.01, min(0.99, sum(
+    # Lower bound: only include outcomes whose resulting rate is >= target_rate.
+    # We treat a 25 bp rounding margin as the minimum meaningful tick — outcomes
+    # that land within one tick BELOW the target are excluded (they are OTM).
+    raw = sum(
         (mp.get(label) or 0.0)
         for label, bps in OUTCOME_BPS.items()
         if (_current_fed_rate + bps / 100.0) >= target_rate
-    )))
+    )
+    # Hard clamp: never return tail certainty — market always retains residual
+    # probability of outcomes outside the model's outcome space.
+    return max(0.05, min(0.95, raw))
 
 
 async def fair_value(ticker: str, market_price: float) -> float | None:
@@ -2584,6 +2624,30 @@ async def fair_value(ticker: str, market_price: float) -> float | None:
     return prob
 
 
+def _staleness_penalty(age_seconds: float, base_confidence: float) -> float:
+    """
+    Apply a tiered staleness penalty to confidence based on data age.
+
+    Tiers:
+      < 30 min  (1800 s):  no penalty  — data is fresh
+      30 min – 2 h:        0.80× multiplier  (current behaviour, unchanged)
+      2 h – 6 h:           0.50× multiplier  — significantly degraded signal
+      > 6 h    (21600 s):  return 0.0 — block signal entirely; data is too old
+
+    Timezone safety: MeetingProbs.fetched_at is always set via
+    datetime.now(timezone.utc) and age_seconds() subtracts an equally
+    timezone-aware datetime.now(timezone.utc), so the subtraction is safe.
+    """
+    if age_seconds < 1_800:          # < 30 minutes — fresh
+        return base_confidence
+    elif age_seconds < 7_200:        # 30 min – 2 hours — mild penalty
+        return base_confidence * 0.80
+    elif age_seconds < 21_600:       # 2 – 6 hours — significant penalty
+        return base_confidence * 0.50
+    else:                            # > 6 hours — block signal
+        return 0.0
+
+
 async def get_confidence(ticker: str) -> float:
     """
     Return the current confidence score for a given FOMC ticker.
@@ -2597,8 +2661,20 @@ async def get_confidence(ticker: str) -> float:
     if mp is None:
         return 0.30
 
-    if mp.is_stale():
-        return max(mp.confidence * 0.80, 0.40)
+    age = mp.age_seconds()
+    if age >= 1_800:   # 30 minutes
+        penalised = _staleness_penalty(age, mp.confidence)
+        if penalised == 0.0:
+            log.warning(
+                "FOMC data for %s is %.0fs old (>6h) — confidence blocked to 0.0",
+                parsed["meeting"], age,
+            )
+        else:
+            log.debug(
+                "FOMC data for %s is %.0fs old — staleness penalty applied, conf=%.2f",
+                parsed["meeting"], age, penalised,
+            )
+        return penalised
 
     return mp.confidence  # read-only — never mutate shared MeetingProbs
 
@@ -2640,12 +2716,33 @@ async def fair_value_with_confidence(
                       outcome, ticker, list(mp.probs.keys()))
             return None, 0.30
 
-    # Compute effective confidence without mutating shared state
-    effective_conf = mp.confidence
-    if mp.is_stale():
-        effective_conf = max(mp.confidence * 0.80, 0.40)
-        log.warning("FOMC data for %s is %.0fs old — effective confidence %.2f.",
-                    meeting_key, mp.age_seconds(), effective_conf)
+    # Compute effective confidence without mutating shared state.
+    # Use tiered staleness penalty: < 30 min no penalty, 30 min-2 h: 0.80×,
+    # 2-6 h: 0.50×, > 6 h: 0.0 (signal blocked entirely).
+    age = mp.age_seconds()
+    if age >= 1_800:   # 30 minutes
+        effective_conf = _staleness_penalty(age, mp.confidence)
+        if effective_conf == 0.0:
+            log.warning(
+                "FOMC data for %s is %.0fs old (>6h) — signal blocked "
+                "(returning None, 0.0).",
+                meeting_key, age,
+            )
+            return None, 0.0
+        log.warning(
+            "FOMC data for %s is %.0fs old — staleness penalty applied, "
+            "effective confidence %.2f.",
+            meeting_key, age, effective_conf,
+        )
+    else:
+        effective_conf = mp.confidence
 
-    log.debug("FOMC %s → fair_yes=%.4f conf=%.2f", ticker, prob, effective_conf)
+    if mp.data_quality == "fallback_only":
+        log.debug(
+            "FOMC %s data_quality=fallback_only — model running on FRED static anchor",
+            meeting_key,
+        )
+
+    log.debug("FOMC %s → fair_yes=%.4f conf=%.2f data_quality=%s",
+              ticker, prob, effective_conf, mp.data_quality)
     return prob, effective_conf

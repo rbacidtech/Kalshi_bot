@@ -70,6 +70,13 @@ class SignalMessage:
     model_source: Optional[str] = None   # "fedwatch+zq" | "fred_anchor_3.75%"
     arb_partner:  Optional[str] = None   # paired ticker for arb signals
 
+    # ── Multi-leg arb (null for single-leg and arb_partner-style 2-leg arbs) ──
+    # Each element: {"ticker": str, "side": str, "price_cents": int}
+    # When set, Exec calls execute_arb_legs() instead of the normal execute() path.
+    # arb_partner (above) handles 2-leg monotonicity arbs via its own code path;
+    # arb_legs carries butterfly and any other N-leg structural arbs.
+    arb_legs: Optional[List[dict]] = None
+
     # ── BTC mean-reversion (null for non-BTC) ─────────────────────────────────
     btc_price:      Optional[float] = None
     btc_z_score:    Optional[float] = None   # std devs from rolling mean

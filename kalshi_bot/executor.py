@@ -211,6 +211,157 @@ class Executor:
             log.error("Entry FAILED for %s: %s", signal.ticker, exc)
             return ""
 
+    # ── Multi-leg arb execution ───────────────────────────────────────────────
+
+    def execute_arb_legs(
+        self,
+        legs: list,
+        contracts_per_leg: int = 1,
+    ) -> list:
+        """
+        Place each leg of a structural arb sequentially (flat sizing — no Kelly).
+
+        Args:
+            legs: list of {"ticker": str, "side": str, "price_cents": int} dicts
+            contracts_per_leg: contracts to trade on each leg (default 1)
+
+        Returns:
+            list of order_ids (one per leg, in submission order)
+
+        Raises:
+            RuntimeError if a leg fails after previous legs have been placed
+            (the already-placed legs are best-effort cancelled before raising).
+        """
+        placed: list = []   # list of (ticker, side, order_id) for legs placed so far
+
+        log.info(
+            "[ARB ENTRY] Starting %d-leg arb  contracts_per_leg=%d  legs=%s",
+            len(legs),
+            contracts_per_leg,
+            [(lg["ticker"], lg["side"], lg["price_cents"]) for lg in legs],
+        )
+
+        for i, leg in enumerate(legs):
+            ticker      = leg["ticker"]
+            side        = leg["side"]
+            price_cents = int(leg["price_cents"])
+
+            if self.paper:
+                order_id = self._arb_paper_leg(ticker, side, price_cents, contracts_per_leg, i)
+            else:
+                order_id = self._arb_live_leg(ticker, side, price_cents, contracts_per_leg, i)
+
+            if not order_id:
+                # This leg failed.  Best-effort cancel already-placed legs.
+                log.warning(
+                    "[ARB ENTRY] Leg %d/%d FAILED (%s %s) — attempting to cancel %d earlier leg(s)",
+                    i + 1, len(legs), ticker, side, len(placed),
+                )
+                self._arb_cancel_placed(placed)
+                raise RuntimeError(
+                    f"Arb leg {i + 1}/{len(legs)} failed ({ticker} {side}) "
+                    f"after {len(placed)} leg(s) already placed"
+                )
+
+            placed.append((ticker, side, order_id))
+            log.info(
+                "[ARB ENTRY] Leg %d/%d OK  %-38s  side=%-3s  price=%d¢  order_id=%s",
+                i + 1, len(legs), ticker[:38], side, price_cents, order_id,
+            )
+
+        order_ids = [oid for _, _, oid in placed]
+        log.info(
+            "[ARB ENTRY] All %d legs placed  order_ids=%s",
+            len(legs), order_ids,
+        )
+        return order_ids
+
+    def _arb_paper_leg(
+        self,
+        ticker: str,
+        side: str,
+        price_cents: int,
+        contracts: int,
+        leg_index: int,
+    ) -> str:
+        """Simulate placement of one arb leg in paper mode."""
+        log.info(
+            "[PAPER ARB LEG %d] %-38s  side=%-3s  price=%d¢  contracts=%d",
+            leg_index + 1, ticker[:38], side, price_cents, contracts,
+        )
+        return "paper"
+
+    def _arb_live_leg(
+        self,
+        ticker: str,
+        side: str,
+        price_cents: int,
+        contracts: int,
+        leg_index: int,
+    ) -> str:
+        """Place one live arb leg.  Returns order_id on success, "" on failure."""
+        if not (1 <= price_cents <= 99):
+            log.error(
+                "Arb leg %d: price_cents=%d out of valid range [1, 99] "
+                "— refusing order for %s %s",
+                leg_index + 1, price_cents, ticker, side,
+            )
+            return ""
+        price_key = "yes_price" if side == "yes" else "no_price"
+        payload = {
+            "action":  "buy",
+            "type":    "limit",
+            "ticker":  ticker,
+            "side":    side,
+            "count":   contracts,
+            price_key: price_cents,
+        }
+        try:
+            resp     = self.client.post("/portfolio/orders", payload)
+            order_id = resp.get("order", {}).get("order_id")
+            if not order_id:
+                log.error(
+                    "Arb leg %d FAILED for %s %s: no order_id in response — %s",
+                    leg_index + 1, ticker, side, resp,
+                )
+                return ""
+            log.info(
+                "[LIVE ARB LEG %d] %-38s  side=%-3s  price=%d¢  contracts=%d  order_id=%s",
+                leg_index + 1, ticker[:38], side, price_cents, contracts, order_id,
+            )
+            return order_id
+        except requests.HTTPError as exc:
+            log.error("Arb leg %d FAILED for %s %s: HTTP %s", leg_index + 1, ticker, side, exc)
+            return ""
+        except Exception as exc:
+            log.error("Arb leg %d FAILED for %s %s: %s", leg_index + 1, ticker, side, exc)
+            return ""
+
+    def _arb_cancel_placed(self, placed: list) -> None:
+        """
+        Best-effort cancel of already-placed arb legs when a subsequent leg fails.
+        Logs a warning per leg if the cancel itself fails — never raises.
+
+        placed: list of (ticker, side, order_id) tuples
+        """
+        for ticker, side, order_id in reversed(placed):
+            if order_id == "paper":
+                log.info(
+                    "[ARB UNWIND] Paper leg %s %s — no cancel needed", ticker, side
+                )
+                continue
+            try:
+                self.client._request("DELETE", f"/portfolio/orders/{order_id}")
+                log.info(
+                    "[ARB UNWIND] Cancelled leg %s %s  order_id=%s", ticker, side, order_id
+                )
+            except Exception as exc:
+                log.warning(
+                    "[ARB UNWIND] Cancel FAILED for %s %s order_id=%s: %s "
+                    "(position may be open — check Kalshi dashboard)",
+                    ticker, side, order_id, exc,
+                )
+
     # ── Exit management ───────────────────────────────────────────────────────
 
 

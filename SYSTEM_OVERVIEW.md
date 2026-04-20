@@ -199,15 +199,17 @@ Runs every 60s. For each open position:
 1. Consume `ep:tombstone:{ticker}` keys — cancel resting order + tombstone position
 2. Consume `ep:cut_loss:{ticker}` keys — for filled positions: place sell-limit at market; for resting orders: cancel_and_tombstone
 3. Fetch price from `ep:prices` — skip if stale (> 300s old)
-4. Check pre-expiry tranches (Kalshi only — T-24h exit 50%, T-2h exit remainder)
-5. BTC max-hold timeout (12h) — exits without cooldown penalty
-6. Trailing stop (fires if drawdown from HWM ≥ `TRAILING_STOP_CENTS`)
-7. BTC mean-reversion tranche 1 (price ≥ mid-BB while in profit → exit half, set break-even stop)
-8. Break-even stop on remainder (exit if price falls back to entry)
-9. BTC mean-reversion tranche 2 (exit remainder at mid-BB)
-10. Take-profit (`TAKE_PROFIT_CENTS=20`)
-11. Stop-loss (`STOP_LOSS_CENTS=15`) — sets Redis-persisted cooldown (30min/2h/24h escalation)
-12. Publish `ExecutionReport`, notify Telegram
+4. **Near-certain skip** (Kalshi only) — if YES price ≤ `KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS` (8¢) or ≥ 92¢, skip pre-expiry exit; hold to auto-resolution at 0¢/100¢
+5. Check pre-expiry tranches (Kalshi only — T-24h exit 50%, T-2h exit remainder); skipped for near-certain positions
+6. **Near-expiry stop suppression** — if `days_left < KALSHI_NEAR_EXPIRY_NO_STOP_DAYS` (7), stop-loss and trailing stop are suppressed; contract resolves naturally
+7. BTC max-hold timeout (12h) — exits without cooldown penalty
+8. Trailing stop (fires if drawdown from HWM ≥ `TRAILING_STOP_CENTS`; suppressed within 7 days of expiry)
+9. BTC mean-reversion tranche 1 (price ≥ mid-BB while in profit → exit half, set break-even stop)
+10. Break-even stop on remainder (exit if price falls back to entry)
+11. BTC mean-reversion tranche 2 (exit remainder at mid-BB)
+12. Take-profit (`TAKE_PROFIT_CENTS=40`)
+13. Stop-loss (`STOP_LOSS_CENTS=30`) — sets Redis-persisted cooldown (30min/2h/24h escalation); suppressed within 7 days of expiry
+14. Publish `ExecutionReport`, notify Telegram
 
 #### `_heartbeat_loop`
 Publishes `HEARTBEAT` event to `ep:system` every 30s. Used by monitoring.
@@ -350,22 +352,27 @@ Queries Kalshi `/markets?status=settled` hourly. Records outcomes in SQLite, fee
 | Parameter | Value | Env var |
 |---|---|---|
 | Kelly fraction | 0.25 | KALSHI_KELLY_FRACTION |
-| Max contracts per signal | 5 | KALSHI_MAX_CONTRACTS |
-| Min edge (gross) | 0.12 (12¢) | KALSHI_EDGE_THRESHOLD |
+| Max contracts per signal | 15 | KALSHI_MAX_CONTRACTS |
+| Min edge (gross) | 0.10 (10¢) | KALSHI_EDGE_THRESHOLD |
 | Min confidence | 0.60 | KALSHI_MIN_CONFIDENCE |
+| Min YES entry price | 0.60 (KXFED only) | KALSHI_MIN_YES_ENTRY_PRICE |
+| Fallback-only edge threshold | 0.25 (25¢) | KALSHI_FALLBACK_ONLY_EDGE_THRESHOLD |
 | Max spread | 10¢ | KALSHI_MAX_SPREAD_CENTS |
 | Fee per trade | 7% of winnings | KALSHI_FEE_CENTS |
-| Max single market exposure | 10% of balance | KALSHI_MAX_MARKET_EXPOSURE |
+| Max single market exposure | 20% of balance | KALSHI_MAX_MARKET_EXPOSURE |
 | Max total exposure | 80% of balance | KALSHI_MAX_TOTAL_EXPOSURE |
 | Max category exposure | 60% of balance | hardcoded _MAX_CATEGORY_PCT |
 | Max series exposure | 40% of balance | hardcoded _MAX_SERIES_PCT |
 | Max positions per FOMC meeting | 4 | hardcoded MAX_POSITIONS_PER_MEETING |
 | Daily drawdown limit | 20% | KALSHI_DAILY_DRAWDOWN_LIMIT |
-| Take profit | 20¢ | KALSHI_TAKE_PROFIT_CENTS |
-| Stop loss | 15¢ | KALSHI_STOP_LOSS_CENTS |
-| Trailing stop | 15¢ | KALSHI_TRAILING_STOP_CENTS (implied) |
+| Take profit | 40¢ | KALSHI_TAKE_PROFIT_CENTS |
+| Stop loss | 30¢ | KALSHI_STOP_LOSS_CENTS |
+| Trailing stop | 12¢ | KALSHI_TRAILING_STOP_CENTS |
+| Near-certain threshold | 8¢ (skip pre-expiry exit) | KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS |
+| Near-expiry stop suppression | 7 days before close_time | KALSHI_NEAR_EXPIRY_NO_STOP_DAYS |
 | Pre-expiry exit | T-24h full, T-48h half | KALSHI_HOURS_BEFORE_CLOSE=24 |
 | Stop-loss cooldown | 30min / 2h / 24h (escalating) | Redis-persisted ep:cooldown:{ticker} |
+| Min Kelly trades (terminal) | 10 | KALSHI_MIN_KELLY_TRADES |
 
 ### BTC risk
 
@@ -526,19 +533,25 @@ KALSHI_API_KEY_ID           Key ID for Kalshi RSA auth
 KALSHI_PRIVATE_KEY_PATH     Path to RSA private key PEM
 KALSHI_PAPER_TRADE          true/false (default true)
 KALSHI_BASE_URL             https://api.elections.kalshi.com/trade-api/v2
-KALSHI_EDGE_THRESHOLD       0.10 — min gross edge for signal (12¢ strategy default)
-KALSHI_MAX_CONTRACTS        5 — max contracts per order
-KALSHI_POLL_INTERVAL        120 — seconds between Intel cycles
-KALSHI_MIN_CONFIDENCE       0.60
-KALSHI_KELLY_FRACTION       0.25
-KALSHI_MAX_MARKET_EXPOSURE  0.05
-KALSHI_MAX_TOTAL_EXPOSURE   0.30
-KALSHI_DAILY_DRAWDOWN_LIMIT 0.20
-KALSHI_MAX_SPREAD_CENTS     10
-KALSHI_FEE_CENTS            7
-KALSHI_TAKE_PROFIT_CENTS    20
-KALSHI_STOP_LOSS_CENTS      15
-KALSHI_HOURS_BEFORE_CLOSE   24.0 — pre-expiry exit window
+KALSHI_EDGE_THRESHOLD                0.10 — min gross edge for signal
+KALSHI_FALLBACK_ONLY_EDGE_THRESHOLD  0.25 — higher bar when only FRED static is available
+KALSHI_MAX_CONTRACTS                 15 — max contracts per order
+KALSHI_POLL_INTERVAL                 120 — seconds between Intel cycles
+KALSHI_MIN_CONFIDENCE                0.60
+KALSHI_MIN_YES_ENTRY_PRICE           0.60 — suppress KXFED YES below 60¢ market price
+KALSHI_KELLY_FRACTION                0.25
+KALSHI_MIN_KELLY_TRADES              10 — min terminal trades before terminal-filtered Kelly
+KALSHI_MAX_MARKET_EXPOSURE           0.20
+KALSHI_MAX_TOTAL_EXPOSURE            0.80
+KALSHI_DAILY_DRAWDOWN_LIMIT          0.20
+KALSHI_MAX_SPREAD_CENTS              10
+KALSHI_FEE_CENTS                     7
+KALSHI_TAKE_PROFIT_CENTS             40
+KALSHI_STOP_LOSS_CENTS               30
+KALSHI_TRAILING_STOP_CENTS           12
+KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS  8 — skip pre-expiry exit if YES ≤ 8¢ or ≥ 92¢
+KALSHI_NEAR_EXPIRY_NO_STOP_DAYS      7 — suppress stops within 7 days of close_time
+KALSHI_HOURS_BEFORE_CLOSE            24.0 — pre-expiry exit window
 
 # Coinbase BTC
 COINBASE_API_KEY_NAME       CDP key name (organizations/.../apiKeys/...)

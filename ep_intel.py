@@ -1387,7 +1387,7 @@ async def intel_main() -> None:
                     # Late-money spike: accelerating volume → market may be crowded
                     _cur_vol = _market_vol_map.get(_sig.ticker, 0.0)
                     if is_late_money_spike(_sig.ticker, _cur_vol):
-                        _sig.confidence = max(0.10, _sig.confidence * 0.70)
+                        _sig.confidence = max(0.10, _sig.confidence * 0.90)
                         log.info(
                             "Late-money spike: %-38s  confidence → %.2f",
                             _sig.ticker[:38], _sig.confidence,
@@ -1822,6 +1822,22 @@ async def intel_main() -> None:
                         log.debug(
                             "Spread>edge filter: %s  spread=%d¢  edge=%.0f¢ — skipping",
                             msg.ticker, msg.spread_cents, msg.edge * 100,
+                        )
+                        continue
+
+                    # ── Fix 2c: fallback-only data quality gate ────────────────
+                    # When fomc.py marks a signal as produced from fallback sources
+                    # only (e.g. FRED anchor with no live market data), require a
+                    # much higher edge to avoid publishing spurious FRED-disagreement
+                    # artefacts.  The field may be absent on signals from other
+                    # agents — use .get() so this never raises.
+                    _dq = getattr(msg, "data_quality", None) or (
+                        msg.__dict__.get("data_quality") if hasattr(msg, "__dict__") else None
+                    )
+                    if _dq == "fallback_only" and msg.edge < cfg.FALLBACK_ONLY_EDGE_THRESHOLD:
+                        log.info(
+                            "Fallback-only gate: %s side=%s edge=%.3f < %.2f (FALLBACK_ONLY_EDGE_THRESHOLD) — skipping",
+                            msg.ticker, msg.side, msg.edge, cfg.FALLBACK_ONLY_EDGE_THRESHOLD,
                         )
                         continue
 
