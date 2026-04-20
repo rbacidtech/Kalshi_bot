@@ -1591,6 +1591,36 @@ async def intel_main() -> None:
                     _move_now, _move_fomc_count,
                 )
 
+            # ── FOMC announcement day blackout ────────────────────────────────
+            # On meeting days, Kalshi prices whipsaw around the 2pm ET announcement.
+            # Suppress new FOMC directional signals for ±N hours around 18:00 UTC.
+            # Arb signals are structural and are always kept.
+            _blackout_hours = int(os.getenv("FOMC_ANNOUNCE_BLACKOUT_HOURS", "2"))
+            if _blackout_hours > 0:
+                import kalshi_bot.models.fomc as _fomc_mod
+                _now_utc = datetime.now(timezone.utc)
+                _today_str = _now_utc.strftime("%Y-%m-%d")
+                _fomc_cal = _fomc_mod._FOMC_UPCOMING_LIVE if _fomc_mod._FOMC_UPCOMING_LIVE else _fomc_mod._FOMC_UPCOMING
+                _ANNOUNCE_HOUR = 18  # 2pm ET/EDT = 18:00 UTC
+                _in_blackout = (
+                    _today_str in _fomc_cal
+                    and abs(_now_utc.hour - _ANNOUNCE_HOUR) <= _blackout_hours
+                )
+                if _in_blackout:
+                    _bl_count = sum(
+                        1 for s in signals
+                        if s.category == "fomc" and not s.model_source.endswith("_arb")
+                    )
+                    signals = [
+                        s for s in signals
+                        if not (s.category == "fomc" and not s.model_source.endswith("_arb"))
+                    ]
+                    log.warning(
+                        "FOMC announcement blackout active (%s ±%dh of %02d:00 UTC)"
+                        " — suppressed %d directional signal(s), arb kept",
+                        _today_str, _blackout_hours, _ANNOUNCE_HOUR, _bl_count,
+                    )
+
             new_signals = [
                 s for s in signals
                 if s.ticker not in current_positions
