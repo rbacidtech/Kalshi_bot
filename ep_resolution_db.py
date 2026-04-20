@@ -344,6 +344,7 @@ class ResolutionDB:
             ("series",      "TEXT"),
             ("entry_cents", "INTEGER"),
             ("exit_cents",  "INTEGER"),
+            ("correct",     "INTEGER"),
         ]:
             try:
                 self._conn.execute(
