@@ -1,32 +1,26 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
-  TrendingUp,
-  TrendingDown,
-  BarChart2,
-  Clock,
-  Percent,
-  Award,
-  AlertTriangle,
-  Inbox,
+  TrendingUp, TrendingDown, BarChart2, Clock,
+  Percent, Award, AlertTriangle, Inbox,
 } from 'lucide-react'
 import { api } from '../lib/api'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface PerformanceSummary {
-  period_days: number
-  total_trades: number
-  wins: number
-  losses: number
-  win_rate: number
-  total_pnl_cents: number
-  avg_pnl_per_trade: number
-  by_strategy: Record<string, { trades: number; wins: number; pnl_cents: number }>
-  best_trade: { ticker: string; pnl_cents: number; strategy: string } | null
-  worst_trade: { ticker: string; pnl_cents: number; strategy: string } | null
+  period_days:        number
+  total_trades:       number
+  wins:               number
+  losses:             number
+  win_rate:           number
+  total_pnl_cents:    number
+  avg_pnl_per_trade:  number
+  by_strategy:        Record<string, { trades: number; wins: number; pnl_cents: number }>
+  best_trade:         { ticker: string; pnl_cents: number; strategy: string } | null
+  worst_trade:        { ticker: string; pnl_cents: number; strategy: string } | null
   avg_hold_time_hours: number
-  sharpe_daily: number | null
+  sharpe_daily:       number | null
 }
 
 type Period = 7 | 30 | 90
@@ -50,11 +44,67 @@ function winRatePct(rate: number): string {
   return (rate * 100).toFixed(1) + '%'
 }
 
+// ── Win Rate Ring (SVG — no black-hole artifact) ─────────────────────────────
+
+function WinRateRing({ rate }: { rate: number }) {
+  const pct    = Math.round(rate * 100)
+  const color  = pct >= 55 ? '#34d399' : pct >= 45 ? '#fbbf24' : '#f87171'
+  const r      = 16
+  const circ   = 2 * Math.PI * r
+  const offset = circ * (1 - rate)
+  return (
+    <div className="relative shrink-0 flex items-center justify-center" style={{ width: 44, height: 44 }}>
+      <svg width="44" height="44" className="-rotate-90" style={{ overflow: 'visible' }}>
+        <circle cx="22" cy="22" r={r} fill="none" stroke="#1a2238" strokeWidth="4" />
+        <circle
+          cx="22" cy="22" r={r} fill="none"
+          stroke={color} strokeWidth="4"
+          strokeDasharray={circ}
+          strokeDashoffset={offset}
+          strokeLinecap="round"
+          style={{ transition: 'stroke-dashoffset 0.5s ease' }}
+        />
+      </svg>
+      <span className="absolute text-[10px] font-bold text-white tabular-nums">{pct}%</span>
+    </div>
+  )
+}
+
+// ── Stat Card ────────────────────────────────────────────────────────────────
+
+interface StatCardProps {
+  label:   string
+  value:   React.ReactNode
+  icon?:   React.ReactNode
+  sub?:    React.ReactNode
+  accent?: string
+}
+
+function StatCard({ label, value, icon, sub, accent }: StatCardProps) {
+  return (
+    <div
+      className="bg-surface-1 rounded-xl border border-border p-4 flex flex-col gap-1 min-w-0"
+      style={accent ? {
+        borderTopColor: accent,
+        borderTopWidth: 3,
+        boxShadow: `0 4px 24px ${accent}22`,
+      } : undefined}
+    >
+      <span className="text-xs font-medium text-slate-500 uppercase tracking-wide truncate">{label}</span>
+      <div className="flex items-center gap-2.5 mt-0.5">
+        {icon && <span className="shrink-0">{icon}</span>}
+        <span className="text-2xl font-bold truncate">{value}</span>
+      </div>
+      {sub && <div className="text-xs text-slate-500 mt-0.5">{sub}</div>}
+    </div>
+  )
+}
+
 // ── Skeleton ─────────────────────────────────────────────────────────────────
 
 function StatSkeleton() {
   return (
-    <div className="card-sm flex flex-col gap-2 animate-pulse">
+    <div className="rounded-xl border border-border bg-surface-1 p-4 flex flex-col gap-2 animate-pulse">
       <div className="h-3 bg-surface-2 rounded w-24" />
       <div className="h-8 bg-surface-2 rounded w-32 mt-1" />
     </div>
@@ -78,7 +128,7 @@ function StrategySkeleton() {
 
 function TradeCardSkeleton() {
   return (
-    <div className="card-sm animate-pulse">
+    <div className="rounded-xl border border-border bg-surface-1 p-4 animate-pulse">
       <div className="h-3 bg-surface-2 rounded w-20 mb-3" />
       <div className="h-7 bg-surface-2 rounded w-36 mb-2" />
       <div className="h-3 bg-surface-2 rounded w-24" />
@@ -86,83 +136,28 @@ function TradeCardSkeleton() {
   )
 }
 
-// ── Win Rate Ring ─────────────────────────────────────────────────────────────
-// A compact circular-progress feel via conic-gradient
-
-interface WinRingProps {
-  rate: number
-}
-
-function WinRateRing({ rate }: WinRingProps) {
-  const pct = Math.round(rate * 100)
-  const color = pct >= 55 ? '#34d399' : pct >= 45 ? '#fbbf24' : '#f87171'
-  return (
-    <div className="flex items-center gap-3">
-      <div
-        className="relative shrink-0 rounded-full flex items-center justify-center"
-        style={{
-          width: 44,
-          height: 44,
-          background: `conic-gradient(${color} ${pct}%, #1a2238 ${pct}%)`,
-        }}
-      >
-        {/* inner fill */}
-        <div className="absolute inset-1.5 bg-surface-1 rounded-full" />
-        <span className="relative z-10 text-[10px] font-bold text-white tabular-nums">{pct}%</span>
-      </div>
-    </div>
-  )
-}
-
-// ── Stat Card ────────────────────────────────────────────────────────────────
-
-interface StatCardProps {
-  label: string
-  value: React.ReactNode
-  icon?: React.ReactNode
-  sub?: React.ReactNode
-}
-
-function StatCard({ label, value, icon, sub }: StatCardProps) {
-  return (
-    <div className="card-sm flex flex-col gap-1 min-w-0">
-      <span className="text-xs font-medium text-slate-500 uppercase tracking-wide">{label}</span>
-      <div className="flex items-center gap-2.5 mt-0.5">
-        {icon && <span className="shrink-0">{icon}</span>}
-        <span className="text-2xl font-bold truncate">{value}</span>
-      </div>
-      {sub && <div className="text-xs text-slate-500 mt-0.5">{sub}</div>}
-    </div>
-  )
-}
-
 // ── Strategy Row ─────────────────────────────────────────────────────────────
 
 interface StrategyRowProps {
-  name: string
-  trades: number
-  wins: number
+  name:      string
+  trades:    number
+  wins:      number
   pnl_cents: number
   maxAbsPnl: number
 }
 
 function StrategyRow({ name, trades, wins, pnl_cents, maxAbsPnl }: StrategyRowProps) {
-  const wr = trades > 0 ? wins / trades : 0
-  const wrPct = Math.round(wr * 100)
+  const wr       = trades > 0 ? wins / trades : 0
+  const wrPct    = Math.round(wr * 100)
   const barWidth = maxAbsPnl > 0 ? Math.round((Math.abs(pnl_cents) / maxAbsPnl) * 100) : 0
-  const isPos = pnl_cents >= 0
+  const isPos    = pnl_cents >= 0
 
   return (
     <tr className="hover:bg-surface-2/40 transition-colors">
-      {/* Strategy name */}
       <td className="py-3 pr-4">
         <span className="font-mono text-sm text-slate-200">{name}</span>
       </td>
-
-      {/* Trades */}
       <td className="py-3 pr-4 text-slate-400 tabular-nums text-sm">{trades}</td>
-
-      {/* Win Rate */}
       <td className="py-3 pr-6">
         <div className="flex items-center gap-2">
           <div className="w-16 h-1.5 bg-surface-3 rounded-full overflow-hidden shrink-0">
@@ -174,8 +169,6 @@ function StrategyRow({ name, trades, wins, pnl_cents, maxAbsPnl }: StrategyRowPr
           <span className="text-slate-300 text-xs tabular-nums w-9 shrink-0">{wrPct}%</span>
         </div>
       </td>
-
-      {/* P&L with color bar */}
       <td className="py-3">
         <div className="flex items-center gap-2">
           <div className="w-20 h-1.5 bg-surface-3 rounded-full overflow-hidden shrink-0">
@@ -195,34 +188,30 @@ function StrategyRow({ name, trades, wins, pnl_cents, maxAbsPnl }: StrategyRowPr
 
 // ── Best / Worst Trade Card ───────────────────────────────────────────────────
 
-interface TradeHighlightCardProps {
-  type: 'best' | 'worst'
+function TradeHighlightCard({ type, trade }: {
+  type:  'best' | 'worst'
   trade: { ticker: string; pnl_cents: number; strategy: string }
-}
-
-function TradeHighlightCard({ type, trade }: TradeHighlightCardProps) {
-  const isBest = type === 'best'
-  const Icon = isBest ? Award : AlertTriangle
-  const iconColor = isBest ? 'text-emerald-400' : 'text-rose-400'
-  const borderColor = isBest ? 'border-emerald-400/20' : 'border-rose-400/20'
-  const bgColor = isBest ? 'bg-emerald-400/5' : 'bg-rose-400/5'
-
+}) {
+  const isBest    = type === 'best'
+  const Icon      = isBest ? Award : AlertTriangle
+  const color     = isBest ? '#34d399' : '#f87171'
   return (
-    <div className={`card-sm flex flex-col gap-2 border ${borderColor} ${bgColor}`}>
+    <div
+      className="bg-surface-1 rounded-xl border border-border p-4 flex flex-col gap-2"
+      style={{ borderTopColor: color, borderTopWidth: 3, boxShadow: `0 4px 24px ${color}18` }}
+    >
       <div className="flex items-center gap-2">
-        <Icon size={14} className={iconColor} />
+        <Icon size={14} style={{ color }} />
         <span className="text-xs font-medium text-slate-500 uppercase tracking-wide">
           {isBest ? 'Best Trade' : 'Worst Trade'}
         </span>
       </div>
-
       <div className="flex items-center justify-between gap-4 mt-0.5">
         <span className="font-mono text-sm font-semibold text-slate-200 truncate">{trade.ticker}</span>
-        <span className={`text-xl font-bold tabular-nums shrink-0 ${pnlClass(trade.pnl_cents)}`}>
+        <span className="text-xl font-bold tabular-nums shrink-0" style={{ color }}>
           {pnlText(trade.pnl_cents)}
         </span>
       </div>
-
       <span className="text-xs text-slate-500">
         Strategy: <span className="text-slate-400">{trade.strategy}</span>
       </span>
@@ -232,23 +221,18 @@ function TradeHighlightCard({ type, trade }: TradeHighlightCardProps) {
 
 // ── Period Selector ───────────────────────────────────────────────────────────
 
-interface PeriodSelectorProps {
-  value: Period
-  onChange: (p: Period) => void
-}
-
 const PERIODS: Period[] = [7, 30, 90]
 
-function PeriodSelector({ value, onChange }: PeriodSelectorProps) {
+function PeriodSelector({ value, onChange }: { value: Period; onChange: (p: Period) => void }) {
   return (
-    <div className="flex items-center gap-1 bg-surface-1 border border-border rounded-full p-0.5">
+    <div className="flex items-center gap-1 bg-surface-2 border border-border rounded-full p-0.5">
       {PERIODS.map(p => (
         <button
           key={p}
           onClick={() => onChange(p)}
-          className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-colors duration-150 ${
+          className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all duration-150 ${
             value === p
-              ? 'bg-surface-2 text-white shadow-sm'
+              ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-sm'
               : 'text-slate-400 hover:text-white'
           }`}
         >
@@ -266,26 +250,19 @@ export default function PerformancePage() {
 
   const { data, isLoading, isError } = useQuery<PerformanceSummary>({
     queryKey: ['performance', days],
-    queryFn: () => api.get('/performance', { params: { days } }).then(r => r.data),
+    queryFn:  () => api.get('/performance', { params: { days } }).then(r => r.data),
     staleTime: 60_000,
   })
-
-  // ── Derived ───────────────────────────────────────────────────────────────
 
   const isEmpty = !isLoading && !isError && data?.total_trades === 0
 
   const sortedStrategies: Array<[string, { trades: number; wins: number; pnl_cents: number }]> =
-    data
-      ? Object.entries(data.by_strategy).sort((a, b) => b[1].pnl_cents - a[1].pnl_cents)
-      : []
+    data ? Object.entries(data.by_strategy).sort((a, b) => b[1].pnl_cents - a[1].pnl_cents) : []
 
-  const maxAbsPnl = sortedStrategies.reduce(
-    (acc, [, v]) => Math.max(acc, Math.abs(v.pnl_cents)),
-    0,
-  )
+  const maxAbsPnl = sortedStrategies.reduce((acc, [, v]) => Math.max(acc, Math.abs(v.pnl_cents)), 0)
 
-  const totalPnlPositive = (data?.total_pnl_cents ?? 0) >= 0
-  const avgPnlPositive = (data?.avg_pnl_per_trade ?? 0) >= 0
+  const totalPnlPos = (data?.total_pnl_cents ?? 0) >= 0
+  const avgPnlPos   = (data?.avg_pnl_per_trade ?? 0) >= 0
 
   return (
     <div className="space-y-5">
@@ -299,71 +276,54 @@ export default function PerformancePage() {
         <PeriodSelector value={days} onChange={setDays} />
       </div>
 
-      {/* ── 1. Summary Stat Cards ─────────────────────────────────────────── */}
+      {/* ── Stat Cards ────────────────────────────────────────────────────── */}
       {isLoading ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          {[0, 1, 2, 3, 4, 5].map(i => <StatSkeleton key={i} />)}
+          {[0,1,2,3,4,5].map(i => <StatSkeleton key={i} />)}
         </div>
       ) : data ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          {/* Total P&L */}
+
           <StatCard
             label="Total P&L"
-            icon={
-              totalPnlPositive
-                ? <TrendingUp size={18} className="text-emerald-400" />
-                : <TrendingDown size={18} className="text-rose-400" />
-            }
-            value={
-              <span className={pnlClass(data.total_pnl_cents)}>
-                {pnlText(data.total_pnl_cents)}
-              </span>
-            }
+            accent={totalPnlPos ? '#34d399' : '#f87171'}
+            icon={totalPnlPos
+              ? <TrendingUp size={18} className="text-emerald-400" />
+              : <TrendingDown size={18} className="text-rose-400" />}
+            value={<span className={pnlClass(data.total_pnl_cents)}>{pnlText(data.total_pnl_cents)}</span>}
           />
 
-          {/* Win Rate */}
           <StatCard
             label="Win Rate"
+            accent={data.win_rate >= 0.55 ? '#34d399' : data.win_rate >= 0.45 ? '#fbbf24' : '#f87171'}
             icon={<WinRateRing rate={data.win_rate} />}
             value={
-              <span className={
-                data.win_rate >= 0.55
-                  ? 'text-emerald-400'
-                  : data.win_rate >= 0.45
-                    ? 'text-amber-400'
-                    : 'text-rose-400'
-              }>
+              <span className={data.win_rate >= 0.55 ? 'text-emerald-400' : data.win_rate >= 0.45 ? 'text-amber-400' : 'text-rose-400'}>
                 {winRatePct(data.win_rate)}
               </span>
             }
             sub={`${data.wins}W / ${data.losses}L`}
           />
 
-          {/* Total Trades */}
           <StatCard
             label="Total Trades"
-            icon={<BarChart2 size={18} className="text-accent-blue" />}
+            accent="#60a5fa"
+            icon={<BarChart2 size={18} className="text-blue-400" />}
             value={<span className="text-white">{data.total_trades.toLocaleString()}</span>}
           />
 
-          {/* Avg P&L per Trade */}
           <StatCard
             label="Avg P&L / Trade"
-            icon={
-              avgPnlPositive
-                ? <TrendingUp size={18} className="text-emerald-400" />
-                : <TrendingDown size={18} className="text-rose-400" />
-            }
-            value={
-              <span className={pnlClass(data.avg_pnl_per_trade)}>
-                {pnlText(data.avg_pnl_per_trade)}
-              </span>
-            }
+            accent={avgPnlPos ? '#34d399' : '#f87171'}
+            icon={avgPnlPos
+              ? <TrendingUp size={18} className="text-emerald-400" />
+              : <TrendingDown size={18} className="text-rose-400" />}
+            value={<span className={pnlClass(data.avg_pnl_per_trade)}>{pnlText(data.avg_pnl_per_trade)}</span>}
           />
 
-          {/* Avg Hold Time */}
           <StatCard
             label="Avg Hold Time"
+            accent="#94a3b8"
             icon={<Clock size={18} className="text-slate-400" />}
             value={
               <span className="text-white">
@@ -374,31 +334,32 @@ export default function PerformancePage() {
             }
           />
 
-          {/* Sharpe Ratio */}
           <StatCard
             label="Sharpe Ratio"
+            accent={data.sharpe_daily != null ? (data.sharpe_daily >= 1 ? '#34d399' : data.sharpe_daily >= 0 ? '#fbbf24' : '#f87171') : '#94a3b8'}
             icon={<Percent size={18} className="text-slate-400" />}
             value={
-              data.sharpe_daily != null ? (
-                <span className={data.sharpe_daily >= 1 ? 'text-emerald-400' : data.sharpe_daily >= 0 ? 'text-amber-400' : 'text-rose-400'}>
-                  {data.sharpe_daily.toFixed(2)}
-                </span>
-              ) : (
-                <span className="text-slate-500">N/A</span>
-              )
+              data.sharpe_daily != null
+                ? <span className={data.sharpe_daily >= 1 ? 'text-emerald-400' : data.sharpe_daily >= 0 ? 'text-amber-400' : 'text-rose-400'}>
+                    {data.sharpe_daily.toFixed(2)}
+                  </span>
+                : <span className="text-slate-500">N/A</span>
             }
           />
         </div>
       ) : null}
 
-      {/* ── Error State ───────────────────────────────────────────────────── */}
+      {/* ── Error ─────────────────────────────────────────────────────────── */}
       {isError && (
-        <div className="card py-10 text-center text-rose-400 text-sm">
+        <div
+          className="rounded-xl border py-10 text-center text-rose-400 text-sm"
+          style={{ background: 'rgba(248,113,113,0.05)', borderColor: 'rgba(248,113,113,0.2)' }}
+        >
           Failed to load performance data. Please try again.
         </div>
       )}
 
-      {/* ── Empty State ───────────────────────────────────────────────────── */}
+      {/* ── Empty ─────────────────────────────────────────────────────────── */}
       {isEmpty && (
         <div className="card py-16 flex flex-col items-center gap-3 text-slate-500">
           <Inbox size={36} strokeWidth={1.25} />
@@ -406,10 +367,20 @@ export default function PerformancePage() {
         </div>
       )}
 
-      {/* ── 2. Strategy Breakdown ─────────────────────────────────────────── */}
+      {/* ── Strategy Breakdown ────────────────────────────────────────────── */}
       {!isEmpty && (
-        <div className="card">
-          <h2 className="text-sm font-semibold text-slate-300 mb-4">Strategy Breakdown</h2>
+        <div
+          className="rounded-xl border border-border bg-surface-1 p-5"
+          style={{ borderTopColor: '#60a5fa', borderTopWidth: 3, boxShadow: '0 4px 24px rgba(96,165,250,0.08)' }}
+        >
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-semibold text-slate-300">Strategy Breakdown</h2>
+            {data && (
+              <span className="text-xs text-slate-500">
+                {sortedStrategies.length} strategies · {days}d window
+              </span>
+            )}
+          </div>
 
           {isLoading ? (
             <StrategySkeleton />
@@ -419,10 +390,7 @@ export default function PerformancePage() {
                 <thead>
                   <tr className="border-b border-border text-left">
                     {['Strategy', 'Trades', 'Win Rate', 'P&L'].map(col => (
-                      <th
-                        key={col}
-                        className="pb-2.5 pr-6 text-xs font-medium text-slate-500 whitespace-nowrap last:pr-0"
-                      >
+                      <th key={col} className="pb-2.5 pr-6 text-xs font-medium text-slate-500 whitespace-nowrap last:pr-0">
                         {col}
                       </th>
                     ))}
@@ -444,38 +412,27 @@ export default function PerformancePage() {
             </div>
           ) : (
             !isLoading && (
-              <div className="py-8 text-center text-slate-500 text-sm">
-                No strategy data available
-              </div>
+              <div className="py-8 text-center text-slate-500 text-sm">No strategy data available</div>
             )
           )}
         </div>
       )}
 
-      {/* ── 3. Best / Worst Trade Cards ───────────────────────────────────── */}
+      {/* ── Best / Worst Trade ────────────────────────────────────────────── */}
       {!isEmpty && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           {isLoading ? (
-            <>
-              <TradeCardSkeleton />
-              <TradeCardSkeleton />
-            </>
+            <><TradeCardSkeleton /><TradeCardSkeleton /></>
           ) : data ? (
             <>
-              {data.best_trade ? (
-                <TradeHighlightCard type="best" trade={data.best_trade} />
-              ) : (
-                <div className="card-sm flex items-center justify-center text-slate-500 text-sm py-6">
-                  No best trade data
-                </div>
-              )}
-              {data.worst_trade ? (
-                <TradeHighlightCard type="worst" trade={data.worst_trade} />
-              ) : (
-                <div className="card-sm flex items-center justify-center text-slate-500 text-sm py-6">
-                  No worst trade data
-                </div>
-              )}
+              {data.best_trade
+                ? <TradeHighlightCard type="best"  trade={data.best_trade} />
+                : <div className="card flex items-center justify-center text-slate-500 text-sm py-6">No best trade data</div>
+              }
+              {data.worst_trade
+                ? <TradeHighlightCard type="worst" trade={data.worst_trade} />
+                : <div className="card flex items-center justify-center text-slate-500 text-sm py-6">No worst trade data</div>
+              }
             </>
           ) : null}
         </div>

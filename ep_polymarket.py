@@ -17,6 +17,7 @@ No auth required for price reads.
 
 import asyncio
 import datetime
+import json
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -28,9 +29,11 @@ from ep_config import log
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 GAMMA_URL           = "https://gamma-api.polymarket.com"
-DIVERGENCE_THRESHOLD = 0.04   # 4 cents — minimum gap to generate a signal
+DIVERGENCE_THRESHOLD = 0.02   # 2 cents — minimum gap to generate a signal
 CACHE_TTL           = 60      # seconds between Gamma API refreshes (default)
 _HTTP_TIMEOUT       = 8.0
+_GAMMA_PAGE_SIZE    = 500     # markets per page; paginate until empty
+_GAMMA_MAX_PAGES    = 10      # safety cap: at most 5 000 markets total
 
 # BLS/FOMC release times (UTC): CPI ~12:30, NFP ~12:30 first Friday, FOMC 18:00
 _RELEASE_HOURS_UTC = {7, 8, 12, 13, 17, 18, 19}  # hours when major releases happen
@@ -42,16 +45,18 @@ def _active_cache_ttl() -> int:
     return 10 if hour in _RELEASE_HOURS_UTC else 60
 
 # ── Static mapping: Kalshi series prefix → Polymarket search keywords ──────────
-# This tells the matcher what to search for when looking up Polymarket peers.
+# Broad, partial-word keywords — matched case-insensitively against question text.
+# Use short phrases that appear in many real Polymarket question titles.
 _SERIES_KEYWORDS: Dict[str, List[str]] = {
-    "KXFED":   ["federal reserve rate", "fed rate decision", "fomc"],
-    "KXCPI":   ["consumer price index", "cpi inflation"],
-    "KXNFP":   ["nonfarm payroll", "jobs report", "unemployment"],
-    "KXGDP":   ["gdp growth", "gross domestic product"],
-    "KXPCE":   ["pce inflation", "personal consumption"],
-    "KXBTC":   ["bitcoin price", "btc price"],
-    "KXETH":   ["ethereum price", "eth price"],
-    "INX":     ["s&p 500", "sp500"],
+    "KXFED":   ["interest rate", "rate cut", "rate hike", "fed ", "fomc",
+                "federal reserve", "basis point", "bps after"],
+    "KXCPI":   ["cpi", "consumer price", "inflation"],
+    "KXNFP":   ["nonfarm", "payroll", "jobs report", "unemployment"],
+    "KXGDP":   ["gdp", "gross domestic product"],
+    "KXPCE":   ["pce", "personal consumption"],
+    "KXBTC":   ["bitcoin", "btc"],
+    "KXETH":   ["ethereum", " eth ", "eth price", "eth/usd"],
+    "INX":     ["s&p 500", "s&p500", "sp500", "spx"],
     "NASDAQ":  ["nasdaq", "qqq"],
 }
 
@@ -92,7 +97,7 @@ class PolymarketFeed:
             markets = await self._fetch_active_markets()
             self._poly_markets = markets
             self._last_fetch   = time.time()
-            log.debug("Polymarket: fetched %d active markets", len(markets))
+            log.info("Polymarket: fetched %d active markets across all pages", len(markets))
         except Exception as exc:
             log.warning("Polymarket refresh failed: %s", exc)
 
@@ -107,17 +112,30 @@ class PolymarketFeed:
 
         Returns a list of new Signal objects with source="polymarket_arb".
         """
-        if not self._poly_markets or not kalshi_signals:
+        if not self._poly_markets:
+            log.debug("Polymarket divergence_signals: no cached markets (call refresh() first)")
+            return []
+        if not kalshi_signals:
             return []
 
         new_signals = []
         for sig in kalshi_signals:
             match = self._find_match(sig)
             if match is None:
+                log.debug("Polymarket: no match found for %s", sig.ticker)
                 continue
 
             kalshi_yes = sig.market_price          # 0.0–1.0
             poly_yes   = match.yes_price           # 0.0–1.0
+
+            # Skip degenerate/stale Polymarket prices — a liquid market never
+            # trades at exactly 0 or 1.  poly=0.00 almost always means the
+            # keyword match found the wrong or expired Polymarket question.
+            if poly_yes < 0.02 or poly_yes > 0.98:
+                log.debug("Polymarket: skipping %s — degenerate poly_price=%.3f (stale/wrong match)",
+                          sig.ticker, poly_yes)
+                continue
+
             diff       = poly_yes - kalshi_yes     # positive → Kalshi is cheap
 
             if abs(diff) < self._threshold:
@@ -176,6 +194,7 @@ class PolymarketFeed:
         series_prefix = sig.ticker.split("-")[0] if "-" in sig.ticker else sig.ticker
         keywords = _SERIES_KEYWORDS.get(series_prefix, [])
         if not keywords:
+            log.debug("Polymarket: no keyword mapping for series prefix %r", series_prefix)
             return None
 
         candidates = []
@@ -185,63 +204,125 @@ class PolymarketFeed:
                 candidates.append(pm)
 
         if not candidates:
+            log.debug("Polymarket: 0 candidates for %s (keywords=%s)", sig.ticker, keywords)
             return None
 
-        # Prefer highest-volume active market
-        return max(candidates, key=lambda m: m.volume_24h)
+        best = max(candidates, key=lambda m: m.volume_24h)
 
-    async def _fetch_active_markets(self) -> List[PolyMarket]:
+        # Require minimum 24h volume — low-volume matches are usually structural mismatches
+        # (e.g. Polymarket range markets matched against Kalshi threshold markets)
+        if best.volume_24h < 1000:
+            log.debug(
+                "Polymarket: rejecting match for %s — best vol24=%.0f < 1000 (likely wrong market)",
+                sig.ticker, best.volume_24h,
+            )
+            return None
+
+        log.info(
+            "Polymarket match: %-38s → %d candidates, best vol24=%.0f  %r",
+            sig.ticker[:38], len(candidates), best.volume_24h, best.question[:60],
+        )
+        self._debug_log_market_sample(candidates)
+        return best
+
+    def _debug_log_market_sample(self, markets: List["PolyMarket"]) -> None:
+        """Log the first 3 matching Polymarket markets at DEBUG level for troubleshooting."""
+        sample = sorted(markets, key=lambda m: -m.volume_24h)[:3]
+        for i, pm in enumerate(sample, 1):
+            log.debug(
+                "  Polymarket sample #%d: condition_id=%s  yes=%.3f  vol24=%.0f  %r",
+                i, pm.condition_id[:12], pm.yes_price, pm.volume_24h, pm.question[:70],
+            )
+
+    async def _fetch_active_markets(self) -> List["PolyMarket"]:
         """
         Fetch active binary markets from Polymarket Gamma API.
-        Returns parsed PolyMarket objects.
+
+        Paginates through all pages (_GAMMA_MAX_PAGES cap) so that markets
+        beyond the first 500 are included — relevant FOMC/Fed/crypto markets
+        are often found beyond offset 500.
+
+        NOTE: The Gamma API returns outcomePrices as a JSON-encoded string
+        (e.g. '["0.73", "0.27"]'), not a Python list.  We json.loads() it
+        before indexing to avoid the silent ValueError that caused 0 signals.
         """
         results: List[PolyMarket] = []
-        params = {
-            "active":   "true",
-            "closed":   "false",
-            "limit":    500,
+        base_params = {
+            "active": "true",
+            "closed": "false",
+            "limit":  _GAMMA_PAGE_SIZE,
         }
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.get(f"{GAMMA_URL}/markets", params=params)
-            if resp.status_code != 200:
-                log.warning("Polymarket Gamma API %d: %s", resp.status_code, resp.text[:200])
-                return []
-            data = resp.json()
 
-        # Gamma API returns a list directly or wrapped in {"markets": [...]}
-        if isinstance(data, list):
-            raw_markets = data
-        elif isinstance(data, dict):
-            raw_markets = data.get("markets", [])
-        else:
-            return []
+        async with httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT,
+            headers={"User-Agent": "EdgePulse/1.0"},
+        ) as client:
+            for page in range(_GAMMA_MAX_PAGES):
+                params = dict(base_params, offset=page * _GAMMA_PAGE_SIZE)
+                resp = await client.get(f"{GAMMA_URL}/markets", params=params)
+                if resp.status_code != 200:
+                    log.warning(
+                        "Polymarket Gamma API page %d returned %d: %s",
+                        page, resp.status_code, resp.text[:200],
+                    )
+                    break
 
-        for m in raw_markets:
-            try:
-                outcome_prices = m.get("outcomePrices", [])
-                outcomes       = m.get("outcomes", [])
+                data = resp.json()
 
-                if not outcome_prices or len(outcome_prices) < 2:
-                    continue
+                # Gamma API returns a list directly or wrapped in {"markets": [...]}
+                if isinstance(data, list):
+                    raw_markets = data
+                elif isinstance(data, dict):
+                    raw_markets = data.get("markets", [])
+                else:
+                    break
 
-                # Gamma returns outcomePrices as strings like ["0.73", "0.27"]
-                yes_price = float(outcome_prices[0])
-                no_price  = float(outcome_prices[1])
+                if not raw_markets:
+                    log.debug("Polymarket: page %d empty, stopping pagination", page)
+                    break
 
-                # Sanity check — binary market probabilities must sum to ~1.0
-                if abs(yes_price + no_price - 1.0) > 0.05:
-                    continue
+                page_parsed = 0
+                for m in raw_markets:
+                    try:
+                        raw_prices = m.get("outcomePrices", "[]")
 
-                results.append(PolyMarket(
-                    condition_id = m.get("conditionId", ""),
-                    question     = m.get("question", ""),
-                    yes_price    = yes_price,
-                    no_price     = no_price,
-                    volume_24h   = float(m.get("volume24hr", 0) or 0),
-                    active       = bool(m.get("active", True)),
-                ))
-            except (ValueError, TypeError, KeyError):
-                continue
+                        # outcomePrices arrives as a JSON-encoded string like
+                        # '["0.73", "0.27"]' — decode it before indexing.
+                        if isinstance(raw_prices, str):
+                            outcome_prices = json.loads(raw_prices)
+                        else:
+                            outcome_prices = list(raw_prices)
+
+                        if not outcome_prices or len(outcome_prices) < 2:
+                            continue
+
+                        yes_price = float(outcome_prices[0])
+                        no_price  = float(outcome_prices[1])
+
+                        # Sanity check — binary market probabilities must sum to ~1.0
+                        if abs(yes_price + no_price - 1.0) > 0.05:
+                            continue
+
+                        results.append(PolyMarket(
+                            condition_id = m.get("conditionId", ""),
+                            question     = m.get("question", ""),
+                            yes_price    = yes_price,
+                            no_price     = no_price,
+                            volume_24h   = float(m.get("volume24hr", 0) or 0),
+                            active       = bool(m.get("active", True)),
+                        ))
+                        page_parsed += 1
+                    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                        continue
+
+                log.debug(
+                    "Polymarket: page %d → %d raw / %d parsed (total so far: %d)",
+                    page, len(raw_markets), page_parsed, len(results),
+                )
+
+                # If fewer results than the page size, we've reached the last page
+                if len(raw_markets) < _GAMMA_PAGE_SIZE:
+                    break
 
         return results
 

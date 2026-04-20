@@ -339,6 +339,19 @@ class ResolutionDB:
             )
         """)
         self._conn.commit()
+        # Migrations: add columns that were added after initial deployment
+        for _col, _typedef in [
+            ("series",      "TEXT"),
+            ("entry_cents", "INTEGER"),
+            ("exit_cents",  "INTEGER"),
+        ]:
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE trade_outcomes ADD COLUMN {_col} {_typedef}"
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
         log.info("ResolutionDB initialised at %s", self._path)
 
     def get_outcome(self, ticker: str) -> Optional[str]:

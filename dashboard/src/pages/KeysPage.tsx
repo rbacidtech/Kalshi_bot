@@ -93,6 +93,11 @@ const EXCHANGES: ExchangeConfig[] = [
   },
 ]
 
+const EXCHANGE_ACCENT: Record<string, string> = {
+  kalshi:   '#a78bfa',
+  coinbase: '#60a5fa',
+}
+
 // ── ExchangeCard ──────────────────────────────────────────────────────────────
 
 interface ExchangeCardProps {
@@ -155,31 +160,37 @@ function ExchangeCard({ config, existingKey }: ExchangeCardProps) {
     storeMut.mutate()
   }
 
+  const accent = EXCHANGE_ACCENT[config.id] ?? '#60a5fa'
+
   return (
-    <div className="card relative">
+    <div
+      className="relative bg-surface-1 border border-border rounded-xl p-5"
+      style={{ borderTopColor: accent, borderTopWidth: 3, boxShadow: `0 4px 24px ${accent}14` }}
+    >
       <Toast toast={toast} />
 
       {/* Header ─────────────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-surface-2 border border-border flex items-center justify-center shrink-0">
-            <Key size={14} className="text-muted" />
+          <div
+            className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border"
+            style={{ background: `${accent}15`, borderColor: `${accent}40` }}
+          >
+            <Key size={15} style={{ color: accent }} />
           </div>
           <div>
             <h2 className="text-slate-100 font-semibold text-sm">{config.label}</h2>
             <div className="flex items-center gap-1.5 mt-0.5">
-              <span
-                className={[
-                  'inline-block w-1.5 h-1.5 rounded-full',
-                  connected ? 'bg-success' : 'bg-muted',
-                ].join(' ')}
-              />
-              <span className="text-xs text-muted">
+              <span className={`inline-block w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-400' : 'bg-slate-600'}`} />
+              <span className={`text-xs font-medium ${connected ? 'text-emerald-400' : 'text-slate-500'}`}>
                 {connected ? 'Connected' : 'Not connected'}
               </span>
             </div>
           </div>
         </div>
+        {connected && (
+          <span className="badge-success text-[10px]">Active</span>
+        )}
       </div>
 
       {/* Connected state ──────────────────────────────────────────────────── */}

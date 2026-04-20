@@ -1,19 +1,32 @@
-import { LogOut } from 'lucide-react'
+import { LogOut, Menu } from 'lucide-react'
 import { useAuth } from '../lib/auth'
 
 interface TopbarProps {
-  title?: string
+  title?:           string
+  sidebarOpen?:     boolean
+  onToggleSidebar?: () => void
 }
 
-export default function Topbar({ title = '' }: TopbarProps) {
+export default function Topbar({ title = '', sidebarOpen, onToggleSidebar }: TopbarProps) {
   const { user, logout } = useAuth()
 
   return (
-    <header className="sticky top-0 z-30 h-14 flex items-center justify-between px-6 bg-surface-0/80 backdrop-blur border-b border-border">
-      {/* Left: page title */}
-      <h1 className="font-semibold text-slate-100 text-base leading-none">
-        {title}
-      </h1>
+    <header className="sticky top-0 z-30 h-14 flex items-center justify-between px-4 bg-surface-0/80 backdrop-blur border-b border-border">
+      {/* Left: sidebar toggle + page title */}
+      <div className="flex items-center gap-3">
+        {!sidebarOpen && (
+          <button
+            onClick={onToggleSidebar}
+            className="text-slate-500 hover:text-slate-200 transition-colors p-1.5 rounded-lg hover:bg-surface-2"
+            title="Open sidebar"
+          >
+            <Menu size={18} />
+          </button>
+        )}
+        <h1 className="font-semibold text-slate-100 text-base leading-none">
+          {title}
+        </h1>
+      </div>
 
       {/* Right: live indicator + user + logout */}
       <div className="flex items-center gap-4">

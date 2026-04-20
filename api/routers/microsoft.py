@@ -72,7 +72,7 @@ router = APIRouter(prefix="/auth/microsoft", tags=["auth"])
 # ---------------------------------------------------------------------------
 
 _ALLOWED_EMAIL = "acidtechrb@outlook.com"
-_REDIRECT_URI = "https://edgepulse.us:8502/auth/microsoft/callback"
+_REDIRECT_URI = "https://edgepulse.us/auth/microsoft/callback"
 _TENANT = "consumers"
 _AUTHORIZE_URL = f"https://login.microsoftonline.com/{_TENANT}/oauth2/v2.0/authorize"
 _TOKEN_URL = f"https://login.microsoftonline.com/{_TENANT}/oauth2/v2.0/token"

@@ -23,6 +23,13 @@ const TIER_PILL: Record<string, string> = {
   institutional: 'bg-violet-500/10 text-violet-400 border border-violet-500/30',
 }
 
+const TIER_ACCENT: Record<string, string> = {
+  free:          '#94a3b8',
+  starter:       '#60a5fa',
+  pro:           '#34d399',
+  institutional: '#a78bfa',
+}
+
 const TIER_LABEL: Record<string, string> = {
   free:          'FREE',
   starter:       'STARTER',
@@ -186,9 +193,10 @@ function TierTable({ currentTier }: { currentTier: string }) {
                     className={[
                       'pb-3 px-3 text-center rounded-t-lg border-x border-t',
                       isActive
-                        ? 'bg-accent-blue/5 border-accent-blue/30 text-accent-blue'
+                        ? 'bg-surface-1 border-border text-slate-200'
                         : 'border-transparent text-muted',
                     ].join(' ')}
+                    style={isActive ? { borderTopColor: TIER_ACCENT[tier], borderTopWidth: 3 } : undefined}
                   >
                     <div className="flex flex-col items-center gap-1.5">
                       <span
@@ -238,9 +246,7 @@ function TierTable({ currentTier }: { currentTier: string }) {
                         className={[
                           'py-2.5 px-3 text-center text-xs border-x',
                           isLast ? 'rounded-b-lg border-b' : '',
-                          isActive
-                            ? 'bg-accent-blue/5 border-accent-blue/30'
-                            : 'border-transparent',
+                          isActive ? 'bg-surface-1 border-border' : 'border-transparent',
                         ].join(' ')}
                       >
                         <span
@@ -301,7 +307,14 @@ export default function SubscriptionPage() {
       </div>
 
       {/* ── Current plan card ──────────────────────────────────────────────── */}
-      <div className="card space-y-5">
+      <div
+        className="bg-surface-1 border border-border rounded-xl p-5 space-y-5"
+        style={{
+          borderTopColor: TIER_ACCENT[tier] ?? '#60a5fa',
+          borderTopWidth: 3,
+          boxShadow: `0 4px 24px ${TIER_ACCENT[tier] ?? '#60a5fa'}18`,
+        }}
+      >
         {/* Tier pill */}
         <div className="flex items-center gap-3">
           {isLoading ? (

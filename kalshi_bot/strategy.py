@@ -340,19 +340,31 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
     Cost = yes_ask(lower) + no_ask(higher) = yes_ask(lower) + (1 - yes_bid(higher))
     For arb to exist: yes_ask(lower) + (1 - yes_bid(higher)) < 1.0
     i.e.: yes_ask(lower) < yes_bid(higher)
+
+    Enhancement 1 — CDF rank-ordering:
+    Violations are ranked by edge_cents = yes_bid(higher) - yes_ask(lower), so the
+    highest-EV arb appears first in the published signal stream.
+
+    Enhancement 2 — Butterfly spread detection:
+    For three consecutive equal-spaced strikes A < B < C a valid CDF must be convex:
+    P(A) + P(C) >= 2*P(B). A violation signals that the middle strike is overpriced
+    relative to the wings and a 3-leg spread can capture the mispricing.
     """
-    signals = []
-    groups  = _group_fomc_by_meeting(markets)
+    # ── Collect per-meeting candidate violations ───────────────────────────────
+    mono_candidates: list[tuple[float, Signal]] = []   # (edge_cents, signal)
+    butterfly_signals: list[Signal] = []
+
+    groups = _group_fomc_by_meeting(markets)
 
     for event, group in groups.items():
-        # Sort by strike ascending
+        # Build (market, strike, mid_price) list filtered to priced markets only
         priced = [(m, _extract_strike(m["ticker"]), _market_mid(m)) for m in group]
         priced = [(m, s, p) for m, s, p in priced if s is not None and p > 0.01]
         if len(priced) < 2:
             continue
         priced.sort(key=lambda x: x[1])  # ascending strike
 
-        # Check monotonicity: P(rate > lower_strike) >= P(rate > higher_strike)
+        # ── Enhancement 1: monotonicity check with edge-ranked collection ─────
         for i in range(len(priced) - 1):
             m_low, strike_low, price_low   = priced[i]
             m_high, strike_high, price_high = priced[i + 1]
@@ -369,8 +381,9 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
                 net_profit = arb_profit - fee_cost
 
                 if net_profit >= MIN_EDGE_GROSS * 0.5:  # lower bar for pure arb
-                    contracts = min(max_contracts, max(1, int(net_profit * 50)))
-                    signals.append(Signal(
+                    contracts  = min(max_contracts, max(1, int(net_profit * 50)))
+                    edge_cents = yes_bid_high - yes_ask_low  # dollars earned per $1 risk
+                    sig = Signal(
                         ticker            = m_low["ticker"],
                         title             = f"ARB: Buy {m_low['ticker']} YES + Buy {m_high['ticker']} NO",
                         category          = "arb",
@@ -384,13 +397,91 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
                         model_source      = "monotonicity_arb",
                         arb_partner       = m_high["ticker"],
                         meeting           = event,
-                    ))
+                    )
+                    mono_candidates.append((edge_cents, sig))
                     log.info(
-                        "FOMC ARB: Buy %s YES@%.2f + Buy %s NO@%.2f → net %.2f¢",
+                        "FOMC ARB: Buy %s YES@%.2f + Buy %s NO@%.2f → net %.2f¢ edge=%.2f¢",
                         m_low["ticker"], yes_ask_low,
                         m_high["ticker"], 1 - yes_bid_high,
-                        net_profit * 100
+                        net_profit * 100, edge_cents * 100,
                     )
+
+        # ── Enhancement 2: butterfly spread convexity check ───────────────────
+        # Requires at least 3 equally-spaced strikes
+        if len(priced) < 3:
+            continue
+
+        BUTTERFLY_THRESHOLD = 0.04  # minimum violation magnitude to generate a signal
+
+        for i in range(len(priced) - 2):
+            m_a, strike_a, p_a = priced[i]
+            m_b, strike_b, p_b = priced[i + 1]
+            m_c, strike_c, p_c = priced[i + 2]
+
+            # Only check when strikes are equally spaced (within floating-point tolerance)
+            gap_lo = round(strike_b - strike_a, 4)
+            gap_hi = round(strike_c - strike_b, 4)
+            if abs(gap_lo - gap_hi) > 1e-6:
+                continue
+
+            # Convexity: P(A) + P(C) >= 2*P(B)
+            convexity_slack = p_a + p_c - 2 * p_b
+            if convexity_slack >= -BUTTERFLY_THRESHOLD:
+                continue  # no violation
+
+            # Butterfly midpoint for each leg
+            bf_mid_b = (p_a + p_c) / 2.0  # fair value of B implied by wings
+
+            # Deviation of each leg from its butterfly-implied fair value
+            # A and C legs are the wings — their implied fair values from butterfly
+            # symmetry around B are: fair_A = p_b + (p_b - p_c)/... but the
+            # most tractable approach is to flag the leg that deviates most from
+            # the smoothed butterfly midpoint.
+            # For a 3-point butterfly: fair midpoint of B = (P(A)+P(C))/2
+            dev_a = abs(p_a - bf_mid_b)  # wing A deviation from B-implied mid
+            dev_b = abs(p_b - bf_mid_b)  # center deviation (always the inflated leg)
+            dev_c = abs(p_c - bf_mid_b)  # wing C deviation from B-implied mid
+
+            # The most mispriced leg is the one whose price deviates furthest
+            # from the butterfly midpoint
+            legs = [(dev_a, m_a, strike_a, p_a),
+                    (dev_b, m_b, strike_b, p_b),
+                    (dev_c, m_c, strike_c, p_c)]
+            worst_dev, worst_m, worst_strike, worst_price = max(legs, key=lambda x: x[0])
+
+            contracts = min(max_contracts, max(1, int(worst_dev * 50)))
+            sig = Signal(
+                ticker            = worst_m["ticker"],
+                title             = (
+                    f"BUTTERFLY: {m_a['ticker']}/{m_b['ticker']}/{m_c['ticker']} "
+                    f"leg {worst_m['ticker']} off by {worst_dev * 100:.1f}¢"
+                ),
+                category          = "fomc",
+                side              = "yes",
+                fair_value        = bf_mid_b,
+                market_price      = worst_price,
+                edge              = worst_dev,
+                fee_adjusted_edge = worst_dev * (1 - KALSHI_FEE_RATE * 2),
+                contracts         = contracts,
+                confidence        = 0.70,
+                model_source      = "fomc_butterfly_arb",
+                meeting           = event,
+            )
+            butterfly_signals.append(sig)
+            log.info(
+                "FOMC BUTTERFLY: %s/%s/%s P=%.2f/%.2f/%.2f slack=%.2f¢ worst=%s dev=%.2f¢",
+                m_a["ticker"], m_b["ticker"], m_c["ticker"],
+                p_a, p_b, p_c,
+                convexity_slack * 100,
+                worst_m["ticker"], worst_dev * 100,
+            )
+
+    # ── Rank monotonicity violations by edge descending (Enhancement 1) ───────
+    mono_candidates.sort(key=lambda x: x[0], reverse=True)
+    signals = [sig for _, sig in mono_candidates]
+
+    # Append butterfly signals after ranked monotonicity arbs
+    signals.extend(butterfly_signals)
 
     return signals
 
@@ -801,168 +892,328 @@ def scan_crypto_price_markets(
     return signals
 
 
-# ── Weather Model (NOAA NWS) ─────────────────────────────────────────────────
+# ── Weather Model (Open-Meteo primary, NOAA NWS secondary) ───────────────────
+#
+# Open-Meteo is the primary source: free, no auth, JSON daily forecasts with
+# calibrated temperature_2m_max/min and precipitation_sum per target date.
+# NOAA NWS daily forecast is the secondary cross-check.
+# Sigma scales with forecast horizon so uncertainty is properly modelled.
 
-# Known Kalshi weather series and their NOAA grid mapping
+import math as _math
+from datetime import date as _date
+
 WEATHER_SERIES = {
-    "KXHIGHNY": {"wfo": "OKX", "x": 33, "y": 37, "type": "high_temp"},
-    "KXLOWNY":  {"wfo": "OKX", "x": 33, "y": 37, "type": "low_temp"},
-    "KXHIGHLA": {"wfo": "LOX", "x": 148, "y": 48, "type": "high_temp"},
-    "KXHIGHCHI":{"wfo": "LOT", "x": 71, "y": 56, "type": "high_temp"},
-    "KXHIGHDC": {"wfo": "LWX", "x": 98, "y": 69, "type": "high_temp"},
-    "KXRAINY":  {"wfo": "OKX", "x": 33, "y": 37, "type": "precip"},
+    "KXHIGHNY":  {"lat": 40.7128, "lon": -74.0060,  "tz": "America/New_York",    "wfo": "OKX", "x": 33,  "y": 37, "type": "high_temp"},
+    "KXLOWNY":   {"lat": 40.7128, "lon": -74.0060,  "tz": "America/New_York",    "wfo": "OKX", "x": 33,  "y": 37, "type": "low_temp"},
+    "KXHIGHLA":  {"lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles", "wfo": "LOX", "x": 148, "y": 48, "type": "high_temp"},
+    "KXHIGHCHI": {"lat": 41.8781, "lon": -87.6298,  "tz": "America/Chicago",     "wfo": "LOT", "x": 71,  "y": 56, "type": "high_temp"},
+    "KXHIGHDC":  {"lat": 38.9072, "lon": -77.0369,  "tz": "America/New_York",    "wfo": "LWX", "x": 98,  "y": 69, "type": "high_temp"},
+    "KXRAINY":   {"lat": 40.7128, "lon": -74.0060,  "tz": "America/New_York",    "wfo": "OKX", "x": 33,  "y": 37, "type": "precip"},
 }
+
+_MONTH_MAP = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+
+
+def _parse_ticker_date(ticker: str) -> Optional[_date]:
+    """Parse target date from a Kalshi weather ticker like KXHIGHNY-26APR19."""
+    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(?:-|$)", ticker)
+    if not m:
+        return None
+    mo = _MONTH_MAP.get(m.group(2))
+    if not mo:
+        return None
+    try:
+        return _date(2000 + int(m.group(1)), mo, int(m.group(3)))
+    except ValueError:
+        return None
+
+
+async def fetch_open_meteo(
+    lat: float, lon: float, tz: str, target: _date
+) -> Optional[dict]:
+    """
+    Fetch Open-Meteo daily forecast for a specific date.
+    Returns {"high", "low", "precip", "precip_pct", "days_ahead"} or None.
+    """
+    try:
+        http = _get_http_client()
+        params = {
+            "latitude":    lat,
+            "longitude":   lon,
+            "daily":       "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max",
+            "temperature_unit": "fahrenheit",
+            "precipitation_unit": "inch",
+            "timezone":    tz,
+            "forecast_days": 8,
+        }
+        resp = await http.get("https://api.open-meteo.com/v1/forecast", params=params)
+        if resp.status_code != 200:
+            log.warning("Open-Meteo %d for %.4f,%.4f", resp.status_code, lat, lon)
+            return None
+        daily = resp.json().get("daily", {})
+        dates = daily.get("time", [])
+        target_str = target.isoformat()
+        if target_str not in dates:
+            return None
+        idx = dates.index(target_str)
+        def _v(key):
+            vals = daily.get(key, [])
+            return vals[idx] if idx < len(vals) else None
+        return {
+            "high":       _v("temperature_2m_max"),
+            "low":        _v("temperature_2m_min"),
+            "precip":     _v("precipitation_sum"),
+            "precip_pct": _v("precipitation_probability_max"),
+            "days_ahead": (_date.today() - target).days * -1,
+            "source":     "open_meteo",
+        }
+    except Exception as exc:
+        log.warning("Open-Meteo fetch failed for %.4f,%.4f: %s", lat, lon, exc)
+        return None
 
 
 async def fetch_noaa_forecast(wfo: str, x: int, y: int) -> Optional[dict]:
-    """Fetch NOAA NWS hourly forecast for a grid point."""
+    """
+    Fetch NOAA NWS daily (non-hourly) forecast.
+    Returns raw NWS JSON or None.
+    """
     try:
         http = _get_http_client()
-        url  = f"https://api.weather.gov/gridpoints/{wfo}/{x},{y}/forecast/hourly"
+        url  = f"https://api.weather.gov/gridpoints/{wfo}/{x},{y}/forecast"
         resp = await http.get(url, headers={"User-Agent": "KalshiBot/1.0 (prediction-market-research)"})
         if resp.status_code == 200:
             return resp.json()
+        log.warning("NOAA daily %d for %s/%d,%d", resp.status_code, wfo, x, y)
     except Exception as exc:
-        log.debug("NOAA fetch failed for %s/%d,%d: %s", wfo, x, y, exc)
+        log.warning("NOAA daily fetch failed for %s/%d,%d: %s", wfo, x, y, exc)
     return None
 
 
-def _parse_noaa_temps(forecast_data: dict, hours_ahead: int = 24) -> Optional[dict]:
-    """Extract high/low temperature predictions from NOAA forecast."""
+def _parse_nws_daily(forecast_data: dict, target: _date) -> Optional[dict]:
+    """
+    Extract high/low temperature and precip prob for a specific date
+    from NWS daily forecast periods.
+    """
     try:
-        periods = forecast_data["properties"]["periods"][:hours_ahead]
-        temps   = [p["temperature"] for p in periods if p.get("temperature")]
-        if not temps:
-            return None
-        return {
-            "high": max(temps),
-            "low":  min(temps),
-            "avg":  sum(temps) / len(temps),
-            "count": len(temps),
-        }
-    except Exception:
-        return None
-
-
-def _parse_noaa_precip(forecast_data: dict, hours_ahead: int = 24) -> Optional[float]:
-    """Extract precipitation probability from NOAA forecast."""
-    try:
-        periods = forecast_data["properties"]["periods"][:hours_ahead]
-        probs   = []
+        periods = forecast_data["properties"]["periods"]
+        target_str = target.isoformat()
+        high = low = precip_pct = None
         for p in periods:
-            pchance = p.get("probabilityOfPrecipitation", {})
-            if pchance and pchance.get("value") is not None:
-                probs.append(pchance["value"] / 100.0)
-        return max(probs) if probs else None
+            if target_str not in p.get("startTime", ""):
+                continue
+            temp = p.get("temperature")
+            if temp is None:
+                continue
+            if p.get("isDaytime", True):
+                high = float(temp)
+                pp = p.get("probabilityOfPrecipitation", {})
+                if pp and pp.get("value") is not None:
+                    precip_pct = pp["value"]
+            else:
+                low = float(temp)
+        if high is None and low is None:
+            return None
+        return {"high": high, "low": low, "precip_pct": precip_pct, "source": "noaa_nws"}
     except Exception:
         return None
+
+
+def _temp_prob_above(forecast_temp: float, threshold: float, days_ahead: int) -> float:
+    """
+    P(actual daily high/low > threshold) using calibrated forecast uncertainty.
+    Sigma grows with forecast horizon based on NWS MAE verification studies:
+      Day 0-1: 2.5°F,  Day 2: 3.5°F,  Day 3: 4.5°F,  Day 4+: 5.5°F
+    """
+    sigma = max(2.5, min(5.5, 2.5 + max(0, days_ahead - 1) * 1.0))
+    z     = (threshold - forecast_temp) / sigma
+    return 0.5 * (1.0 - _math.erf(z / _math.sqrt(2)))
+
+
+def _precip_prob_above(forecast_sum: Optional[float], precip_pct: Optional[float],
+                       threshold: float) -> Optional[float]:
+    """
+    P(precipitation > threshold inches).
+    Uses a two-stage model: P(any rain) from precip_pct, then
+    P(>threshold | rain) from an exponential distribution around forecast_sum.
+    """
+    if precip_pct is None:
+        return None
+    p_any = min(0.99, max(0.01, precip_pct / 100.0))
+    if threshold <= 0.01:
+        return p_any
+    if forecast_sum and forecast_sum > 0.005:
+        mean_if_rain = forecast_sum / p_any
+        p_above = p_any * _math.exp(-threshold / mean_if_rain)
+    else:
+        p_above = p_any * _math.exp(-threshold * 6.0)
+    return max(0.01, min(0.99, p_above))
 
 
 async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[Signal]:
-    """Score weather markets using NOAA NWS forecasts."""
+    """Score weather markets using Open-Meteo (primary) and NOAA NWS (secondary)."""
     signals = []
 
-    # Filter to weather markets
     weather_markets = [
         m for m in markets
         if any(m.get("ticker", "").startswith(s) for s in WEATHER_SERIES)
     ]
-
     if not weather_markets:
         return signals
 
-    # Group by series
-    series_forecasts: dict[str, Optional[dict]] = {}
-    for series, config in WEATHER_SERIES.items():
-        relevant = [m for m in weather_markets if m.get("ticker", "").startswith(series)]
-        if not relevant:
+    log.debug("Weather scanner: %d markets to evaluate", len(weather_markets))
+
+    # Fetch forecasts per series — one Open-Meteo call covers all dates per city
+    # (we fetch per ticker date so we can target the exact date)
+    for market in weather_markets:
+        ticker = market.get("ticker", "")
+        title  = market.get("title", "")
+        price  = _market_mid(market)
+        vol    = _market_volume(market)
+
+        if price < 0.01 or price >= 0.99 or vol < 20:
+            log.debug("Weather: skipping %s  price=%.4f  vol=%.0f", ticker, price, vol)
             continue
-        forecast = await fetch_noaa_forecast(config["wfo"], config["x"], config["y"])
-        series_forecasts[series] = (forecast, config)
 
-    for series, result in series_forecasts.items():
-        if result is None:
+        # Identify which series this market belongs to
+        series = next((s for s in WEATHER_SERIES if ticker.startswith(s)), None)
+        if series is None:
             continue
-        forecast, config = result
-        relevant = [m for m in weather_markets if m.get("ticker", "").startswith(series)]
+        cfg = WEATHER_SERIES[series]
 
-        for market in relevant:
-            price = _market_mid(market)
-            vol   = _market_volume(market)
-            if price <= 0.01 or price >= 0.99 or vol < 50:
-                continue
+        # Parse the target date from the ticker
+        target = _parse_ticker_date(ticker)
+        if target is None:
+            log.debug("Weather: cannot parse date from ticker %s", ticker)
+            continue
+        today = _date.today()
+        if target < today:
+            continue   # already resolved
+        days_ahead = (target - today).days
+        if days_ahead == 0:
+            continue   # same-day markets trigger immediate pre_expiry (close within 24h)
 
-            ticker = market.get("ticker", "")
-            title  = market.get("title", "")
-            fair_value = None
+        # ── Fetch forecasts ───────────────────────────────────────────────────
+        om   = await fetch_open_meteo(cfg["lat"], cfg["lon"], cfg["tz"], target)
+        nws_raw = await fetch_noaa_forecast(cfg["wfo"], cfg["x"], cfg["y"])
+        nws  = _parse_nws_daily(nws_raw, target) if nws_raw else None
 
-            if config["type"] in ("high_temp", "low_temp"):
-                temps = _parse_noaa_temps(forecast)
-                if temps is None:
+        # Require at least one source
+        if om is None and nws is None:
+            log.warning("Weather: no forecast data for %s (target=%s)", ticker, target)
+            continue
+
+        fair_value: Optional[float] = None
+        source_tag = []
+
+        if cfg["type"] in ("high_temp", "low_temp"):
+            # Prefer floor_strike from market object; fall back to title regex
+            floor_strike_raw = market.get("floor_strike")
+            if floor_strike_raw is not None:
+                threshold = float(floor_strike_raw)
+            else:
+                tm = re.search(r"(\d+)\s*[°º Ff]+", title)
+                if not tm:
+                    log.debug("Weather: no threshold in title %r", title[:60])
                     continue
+                threshold = float(tm.group(1))
 
-                # Extract threshold from title (e.g. "above 75°F")
-                thresh_match = re.search(r"(\d+)\s*°?F", title)
-                if not thresh_match:
-                    continue
-                threshold = float(thresh_match.group(1))
+            # strike_type: "greater" → YES if temp > threshold; "less" → YES if temp < threshold
+            strike_type = market.get("strike_type", "greater")
 
-                if config["type"] == "high_temp":
-                    # P(high > threshold) using normal distribution around forecast
-                    import math
-                    mean = temps["high"]
-                    std  = 4.0  # ~4°F uncertainty for next-day forecast
-                    z = (threshold - mean) / std
-                    fair_value = 0.5 * (1 - math.erf(z / math.sqrt(2)))
+            # Gather temperature estimates from all available sources
+            temp_estimates = []
+            if om:
+                t = om["high"] if cfg["type"] == "high_temp" else om["low"]
+                if t is not None:
+                    temp_estimates.append(t)
+                    source_tag.append("open_meteo")
+            if nws:
+                t = nws.get("high") if cfg["type"] == "high_temp" else nws.get("low")
+                if t is not None:
+                    temp_estimates.append(t)
+                    source_tag.append("noaa_nws")
 
-            elif config["type"] == "precip":
-                rain_prob = _parse_noaa_precip(forecast)
-                if rain_prob is None:
-                    continue
-                # Kalshi asks "will it rain > X inches" — NOAA gives probability of any precip
-                # Adjust down for specific threshold
-                thresh_match = re.search(r"(\d+\.?\d*)\s*inch", title, re.IGNORECASE)
-                if thresh_match:
-                    threshold = float(thresh_match.group(1))
-                    # Simple adjustment: more rain needed = lower probability
-                    fair_value = rain_prob * max(0.1, 1.0 - threshold * 0.3)
-                else:
-                    fair_value = rain_prob
-
-            if fair_value is None:
+            if not temp_estimates:
                 continue
 
-            fair_value = max(0.02, min(0.98, fair_value))
-            diff = fair_value - price
-            if abs(diff) < MIN_EDGE_GROSS:
+            # Blend estimates (simple mean); use spread as additional uncertainty
+            mean_temp = sum(temp_estimates) / len(temp_estimates)
+            spread    = max(temp_estimates) - min(temp_estimates) if len(temp_estimates) > 1 else 0.0
+
+            # Effective sigma: calibrated horizon + source disagreement
+            base_sigma    = max(2.5, min(5.5, 2.5 + max(0, days_ahead - 1) * 1.0))
+            effective_sig = _math.sqrt(base_sigma ** 2 + (spread / 2) ** 2)
+            z             = (threshold - mean_temp) / effective_sig
+            p_above       = 0.5 * (1.0 - _math.erf(z / _math.sqrt(2)))
+            fair_value    = p_above if strike_type != "less" else (1.0 - p_above)
+
+        elif cfg["type"] == "precip":
+            tm = re.search(r"(\d+\.?\d*)\s*inch", title, re.IGNORECASE)
+            threshold = float(tm.group(1)) if tm else 0.10
+
+            # Gather precip data from available sources
+            f_sum     = om["precip"]     if om else None
+            f_pct_om  = om["precip_pct"] if om else None
+            f_pct_nws = nws.get("precip_pct") if nws else None
+            f_pct     = f_pct_om if f_pct_om is not None else f_pct_nws
+
+            if f_pct is None:
                 continue
 
-            side     = "yes" if diff > 0 else "no"
-            edge     = abs(diff)
-            fee_edge = _fee_adjusted_edge(
-                fair_value if side == "yes" else (1 - fair_value),
-                price if side == "yes" else (1 - price),
-                "yes"
-            )
-            if fee_edge < MIN_EDGE_GROSS * 0.5:
+            source_tag.append("open_meteo" if f_pct_om is not None else "noaa_nws")
+            fv = _precip_prob_above(f_sum, f_pct, threshold)
+            if fv is None:
                 continue
+            fair_value = fv
 
-            contracts = min(max_contracts, max(1, int(edge * 60)))
-            signals.append(Signal(
-                ticker            = ticker,
-                title             = title,
-                category          = "weather",
-                side              = side,
-                fair_value        = fair_value if side == "yes" else (1 - fair_value),
-                market_price      = price,
-                edge              = round(edge, 4),
-                fee_adjusted_edge = round(fee_edge, 4),
-                contracts         = contracts,
-                confidence        = 0.68,
-                model_source      = "noaa_nws",
-            ))
+        if fair_value is None:
+            continue
+
+        fair_value = max(0.02, min(0.98, fair_value))
+        diff = fair_value - price
+        if abs(diff) < MIN_EDGE_GROSS:
+            continue
+
+        side     = "yes" if diff > 0 else "no"
+        edge     = abs(diff)
+        fee_edge = _fee_adjusted_edge(
+            fair_value if side == "yes" else (1 - fair_value),
+            price      if side == "yes" else (1 - price),
+            "yes"
+        )
+        if fee_edge < MIN_EDGE_GROSS * 0.5:
+            continue
+
+        # Confidence: higher for near-term + multi-source agreement
+        multi_source = len(source_tag) > 1
+        conf = 0.72 if (days_ahead <= 1 and multi_source) else \
+               0.68 if (days_ahead <= 1 or multi_source) else \
+               0.62
+
+        contracts = min(max_contracts, max(1, int(edge * 60)))
+        signals.append(Signal(
+            ticker            = ticker,
+            title             = title,
+            category          = "weather",
+            side              = side,
+            fair_value        = fair_value if side == "yes" else (1 - fair_value),
+            market_price      = price,
+            edge              = round(edge, 4),
+            fee_adjusted_edge = round(fee_edge, 4),
+            contracts         = contracts,
+            confidence        = conf,
+            model_source      = "+".join(sorted(set(source_tag))) or "weather",
+        ))
+        log.info(
+            "Weather signal: %s  %s  fv=%.2f  market=%.2f  edge=%.2f  "
+            "conf=%.2f  src=%s  days=%d",
+            ticker, side, fair_value, price, edge, conf,
+            "+".join(sorted(set(source_tag))), days_ahead,
+        )
 
     signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+    log.info("Weather scanner: %d signals generated", len(signals))
     return signals
 
 
@@ -1097,6 +1348,48 @@ async def fetch_treasury_2y_yield(fred_api_key: str) -> Optional[float]:
     return None
 
 
+def _compute_surprise_z(vals: list[float]) -> Optional[float]:
+    """
+    Return a normalised Z-score surprise for the most recent observation.
+
+    surprise = (most_recent - mean_last_6) / std_last_6
+
+    Returns None when there are fewer than 3 observations (not enough history
+    for a meaningful standard deviation).  ``vals`` is assumed to be sorted
+    newest-first (i.e. ``vals[0]`` is the most recent observation).
+    """
+    if len(vals) < 3:
+        return None
+    window = vals[1:7]          # six observations *preceding* the most recent
+    if len(window) < 2:
+        return None
+    mean6 = sum(window) / len(window)
+    var6  = sum((v - mean6) ** 2 for v in window) / len(window)
+    std6  = _math.sqrt(var6)
+    if std6 == 0.0:
+        return None
+    return (vals[0] - mean6) / std6
+
+
+def _compute_momentum(vals: list[float]) -> Optional[int]:
+    """
+    Return +1 (bullish), -1 (bearish), or 0 (mixed) based on whether the last
+    three readings are all above or all below the 12-month mean.
+
+    ``vals`` is sorted newest-first.  Returns None when there is insufficient
+    data.
+    """
+    if len(vals) < 4:           # need ≥3 recent + enough for a mean
+        return None
+    recent   = vals[:3]
+    mean12   = sum(vals[:12]) / min(len(vals), 12)
+    if all(v > mean12 for v in recent):
+        return +1
+    if all(v < mean12 for v in recent):
+        return -1
+    return 0
+
+
 async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_contracts: int) -> list[Signal]:
     """Score economic threshold markets using FRED data."""
     if not fred_api_key:
@@ -1120,16 +1413,52 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
     if not econ_markets:
         return signals
 
-    # Fetch FRED data concurrently
+    # Fetch FRED data concurrently.
+    # Use limit=14 so we have ≥12 months of history for surprise and momentum
+    # calculations.  ADP (ADPWNUSNERSA) is fetched alongside but is not a
+    # standalone Kalshi series — it is used only as a leading indicator for
+    # PAYEMS (nonfarm payrolls) markets.
     sids    = list(ECONOMIC_SERIES.keys())
     fetched = await asyncio.gather(
-        *[fetch_fred_series(sid, fred_api_key) for sid in sids],
+        *[fetch_fred_series(sid, fred_api_key, limit=14) for sid in sids],
+        fetch_fred_series("ADPWNUSNERSA", fred_api_key, limit=14),
         return_exceptions=True,
     )
+    # Last element of fetched is ADP
+    adp_obs: Optional[list] = None
+    _adp_raw = fetched[-1]
+    if not isinstance(_adp_raw, Exception) and _adp_raw:
+        adp_obs = _adp_raw
     results = {
         sid: (None if isinstance(val, Exception) else val)
-        for sid, val in zip(sids, fetched)
+        for sid, val in zip(sids, fetched[:-1])
     }
+
+    # Pre-compute ADP signal direction for use inside the PAYEMS match block.
+    # adp_signal_direction: +1 if latest ADP > 12-month mean, -1 if below, 0 otherwise.
+    adp_signal_direction = 0
+    adp_val_logged: Optional[float] = None
+    adp_mean_logged: Optional[float] = None
+    if adp_obs:
+        adp_vals: list[float] = []
+        for _o in adp_obs:
+            try:
+                adp_vals.append(float(_o["value"]))
+            except (ValueError, KeyError):
+                pass
+        if len(adp_vals) >= 2:
+            adp_val_logged  = adp_vals[0]
+            adp_mean_logged = sum(adp_vals[:12]) / min(len(adp_vals), 12)
+            if adp_val_logged > adp_mean_logged:
+                adp_signal_direction = +1
+            elif adp_val_logged < adp_mean_logged:
+                adp_signal_direction = -1
+            log.info(
+                "ADP leading indicator: %s vs mean %s → direction=%+d",
+                f"{adp_val_logged:,.0f}",
+                f"{adp_mean_logged:,.0f}",
+                adp_signal_direction,
+            )
 
     # Sigmoid steepness per series.  One "scale unit" corresponds to the
     # typical noise level for that indicator — values beyond ±2 scales from
@@ -1147,9 +1476,11 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
         if price <= 0.01 or price >= 0.99:
             continue
 
-        fair_value  = None
-        confidence  = 0.55
-        matched_sid = "fred"
+        fair_value      = None
+        confidence      = 0.55
+        matched_sid     = "fred"
+        _surprise_z     = None   # set inside loop on successful match
+        _momentum_boost = 0.0   # set inside loop on successful match
 
         for sid, config in ECONOMIC_SERIES.items():
             if not any(kw in title for kw in config["keywords"]):
@@ -1159,8 +1490,10 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
                 continue
 
             # ── Multi-point weighted trend (exponential decay, up to 6 pts) ──
+            # Collect up to 14 obs (we now fetch 14); the trend model still
+            # uses only the first 6, but surprise/momentum use the full window.
             vals: list[float] = []
-            for o in obs[:6]:
+            for o in obs[:14]:
                 try:
                     vals.append(float(o["value"]))
                 except (ValueError, KeyError):
@@ -1211,8 +1544,74 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
             dist_sigma = abs(projected - threshold) / scale
             confidence = round(min(0.85, 0.50 + 0.15 * min(dist_sigma, 2.0)), 3)
 
-            fair_value  = fair_yes
-            matched_sid = sid
+            # ── Economic surprise (Z-score) ───────────────────────────────────
+            # Measures how far the latest reading is from its trailing 6-month
+            # mean, normalised by the trailing 6-month standard deviation.
+            # A large surprise (|z| > 1.5) means the series is running well
+            # above or below trend — boost confidence accordingly.
+            surprise_z  = _compute_surprise_z(vals)
+            conf_boost  = 0.0
+            series_name = config["name"]
+            if surprise_z is not None:
+                abs_z = abs(surprise_z)
+                if abs_z > 2.5:
+                    conf_boost = 0.10
+                    log.info(
+                        "%s surprise_z=%+.2f (>2.5σ) → conf boost +0.10",
+                        series_name, surprise_z,
+                    )
+                elif abs_z > 1.5:
+                    conf_boost = 0.05
+                    log.info(
+                        "%s surprise_z=%+.2f (>1.5σ) → conf boost +0.05",
+                        series_name, surprise_z,
+                    )
+            confidence = round(min(0.92, confidence + conf_boost), 3)
+
+            # ── Economic momentum signal ──────────────────────────────────────
+            # If the last 3 readings are all above (or all below) the 12-month
+            # mean, that persistent trend boosts the directional edge by 0.03.
+            momentum       = _compute_momentum(vals)
+            momentum_boost = 0.0
+            if momentum == +1:
+                log.info("%s: bullish momentum (last 3 readings all above 12m mean) → +0.03 edge", series_name)
+                momentum_boost = 0.03
+            elif momentum == -1:
+                log.info("%s: bearish momentum (last 3 readings all below 12m mean) → +0.03 edge", series_name)
+                momentum_boost = 0.03
+
+            # ── ADP leading indicator (PAYEMS markets only) ───────────────────
+            # ADP private payrolls are released ~2 days before NFP.  When ADP
+            # confirms the signal direction, it lifts confidence; disagreement
+            # reduces it.
+            adp_confidence_mult = 1.0
+            if sid == "PAYEMS" and adp_signal_direction != 0 and adp_val_logged is not None:
+                # Determine which direction the model is pointing (yes → above threshold)
+                model_direction = +1 if fair_yes >= 0.5 else -1
+                if adp_signal_direction == model_direction:
+                    adp_confidence_mult = 1.10
+                    log.info(
+                        "ADP leading indicator: %s vs mean %s → direction=%+d  "
+                        "(agrees with model → confidence ×1.10)",
+                        f"{adp_val_logged:,.0f}",
+                        f"{adp_mean_logged:,.0f}",
+                        adp_signal_direction,
+                    )
+                else:
+                    adp_confidence_mult = 0.85
+                    log.info(
+                        "ADP leading indicator: %s vs mean %s → direction=%+d  "
+                        "(disagrees with model → confidence ×0.85)",
+                        f"{adp_val_logged:,.0f}",
+                        f"{adp_mean_logged:,.0f}",
+                        adp_signal_direction,
+                    )
+            confidence = round(min(0.92, confidence * adp_confidence_mult), 3)
+
+            fair_value     = fair_yes
+            matched_sid    = sid
+            _surprise_z    = surprise_z        # carry out of loop for model_source tag
+            _momentum_boost = momentum_boost   # carry out of loop for edge adjustment
             break   # matched first relevant series
 
         if fair_value is None:
@@ -1224,7 +1623,7 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
             continue
 
         side     = "yes" if diff > 0 else "no"
-        edge     = abs(diff)
+        edge     = round(abs(diff) + _momentum_boost, 4)
         fee_edge = _fee_adjusted_edge(
             fair_value if side == "yes" else (1 - fair_value),
             price if side == "yes" else (1 - price),
@@ -1232,6 +1631,10 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
         )
         if fee_edge < MIN_EDGE_GROSS * 0.5:
             continue
+
+        # Build a model_source tag that surfaces key signal components.
+        _z_tag = f"_z{_surprise_z:+.1f}" if _surprise_z is not None else ""
+        _m_tag = f"_mom{'+' if _momentum_boost > 0 else '0'}" if _momentum_boost else ""
 
         contracts = min(max_contracts, max(1, int(edge * 50)))
         signals.append(Signal(
@@ -1241,11 +1644,11 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
             side              = side,
             fair_value        = fair_value if side == "yes" else (1 - fair_value),
             market_price      = price,
-            edge              = round(edge, 4),
+            edge              = edge,
             fee_adjusted_edge = round(fee_edge, 4),
             contracts         = contracts,
             confidence        = confidence,
-            model_source      = f"fred_{matched_sid}_sigmoid",
+            model_source      = f"fred_{matched_sid}_sigmoid{_z_tag}{_m_tag}",
         ))
 
     signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
@@ -2130,6 +2533,221 @@ def scan_all_markets(client, limit_per_page: int = 200) -> list[dict]:
     return markets
 
 
+# ── Cross-series coherence scanner (GDP-FOMC) ─────────────────────────────────
+
+async def scan_cross_series_coherence(
+    fomc_markets: list[dict],
+    gdp_markets: list[dict],
+    gdpnow_pct: float,
+    max_contracts: int = 3,
+) -> list[Signal]:
+    """
+    GDP-FOMC coherence: weak GDP implies more rate cuts.
+    If KXFED YES prices for rate cuts are too low given GDPNow, generate a signal.
+    """
+    signals: list[Signal] = []
+
+    # Skip if economy is normal/strong — coherence signal less meaningful
+    if gdpnow_pct > 2.5:
+        log.debug("Cross-series coherence: skipping — GDPNow=%.2f%% > 2.5%%", gdpnow_pct)
+        return signals
+
+    # No KXFED markets available
+    if not fomc_markets:
+        log.debug("Cross-series coherence: no KXFED markets")
+        return signals
+
+    # Only meaningful when GDP is weak (< 1.5%) — expect 1+ cut
+    if gdpnow_pct >= 1.5:
+        log.debug("Cross-series coherence: GDPNow=%.2f%% not weak enough (<1.5%%) for cut signal", gdpnow_pct)
+        return signals
+
+    # Linear model: weak GDP → higher cut probability threshold
+    # e.g. gdpnow=0.5 → 0.75, gdpnow=1.4 → 0.72
+    implied_cut_prob = (2.0 - gdpnow_pct) * 0.3 + 0.40
+
+    # Target KXFED markets for T3.75 or T4.0 (rate ending at/below these levels implies cuts)
+    # Require ≥45 days to close — near-term meetings can't move the rate that far
+    cut_strikes = {"T3.75", "T4.0"}
+    _now_ts = datetime.utcnow().replace(tzinfo=timezone.utc)
+    candidate_markets = []
+    for m in fomc_markets:
+        ticker = m.get("ticker", "")
+        if not any(strike in ticker for strike in cut_strikes):
+            continue
+        close_raw = m.get("close_time") or m.get("expiration_time") or ""
+        if close_raw:
+            try:
+                close_dt = datetime.fromisoformat(
+                    close_raw.replace("Z", "+00:00")
+                )
+                if (close_dt - _now_ts).days < 45:
+                    log.debug("Cross-series coherence: skipping %s — closes in <45 days", ticker)
+                    continue
+            except (ValueError, TypeError):
+                pass
+        price = _market_mid(m)
+        if price > 0:
+            candidate_markets.append(m)
+
+    if not candidate_markets:
+        log.debug("Cross-series coherence: no T3.75/T4.0 KXFED markets found")
+        return signals
+
+    # Sort by ticker (nearest meeting first — alphabetical approximation for KXFED-YYMMM format)
+    candidate_markets.sort(key=lambda m: m.get("ticker", ""))
+
+    emitted = 0
+    for market in candidate_markets:
+        if emitted >= 2:
+            break
+
+        ticker = market.get("ticker", "")
+        price  = _market_mid(market)
+
+        # If market YES price is below our implied cut probability, it's underpricing cuts
+        if price >= implied_cut_prob:
+            log.debug(
+                "Cross-series coherence: %s YES=%.2f already >= implied=%.2f — skip",
+                ticker, price, implied_cut_prob,
+            )
+            continue
+
+        fair_value = implied_cut_prob
+        edge       = fair_value - price          # positive: YES is cheap
+        fee_edge   = _fee_adjusted_edge(fair_value, price, "yes")
+
+        if fee_edge <= 0:
+            continue
+
+        log.info(
+            "Cross-series coherence signal: %s  YES price=%.2f  implied=%.2f  edge=%.2f  gdpnow=%.2f%%",
+            ticker, price, fair_value, edge, gdpnow_pct,
+        )
+        signals.append(Signal(
+            ticker            = ticker,
+            title             = market.get("title", "") or f"KXFED cut coherence ({ticker})",
+            category          = "fomc",
+            side              = "yes",
+            fair_value        = round(fair_value, 4),
+            market_price      = round(price, 4),
+            edge              = round(edge, 4),
+            fee_adjusted_edge = round(fee_edge, 4),
+            contracts         = max_contracts,
+            confidence        = 0.60,
+            model_source      = "gdp_fomc_coherence",
+            spread_cents      = int(abs(
+                float(market.get("yes_ask_dollars") or price + 0.02) -
+                float(market.get("yes_bid_dollars") or price - 0.02)
+            ) * 100),
+        ))
+        emitted += 1
+
+    if signals:
+        log.info(
+            "GDP-FOMC coherence: %d signal(s)  gdpnow=%.2f%%  implied_cut_prob=%.2f",
+            len(signals), gdpnow_pct, implied_cut_prob,
+        )
+    return signals
+
+
+# ── Rate-path calendar spread value scanner ───────────────────────────────────
+
+async def scan_rate_path_value(
+    fomc_markets: list[dict],
+    max_contracts: int = 3,
+) -> list[Signal]:
+    """
+    Detect calendar spread mispricings: for the same rate threshold,
+    P(rate > X at December) should not greatly exceed P(rate > X at June).
+
+    If Dec YES > Jun YES + 0.10 for the same strike, the December market is
+    overpriced — emit a NO signal for the overpriced December market.
+    """
+    signals: list[Signal] = []
+
+    if not fomc_markets:
+        return signals
+
+    # Parse ticker format: KXFED-YYMMMDD-TX.XX
+    # Group by strike, collect (meeting_date_str, ticker, market) tuples
+    import re as _re
+
+    strike_meetings: dict[str, list[tuple[str, str, dict]]] = {}
+    for market in fomc_markets:
+        ticker = market.get("ticker", "")
+        # Match KXFED-YYMMM... format
+        m = _re.match(r"^KXFED-(\d{2}[A-Z]{3}\d{2})-(.+)$", ticker)
+        if not m:
+            continue
+        date_str = m.group(1)   # e.g. "25JUN18"
+        strike   = m.group(2)   # e.g. "T4.25"
+        price    = _market_mid(market)
+        if price <= 0:
+            continue
+        strike_meetings.setdefault(strike, []).append((date_str, ticker, market))
+
+    # For each strike with 2+ meetings, look for Dec YES >> Jun YES
+    for strike, meetings in strike_meetings.items():
+        if len(meetings) < 2:
+            continue
+
+        # Sort chronologically (YYMMM date strings sort alphabetically for same year)
+        meetings.sort(key=lambda t: t[0])
+
+        # Slide a window: compare each adjacent earlier/later pair
+        for i in range(len(meetings) - 1):
+            early_date, early_ticker, early_market = meetings[i]
+            later_date, later_ticker, later_market  = meetings[i + 1]
+
+            early_yes = _market_mid(early_market)
+            later_yes  = _market_mid(later_market)
+
+            # Violation: later meeting YES > earlier meeting YES + 0.10
+            if later_yes > early_yes + 0.10:
+                # Later-meeting market is overpriced — sell YES (buy NO)
+                # For a NO signal: fair_value is the probability that YES resolves NO,
+                # i.e. 1 - later_yes as a rough fair value for NO side.
+                # We model the "fair" later price as early_yes + 0.05 (small premium allowed)
+                fair_later_yes = early_yes + 0.05
+                fair_no_value  = 1.0 - fair_later_yes   # fair prob of NO
+                market_no_price = 1.0 - later_yes        # what the market implies for NO
+
+                edge     = fair_no_value - market_no_price   # positive: NO is cheap
+                fee_edge = _fee_adjusted_edge(fair_no_value, market_no_price, "no")
+
+                if fee_edge <= 0:
+                    continue
+
+                log.info(
+                    "Rate-path calendar arb: %s YES=%.2f >> %s YES=%.2f (+%.2f) → NO signal on later",
+                    early_ticker, early_yes, later_ticker, later_yes, later_yes - early_yes,
+                )
+                market_obj = later_market
+                signals.append(Signal(
+                    ticker            = later_ticker,
+                    title             = later_market.get("title", "") or f"Calendar spread NO ({later_ticker})",
+                    category          = "arb",
+                    side              = "no",
+                    fair_value        = round(fair_no_value, 4),
+                    market_price      = round(market_no_price, 4),
+                    edge              = round(edge, 4),
+                    fee_adjusted_edge = round(fee_edge, 4),
+                    contracts         = max_contracts,
+                    confidence        = 0.65,
+                    model_source      = "calendar_spread_arb",
+                    spread_cents      = int(abs(
+                        float(market_obj.get("yes_ask_dollars") or later_yes + 0.02) -
+                        float(market_obj.get("yes_bid_dollars") or later_yes - 0.02)
+                    ) * 100),
+                    arb_partner       = early_ticker,
+                ))
+
+    if signals:
+        log.info("Rate-path calendar spread: %d signal(s)", len(signals))
+    return signals
+
+
 # ── Main fetch_signals function ───────────────────────────────────────────────
 
 async def fetch_signals_async(
@@ -2266,6 +2884,50 @@ async def fetch_signals_async(
         except Exception as exc:
             log.warning("GDP scan failed: %s", exc)
 
+    # 8. Cross-series coherence (GDP-FOMC)
+    if enable_fomc and enable_gdp and fred_api_key:
+        try:
+            # Fetch latest GDPNow estimate for coherence scanner
+            _gdpnow_pct: Optional[float] = None
+            try:
+                _http = _get_http_client()
+                _url  = (
+                    "https://api.stlouisfed.org/fred/series/observations"
+                    f"?series_id=GDPNOW&api_key={fred_api_key}"
+                    "&file_type=json&sort_order=desc&limit=1"
+                )
+                _resp = await _http.get(_url, timeout=8.0)
+                if _resp.status_code == 200:
+                    _obs = [o for o in _resp.json().get("observations", [])
+                            if o.get("value", ".") != "."]
+                    if _obs:
+                        _gdpnow_pct = float(_obs[0]["value"])
+            except Exception as _exc:
+                log.debug("GDPNow fetch for coherence scanner failed: %s", _exc)
+
+            if _gdpnow_pct is not None:
+                _gdp_markets = [m for m in all_markets if m.get("ticker", "").startswith("KXGDP-")]
+                coherence_sigs = await scan_cross_series_coherence(
+                    fomc_markets, _gdp_markets, _gdpnow_pct, max_contracts
+                )
+                coherence_sigs = [s for s in coherence_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+                all_signals.extend(coherence_sigs)
+                if coherence_sigs:
+                    log.info("Cross-series coherence: %d signals", len(coherence_sigs))
+        except Exception as exc:
+            log.warning("Cross-series coherence scan failed: %s", exc)
+
+    # 9. Rate-path calendar spread value
+    if enable_fomc:
+        try:
+            rate_path_sigs = await scan_rate_path_value(fomc_markets, max_contracts)
+            rate_path_sigs = [s for s in rate_path_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            all_signals.extend(rate_path_sigs)
+            if rate_path_sigs:
+                log.info("Rate-path calendar spread: %d signals", len(rate_path_sigs))
+        except Exception as exc:
+            log.warning("Rate-path calendar spread scan failed: %s", exc)
+
     # Filter by min confidence
     all_signals = [s for s in all_signals if s.confidence >= 0.50]
 
@@ -2285,7 +2947,7 @@ async def fetch_signals_async(
     deduped.sort(key=signal_quality_score, reverse=True)
 
     log.info(
-        "Total signals: %d (%d FOMC arb, %d FOMC dir, %d weather, %d economic, %d sports, %d crypto_price, %d gdp)",
+        "Total signals: %d (%d arb/calendar, %d fomc/coherence, %d weather, %d economic, %d sports, %d crypto_price, %d gdp)",
         len(deduped),
         sum(1 for s in deduped if s.category == "arb"),
         sum(1 for s in deduped if s.category == "fomc"),

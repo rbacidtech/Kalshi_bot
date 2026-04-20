@@ -29,64 +29,42 @@ export default function LoginPage() {
   }
 
   return (
-    <div style={{
-      minHeight: '100vh',
-      width: '100%',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      background: 'linear-gradient(135deg, #1e3a5f 0%, #0f2027 50%, #1a1a2e 100%)',
-      padding: '1rem',
-    }}>
-      <div style={{ width: '100%', maxWidth: '420px' }}>
+    <div className="min-h-screen flex items-center justify-center px-4 py-10" style={{ background: '#0a0f1e' }}>
 
-        {/* Logo */}
-        <div style={{ textAlign: 'center', marginBottom: '2rem' }}>
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
-            <svg width="36" height="36" viewBox="0 0 32 32" fill="none">
-              <rect width="32" height="32" rx="8" fill="#3b82f6" fillOpacity="0.25" />
-              <polygon points="18,4 10,18 15,18 14,28 22,14 17,14" fill="#60a5fa" />
-            </svg>
-            <span style={{ fontSize: '1.75rem', fontWeight: 700, color: '#ffffff', letterSpacing: '-0.02em' }}>
-              EdgePulse
-            </span>
+      {/* Subtle background glow */}
+      <div className="pointer-events-none fixed inset-0 overflow-hidden" aria-hidden>
+        <div className="absolute top-[-20%] left-[50%] -translate-x-1/2 w-[600px] h-[600px] rounded-full opacity-20"
+          style={{ background: 'radial-gradient(circle, #3b82f6 0%, transparent 70%)' }} />
+      </div>
+
+      <div className="relative w-full max-w-sm animate-fadeIn">
+
+        {/* Brand */}
+        <div className="flex flex-col items-center mb-8">
+          <div
+            className="w-14 h-14 rounded-2xl flex items-center justify-center text-2xl mb-4"
+            style={{ background: 'linear-gradient(135deg, #3b82f6 0%, #6366f1 100%)', boxShadow: '0 0 32px rgba(99,102,241,0.5)' }}
+          >
+            🚀
           </div>
-          <p style={{ color: '#94a3b8', fontSize: '0.875rem', margin: 0 }}>
-            Prediction market trading intelligence
-          </p>
+          <h1 className="text-2xl font-bold text-white tracking-tight">EdgePulse</h1>
+          <p className="text-sm text-slate-500 mt-1">Prediction market trading intelligence</p>
         </div>
 
         {/* Card */}
-        <div style={{
-          background: '#ffffff',
-          borderRadius: '16px',
-          padding: '2rem',
-          boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)',
-        }}>
+        <div
+          className="bg-surface-1 border border-border rounded-2xl p-7"
+          style={{ borderTopColor: '#3b82f6', borderTopWidth: 3, boxShadow: '0 24px 48px rgba(0,0,0,0.4)' }}
+        >
 
-          {/* Microsoft Button */}
+          {/* Microsoft */}
           <a
             href="/auth/microsoft/login"
-            style={{
-              width: '100%',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '10px',
-              padding: '11px 16px',
-              background: '#ffffff',
-              border: '1.5px solid #d1d5db',
-              borderRadius: '8px',
-              fontSize: '0.9rem',
-              fontWeight: 600,
-              color: '#111827',
-              cursor: 'pointer',
-              marginBottom: '1.25rem',
-              textDecoration: 'none',
-              boxSizing: 'border-box',
-            }}
+            className="w-full flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl border border-border
+                       bg-surface-2 text-slate-200 text-sm font-semibold hover:bg-surface-3 hover:border-slate-600
+                       transition-all duration-150 mb-5"
           >
-            <svg width="20" height="20" viewBox="0 0 21 21" fill="none">
+            <svg width="18" height="18" viewBox="0 0 21 21" fill="none">
               <rect x="1"  y="1"  width="9" height="9" fill="#f25022" />
               <rect x="11" y="1"  width="9" height="9" fill="#7fba00" />
               <rect x="1"  y="11" width="9" height="9" fill="#00a4ef" />
@@ -96,77 +74,46 @@ export default function LoginPage() {
           </a>
 
           {/* Divider */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '1.25rem' }}>
-            <div style={{ flex: 1, height: '1px', background: '#e5e7eb' }} />
-            <span style={{ color: '#9ca3af', fontSize: '0.75rem', fontWeight: 500 }}>or sign in with email</span>
-            <div style={{ flex: 1, height: '1px', background: '#e5e7eb' }} />
+          <div className="flex items-center gap-3 mb-5">
+            <div className="flex-1 h-px bg-border" />
+            <span className="text-xs text-slate-600 font-medium">or email</span>
+            <div className="flex-1 h-px bg-border" />
           </div>
 
           {/* Form */}
-          <form onSubmit={handleSubmit} noValidate>
+          <form onSubmit={handleSubmit} noValidate className="space-y-4">
 
-            {/* Email */}
-            <div style={{ marginBottom: '1rem' }}>
-              <label style={{ display: 'block', fontSize: '0.875rem', fontWeight: 600, color: '#374151', marginBottom: '6px' }}>
-                Email address
-              </label>
+            <div>
+              <label className="label" htmlFor="email">Email address</label>
               <input
+                id="email"
                 type="email"
                 autoComplete="email"
                 required
+                className="input"
                 placeholder="you@example.com"
                 value={email}
                 onChange={e => setEmail(e.target.value)}
-                style={{
-                  width: '100%',
-                  padding: '10px 12px',
-                  border: '1.5px solid #d1d5db',
-                  borderRadius: '8px',
-                  fontSize: '0.9rem',
-                  color: '#111827',
-                  background: '#f9fafb',
-                  outline: 'none',
-                  boxSizing: 'border-box',
-                }}
-                onFocus={e => { e.target.style.borderColor = '#3b82f6'; e.target.style.background = '#fff' }}
-                onBlur={e =>  { e.target.style.borderColor = '#d1d5db'; e.target.style.background = '#f9fafb' }}
               />
             </div>
 
-            {/* Password */}
-            <div style={{ marginBottom: '1.25rem' }}>
-              <label style={{ display: 'block', fontSize: '0.875rem', fontWeight: 600, color: '#374151', marginBottom: '6px' }}>
-                Password
-              </label>
-              <div style={{ position: 'relative' }}>
+            <div>
+              <label className="label" htmlFor="password">Password</label>
+              <div className="relative">
                 <input
+                  id="password"
                   type={showPass ? 'text' : 'password'}
                   autoComplete="current-password"
                   required
+                  className="input pr-10"
                   placeholder="••••••••"
                   value={password}
                   onChange={e => setPassword(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '10px 40px 10px 12px',
-                    border: '1.5px solid #d1d5db',
-                    borderRadius: '8px',
-                    fontSize: '0.9rem',
-                    color: '#111827',
-                    background: '#f9fafb',
-                    outline: 'none',
-                    boxSizing: 'border-box',
-                  }}
-                  onFocus={e => { e.target.style.borderColor = '#3b82f6'; e.target.style.background = '#fff' }}
-                  onBlur={e =>  { e.target.style.borderColor = '#d1d5db'; e.target.style.background = '#f9fafb' }}
                 />
                 <button
                   type="button"
                   onClick={() => setShowPass(v => !v)}
-                  style={{
-                    position: 'absolute', right: '10px', top: '50%', transform: 'translateY(-50%)',
-                    background: 'none', border: 'none', cursor: 'pointer', color: '#6b7280', padding: '4px',
-                  }}
+                  className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-500 hover:text-slate-300 transition-colors"
                   tabIndex={-1}
                 >
                   {showPass ? <EyeOff size={16} /> : <Eye size={16} />}
@@ -174,47 +121,25 @@ export default function LoginPage() {
               </div>
             </div>
 
-            {/* Error */}
             {error && (
-              <div style={{
-                padding: '10px 14px', marginBottom: '1rem',
-                background: '#fef2f2', border: '1px solid #fca5a5',
-                borderRadius: '8px', color: '#dc2626', fontSize: '0.875rem',
-              }}>
+              <div className="rounded-lg border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger">
                 {error}
               </div>
             )}
 
-            {/* Submit */}
             <button
               type="submit"
               disabled={loading}
-              style={{
-                width: '100%',
-                padding: '11px',
-                background: loading ? '#93c5fd' : '#3b82f6',
-                color: '#ffffff',
-                border: 'none',
-                borderRadius: '8px',
-                fontSize: '0.9rem',
-                fontWeight: 600,
-                cursor: loading ? 'not-allowed' : 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-                transition: 'background 0.15s',
-              }}
+              className="btn-primary w-full justify-center py-2.5 text-sm font-semibold mt-1"
             >
               {loading && <Loader2 size={15} className="animate-spin" />}
               {loading ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
 
-          {/* Footer */}
-          <p style={{ textAlign: 'center', marginTop: '1.25rem', fontSize: '0.8rem', color: '#6b7280', margin: '1.25rem 0 0' }}>
+          <p className="mt-5 text-center text-xs text-slate-600">
             Don't have an account?{' '}
-            <Link to="/register" style={{ color: '#3b82f6', fontWeight: 600, textDecoration: 'none' }}>
+            <Link to="/register" className="text-accent-blue hover:text-blue-400 font-semibold transition-colors">
               Sign up
             </Link>
           </p>

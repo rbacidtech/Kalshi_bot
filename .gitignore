@@ -1,5 +1,7 @@
 .env
+.env.*
 private_key.pem
+.streamlit/secrets.toml
 *.pem
 __pycache__/
 **/__pycache__/
