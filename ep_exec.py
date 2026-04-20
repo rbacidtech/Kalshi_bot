@@ -90,7 +90,7 @@ _CATEGORY_MAP: dict = {
     "KXETH":  "crypto",    "INX":   "equity",     "NASDAQ": "equity",
 }
 _MAX_CATEGORY_PCT = 0.60   # 60 % of balance per macro category
-_MAX_SERIES_PCT   = 0.40   # 40 % per series (e.g., all KXFED markets)
+_MAX_SERIES_PCT   = 0.60   # 60 % per series (e.g., all KXFED markets)
 _MAX_MARKET_PCT   = 0.15   # 15 % per single market
 
 # ── Near-certain resolution threshold ────────────────────────────────────────
@@ -357,19 +357,20 @@ async def _process_signal(
                 contracts  = _cat_max
                 _sig_cost  = _unit_cost * contracts
 
-        if _ser_exp + _sig_cost > balance_cents * _MAX_SERIES_PCT:
-            _ser_remaining = int(balance_cents * _MAX_SERIES_PCT) - _ser_exp
-            _unit_cost = _sig_cost // contracts if contracts > 0 else _sig_cost
-            _ser_max = max(0, _ser_remaining // _unit_cost) if (_unit_cost > 0 and _ser_remaining > 0) else 0
-            if _ser_max <= 0:
-                log.info("Series limit hit (%s, no capacity) — skipping %s",
-                         _series_pfx, sig.ticker)
-                return _rejected(f"SERIES_LIMIT:{_series_pfx}")
-            if _ser_max < contracts:
-                log.info("Series limit: reducing %s contracts %d→%d to fit cap",
-                         sig.ticker, contracts, _ser_max)
-                contracts = _ser_max
-                _sig_cost = _unit_cost * contracts
+        if sig.category != "arb":
+            if _ser_exp + _sig_cost > balance_cents * _MAX_SERIES_PCT:
+                _ser_remaining = int(balance_cents * _MAX_SERIES_PCT) - _ser_exp
+                _unit_cost = _sig_cost // contracts if contracts > 0 else _sig_cost
+                _ser_max = max(0, _ser_remaining // _unit_cost) if (_unit_cost > 0 and _ser_remaining > 0) else 0
+                if _ser_max <= 0:
+                    log.info("Series limit hit (%s, no capacity) — skipping %s",
+                             _series_pfx, sig.ticker)
+                    return _rejected(f"SERIES_LIMIT:{_series_pfx}")
+                if _ser_max < contracts:
+                    log.info("Series limit: reducing %s contracts %d→%d to fit cap",
+                             sig.ticker, contracts, _ser_max)
+                    contracts = _ser_max
+                    _sig_cost = _unit_cost * contracts
         if _sig_cost > balance_cents * _MAX_MARKET_PCT:
             log.info("Market limit hit (%.0f¢ > %.0f¢) — skipping %s",
                      _sig_cost, balance_cents * _MAX_MARKET_PCT, sig.ticker)
