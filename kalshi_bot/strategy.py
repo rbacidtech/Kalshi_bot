@@ -90,6 +90,7 @@ class Signal:
     # Multi-leg arb: list of {"ticker", "side", "price_cents"} dicts.
     # Set on butterfly and any future N-leg structural arbs.
     arb_legs:          Optional[list] = None
+    close_time:        Optional[str] = None
 
     def net_payout(self) -> float:
         """Expected net profit per dollar risked after fees."""
@@ -1146,6 +1147,10 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         if days_ahead == 0:
             continue   # same-day markets trigger immediate pre_expiry (close within 24h)
 
+        # RFC3339 close_time: end of target date in UTC (weather markets close at 23:59 local ≈ midnight UTC next day)
+        _close_dt = datetime(target.year, target.month, target.day, 23, 59, 59, tzinfo=timezone.utc)
+        signal_close_time = _close_dt.isoformat()
+
         # ── Fetch forecasts ───────────────────────────────────────────────────
         om   = await fetch_open_meteo(cfg["lat"], cfg["lon"], cfg["tz"], target)
         nws_raw = await fetch_noaa_forecast(cfg["wfo"], cfg["x"], cfg["y"])
@@ -1158,6 +1163,7 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
 
         fair_value: Optional[float] = None
         source_tag = []
+        strike_type = "greater"  # default; overwritten for temp markets below
 
         if cfg["type"] in ("high_temp", "low_temp"):
             # Prefer floor_strike from market object; fall back to title regex
@@ -1224,6 +1230,12 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
             continue
 
         fair_value = max(0.02, min(0.98, fair_value))
+
+        # For "less" (below-threshold) B-series markets, Kalshi stores the price
+        # as the "above" YES price.  Invert to get the actual YES price for this market.
+        if strike_type == "less":
+            price = 1.0 - price
+
         diff = fair_value - price
         if abs(diff) < MIN_EDGE_GROSS:
             continue
@@ -1257,6 +1269,7 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
             contracts         = contracts,
             confidence        = conf,
             model_source      = "+".join(sorted(set(source_tag))) or "weather",
+            close_time        = signal_close_time,
         ))
         log.info(
             "Weather signal: %s  %s  fv=%.2f  market=%.2f  edge=%.2f  "
