@@ -93,6 +93,13 @@ _MAX_CATEGORY_PCT = 0.60   # 60 % of balance per macro category
 _MAX_SERIES_PCT   = 0.40   # 40 % per series (e.g., all KXFED markets)
 _MAX_MARKET_PCT   = 0.15   # 15 % per single market
 
+# ── Near-certain resolution threshold ────────────────────────────────────────
+# When a Kalshi YES price is at or below this threshold (e.g. 8¢), the contract
+# is near-certain to resolve NO; when at or above (100 - threshold), near-certain
+# YES.  In either case we hold to auto-resolution rather than exiting early at a
+# loss.  Overridable via env var.
+KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS = int(os.getenv("KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS", "8"))
+
 
 async def _execute_btc(
     sig:      SignalMessage,
@@ -405,6 +412,60 @@ async def _process_signal(
         size_str    = f"{contracts * BTC_UNIT:.8f}"
         entry_cents = _entry_cents
         executed    = await _execute_btc(sig, size_str, coinbase)
+    elif sig.asset_class == "kalshi" and sig.arb_legs:
+        # ── Multi-leg structural arb (butterfly / N-leg) ─────────────────────
+        # arb_partner handles 2-leg monotonicity arbs separately (below).
+        # This path handles butterfly spreads and any other N-leg arbs where
+        # all legs are carried explicitly in sig.arb_legs.
+        #
+        # Remove the pending pre-write (written above for crash protection) now —
+        # each arb leg will be written individually after it is placed, so the
+        # pre-write for sig.ticker is redundant and would conflict with leg writes.
+        await positions.close(sig.ticker)
+
+        import uuid as _uuid
+        arb_id  = str(_uuid.uuid4())[:8]
+        _arb_ok = False
+        try:
+            _leg_order_ids = executor.execute_arb_legs(
+                sig.arb_legs, contracts_per_leg=1
+            )
+            _arb_ok = True
+            # Write each arb leg into Redis ep:positions with the shared arb_id.
+            # Use close() + open() so existing entries (e.g., from a prior arb
+            # attempt) are cleanly replaced rather than merged.
+            for _i, (_leg, _oid) in enumerate(zip(sig.arb_legs, _leg_order_ids)):
+                _leg_ticker = _leg["ticker"]
+                _leg_side   = _leg["side"]
+                _leg_price  = int(_leg.get("price_cents", 50))
+                # entry_cents convention: always YES price.
+                # For NO legs, NO price = price_cents; YES price = 100 - no_price.
+                _entry_c = (100 - _leg_price) if _leg_side == "no" else _leg_price
+                await positions.close(_leg_ticker)   # clear any stale entry first
+                await positions.open(
+                    ticker      = _leg_ticker,
+                    side        = _leg_side,
+                    contracts   = 1,
+                    entry_cents = _entry_c,
+                    fair_value  = sig.fair_value,
+                    meeting     = sig.meeting or "",
+                    outcome     = sig.outcome or "",
+                    close_time  = sig.close_time or "",
+                    pending     = False,
+                )
+                await positions.update_fields(_leg_ticker, {
+                    "order_id":       _oid,
+                    "fill_confirmed": _oid == "paper",   # paper fills are instant
+                    "arb_id":         arb_id,
+                    "arb_leg_index":  _i,
+                })
+            log.info(
+                "[ARB ENTRY] %d legs registered in Redis  arb_id=%s  signal_id=%.8s",
+                len(sig.arb_legs), arb_id, sig.signal_id,
+            )
+        except RuntimeError as _arb_exc:
+            log.warning("Multi-leg arb FAILED: %s  signal_id=%.8s", _arb_exc, sig.signal_id)
+        executed = _arb_ok
     elif sig.asset_class == "kalshi":
         if sig.ticker in executor._positions:
             # Executor has an in-memory entry but Redis does not — Redis was wiped.
@@ -485,13 +546,44 @@ async def _process_signal(
         return _rejected("UNKNOWN_ASSET_CLASS")
 
     if not executed:
-        await positions.close(sig.ticker)       # remove the pending entry
+        # For arb-legs path the pending primary position was already removed inside
+        # the branch above; for other paths remove it here.
+        if not sig.arb_legs:
+            await positions.close(sig.ticker)       # remove the pending entry
         _entry_failed_cooldown[sig.ticker] = time.time()
         log.warning(
             "Entry failed for %s — suppressing for %.0f min (ENTRY_FAILED_COOLDOWN)  signal_id=%.8s",
             sig.ticker, _ENTRY_FAILED_COOLDOWN_S / 60, sig.signal_id,
         )
         return _rejected("EXECUTOR_REJECTED")
+
+    # ── Multi-leg arb: return early — legs are already in Redis ─────────────
+    # The arb_legs branch already wrote each leg into ep:positions individually
+    # and removed the pending primary-ticker entry.  Skip the single-leg confirm
+    # step, the arb_partner block, and use the summed leg costs for the report.
+    if sig.arb_legs and sig.asset_class == "kalshi":
+        _arb_cost = sum(
+            lg.get("price_cents", 50) for lg in sig.arb_legs
+        )  # total cents laid out across all legs (1 contract each)
+        _arb_fee  = int(_arb_cost * cfg.FEE_CENTS / 100)
+        metrics.signal_published(sig.asset_class, sig.strategy or "fomc_arb", sig.side)
+        log.info(
+            "ARB executed: %d legs  primary=%s  total_cost=%d¢  signal_id=%.8s",
+            len(sig.arb_legs), sig.ticker, _arb_cost, sig.signal_id,
+        )
+        return ExecutionReport(
+            signal_id     = sig.signal_id,
+            ticker        = sig.ticker,
+            asset_class   = sig.asset_class,
+            side          = sig.side,
+            contracts     = len(sig.arb_legs),
+            fill_price    = sig.market_price,
+            status        = "filled",
+            mode          = "paper" if cfg.PAPER_TRADE else "live",
+            cost_cents    = _arb_cost,
+            fee_cents     = _arb_fee,
+            edge_captured = sig.edge - (_arb_fee / 100),
+        )
 
     # ── Confirm position (remove pending flag, store order_id) ───────────────
     confirm_fields: dict = {"pending": False}
@@ -941,11 +1033,36 @@ async def _exit_checker(
 
                 exit_reason: Optional[str] = None
 
+                # ── Near-certain hold: suppress pre-expiry exits ──────────────
+                # If the YES price is at or below the threshold (≤8¢ default), the
+                # contract is near-certain to resolve NO — hold to auto-resolution
+                # and collect the full 100¢ payout instead of selling early at a
+                # loss.  Same logic applies in reverse: if YES ≥ (100-threshold),
+                # the contract is near-certain to resolve YES — also hold.
+                # This check only applies to Kalshi; BTC falls through normally.
+                _near_certain_skip = False
+                if asset_class == "kalshi":
+                    _nc_thresh = KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS
+                    if current_cents <= _nc_thresh:
+                        log.info(
+                            "Near-certain NO detected %s: YES price=%d¢ ≤ %d¢"
+                            " — suppressing pre-expiry exit, holding to resolution",
+                            ticker, current_cents, _nc_thresh,
+                        )
+                        _near_certain_skip = True
+                    elif current_cents >= (100 - _nc_thresh):
+                        log.info(
+                            "Near-certain YES detected %s: YES price=%d¢ ≥ %d¢"
+                            " — suppressing pre-expiry exit, holding to resolution",
+                            ticker, current_cents, 100 - _nc_thresh,
+                        )
+                        _near_certain_skip = True
+
                 # ── Pre-expiry two-tranche exit ───────────────────────────────
                 # Tranche 1 at 2× hours_before_close: exit half (protects gains early)
                 # Tranche 2 at 1× hours_before_close: exit remainder
                 tranche_done = pos.get("tranche_done", 0)
-                if close_time_str:
+                if close_time_str and not _near_certain_skip:
                     try:
                         close_dt = datetime.fromisoformat(
                             close_time_str.replace("Z", "+00:00")
@@ -1106,7 +1223,30 @@ async def _exit_checker(
                 if exit_reason is None and move_cents >= take_profit_cents:
                     exit_reason = f"take_profit (+{move_cents}¢)"
                 elif exit_reason is None and move_cents <= -stop_loss_cents:
-                    exit_reason = f"stop_loss ({move_cents}¢)"
+                    # Suppress stop-loss within N days of resolution on Kalshi
+                    # contracts — prediction markets resolve to 0 or 100¢, so
+                    # a correct directional bet should hold through noise.
+                    _near_days = int(os.getenv("KALSHI_NEAR_EXPIRY_NO_STOP_DAYS", "7"))
+                    _suppress = False
+                    if close_time_str and asset_class == "kalshi":
+                        try:
+                            _ct = datetime.fromisoformat(
+                                close_time_str.replace("Z", "+00:00")
+                            )
+                            _days_left = (
+                                _ct - datetime.now(timezone.utc)
+                            ).total_seconds() / 86400
+                            if 0 < _days_left < _near_days:
+                                _suppress = True
+                                log.info(
+                                    "Stop suppressed: %s  %.1fd to resolution "
+                                    "(within %dd no-stop zone)  pnl=%+d¢",
+                                    ticker, _days_left, _near_days, move_cents,
+                                )
+                        except (ValueError, TypeError):
+                            pass
+                    if not _suppress:
+                        exit_reason = f"stop_loss ({move_cents}¢)"
 
                 if exit_reason:
                     log.info("Exit triggered: %s  reason=%s  pnl=%+d¢",

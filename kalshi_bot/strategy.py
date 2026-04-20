@@ -87,6 +87,9 @@ class Signal:
     meeting:           Optional[str] = None   # FOMC only
     outcome:           Optional[str] = None   # FOMC only
     arb_partner:       Optional[str] = None   # for pure arb pairs
+    # Multi-leg arb: list of {"ticker", "side", "price_cents"} dicts.
+    # Set on butterfly and any future N-leg structural arbs.
+    arb_legs:          Optional[list] = None
 
     def net_payout(self) -> float:
         """Expected net profit per dollar risked after fees."""
@@ -450,13 +453,36 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
             worst_dev, worst_m, worst_strike, worst_price = max(legs, key=lambda x: x[0])
 
             contracts = min(max_contracts, max(1, int(worst_dev * 50)))
+
+            # Build the full 3-leg arb leg list.
+            # P(A) + P(C) < 2*P(B): middle B is overpriced relative to wings.
+            # Trade: buy wing A YES + sell middle B YES (= buy B NO) + buy wing C YES.
+            # price_cents for NO leg is (100 - yes_mid * 100) since NO costs (1 - yes_price).
+            _bf_arb_legs = [
+                {
+                    "ticker":      m_a["ticker"],
+                    "side":        "yes",
+                    "price_cents": max(1, int(p_a * 100)),
+                },
+                {
+                    "ticker":      m_b["ticker"],
+                    "side":        "no",                          # selling the overpriced middle
+                    "price_cents": max(1, int((1.0 - p_b) * 100)),
+                },
+                {
+                    "ticker":      m_c["ticker"],
+                    "side":        "yes",
+                    "price_cents": max(1, int(p_c * 100)),
+                },
+            ]
+
             sig = Signal(
                 ticker            = worst_m["ticker"],
                 title             = (
                     f"BUTTERFLY: {m_a['ticker']}/{m_b['ticker']}/{m_c['ticker']} "
                     f"leg {worst_m['ticker']} off by {worst_dev * 100:.1f}¢"
                 ),
-                category          = "fomc",
+                category          = "arb",
                 side              = "yes",
                 fair_value        = bf_mid_b,
                 market_price      = worst_price,
@@ -466,6 +492,7 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
                 confidence        = 0.70,
                 model_source      = "fomc_butterfly_arb",
                 meeting           = event,
+                arb_legs          = _bf_arb_legs,
             )
             butterfly_signals.append(sig)
             log.info(
@@ -510,6 +537,14 @@ async def scan_fomc_directional(
     """
     signals = []
     groups  = _group_fomc_by_meeting(markets)
+
+    # Read the MIN_YES_ENTRY_PRICE config value at call time (lazy import avoids
+    # circular dependency at module load; mirrors the pattern in risk.calibrate_kelly).
+    try:
+        import kalshi_bot.config as _kbc
+        _cfg_min_yes_entry_price: float = _kbc.MIN_YES_ENTRY_PRICE
+    except Exception:
+        _cfg_min_yes_entry_price = 0.60   # safe default if config import fails
 
     # Keep parse_fomc_ticker in sync with the live rate passed in from FRED
     _set_fomc_rate(current_rate)
@@ -637,6 +672,24 @@ async def scan_fomc_directional(
             # for every model outcome — the edge is a right-tail truncation artifact,
             # not real alpha.
             if side == "no" and strike > current_rate + 0.50:
+                continue
+
+            # ── FIX 1: Suppress low-probability KXFED YES signals ────────────
+            # Analysis of 608 live trades shows YES entries below 60¢ market
+            # price produce 11-13% win rates and avg -55¢ to -116¢/trade loss.
+            # YES entries above 60¢ are profitable (+$51.64 at 60-80¢,
+            # +$142.72 at 80-100¢).  Only apply to KXFED directional signals —
+            # non-FOMC markets (GDP, weather, etc.) are unaffected.
+            if (
+                side == "yes"
+                and ticker.startswith("KXFED")
+                and price < _cfg_min_yes_entry_price
+            ):
+                log.info(
+                    "Suppressing low-probability YES: %s market_price=%.2f "
+                    "< MIN_YES_ENTRY_PRICE=%.2f",
+                    ticker, price, _cfg_min_yes_entry_price,
+                )
                 continue
 
             edge = abs(diff)

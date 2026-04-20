@@ -43,6 +43,7 @@ def kalshi_signal_to_message(sig: Signal, node_id: str) -> SignalMessage:
         outcome           = sig.outcome,
         model_source      = sig.model_source,
         arb_partner       = getattr(sig, "arb_partner", None),
+        arb_legs          = getattr(sig, "arb_legs", None),
     )
 
 

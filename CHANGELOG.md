@@ -4,6 +4,45 @@ All notable changes to the EdgePulse distributed trading system are documented h
 
 ---
 
+## [1.3.0] — 2026-04-20  Performance overhaul: YES filter, Kelly fix, near-certain hold, wider stops, arb execution
+
+### YES signal suppression (kalshi_bot/strategy.py, kalshi_bot/config.py)
+- **`MIN_YES_ENTRY_PRICE=0.60`** gate in `scan_fomc_directional()` — KXFED YES signals with `market_price < 0.60` are suppressed. Data showed YES entries below 60¢ have 11–13% win rate (avg −55¢ to −116¢/trade); above 60¢ are profitable. Configurable via `KALSHI_MIN_YES_ENTRY_PRICE`.
+
+### Kelly calibration fix (kalshi_bot/risk.py)
+- `calibrate_kelly()` now filters to **terminal-only trades** (exit at 0¢ or 100¢, i.e. market resolution) before computing Kelly parameters. Previously used all exits including stop-loss/pre-expiry, giving win_rate=3.4% and `full_kelly=-0.76` (impossible — bet nothing). Terminal win rate = 71.8%, corrected `full_kelly≈+0.44`.
+- Falls back to full population when fewer than `MIN_KELLY_TRADES` (10) terminal trades exist.
+- `KALSHI_MIN_KELLY_TRADES` env var controls minimum terminal-trade threshold.
+
+### Near-certain hold logic (ep_exec.py)
+- **`KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS=8`** — positions where YES price ≤ 8¢ or ≥ 92¢ (near-certainty) are exempted from pre-expiry forced exits. These contracts were being exited 24–48h early at a discount instead of holding to auto-resolution at 0¢ or 100¢.
+- Near-certain skip guard runs BEFORE the pre-expiry block in `_exit_checker`.
+
+### Near-expiry stop suppression (ep_exec.py)
+- **`KALSHI_NEAR_EXPIRY_NO_STOP_DAYS=7`** — stop-loss is suppressed within 7 days of `close_time`. Contracts this close to expiry should resolve naturally; stop-losses here are noise-driven and cut winners.
+- Affects both stop-loss and trailing stop.
+
+### Wider exits and larger sizing (.env, ep_exec.py)
+- `KALSHI_TAKE_PROFIT_CENTS`: 20 → **40** — FOMC contracts need room to move; 20¢ TP was exiting before contracts reached their fair value floor (0¢).
+- `KALSHI_STOP_LOSS_CENTS`: 15 → **30** — 15¢ was within the spread noise band for high-value contracts; stops were firing on bid-ask jitter.
+- `KALSHI_MAX_CONTRACTS`: 5 → **15** — quarter-Kelly sizing with 71.8% terminal win rate warrants larger positions.
+- `KALSHI_MAX_MARKET_EXPOSURE`: 10% → **20%** — Kelly analysis warrants higher per-position allocation.
+
+### Butterfly arb multi-leg execution (ep_exec.py, kalshi_bot/executor.py, ep_schema.py, ep_adapters.py)
+- `scan_fomc_arb()` now populates `arb_legs` list on butterfly `Signal` objects with 3-leg structure (buy leg A, sell leg B, buy leg C).
+- `ep_exec.py` dispatches arb signals to `executor.execute_arb_legs()` — all legs placed atomically; partial fill triggers best-effort cancel of already-placed legs.
+- `arb_legs: Optional[List[dict]]` field added to `SignalMessage` dataclass.
+- `ep_adapters.py` propagates `arb_legs` from `Signal` through to `SignalMessage`.
+
+### FOMC model improvements (kalshi_bot/models/fomc.py)
+- **Tiered staleness penalty** replaces flat 0.80× haircut: <30min → 1.0×, 30min–2h → 0.80×, 2–6h → 0.50×, >6h → 0.0 (signal blocked entirely).
+- **`data_quality` field** on `MeetingProbs` — `"fallback_only"` when running on FRED static only with no Kalshi-implied and no ZQ futures data.
+- **`FALLBACK_ONLY_EDGE_THRESHOLD=0.25`** — fallback-only signals require 25¢ edge instead of 10¢.
+- **Late-money spike penalty softened**: 0.70× → 0.90× multiplier (was over-penalizing valid FOMC signals).
+- Probability clamp tightened: `max(0.05, min(0.95, raw))` (was 0.01/0.99).
+
+---
+
 ## [1.2.0] — 2026-04-19  Signal quality: FOMC butterfly, cross-series coherence, calendar spread, ADP, VIX gate, Polymarket fixes
 
 ### FOMC butterfly spread arb (kalshi_bot/strategy.py)

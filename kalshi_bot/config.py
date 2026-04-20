@@ -48,11 +48,13 @@ _DEFAULT_URL = (
 BASE_URL = os.getenv("KALSHI_BASE_URL", "").strip() or _DEFAULT_URL
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-# Raised from 0.05 to 0.10 — minimum edge must exceed typical fee (7¢) plus margin
+# Minimum edge must exceed typical fee (7¢) plus spread margin
 EDGE_THRESHOLD   = _getenv_float("KALSHI_EDGE_THRESHOLD", 0.10)
 MAX_CONTRACTS    = _getenv_int("KALSHI_MAX_CONTRACTS", 10)
 POLL_INTERVAL    = _getenv_int("KALSHI_POLL_INTERVAL", 120)   # 2 min default for FOMC
 MIN_CONFIDENCE   = _getenv_float("KALSHI_MIN_CONFIDENCE", 0.60)
+# Gate for signals where the only source is a static fallback (FRED anchor, no futures data).
+FALLBACK_ONLY_EDGE_THRESHOLD = _getenv_float("KALSHI_FALLBACK_ONLY_EDGE_THRESHOLD", 0.25)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
@@ -71,6 +73,19 @@ MAX_TOTAL_EXPOSURE    = _getenv_float("KALSHI_MAX_TOTAL_EXPOSURE", 0.30)  # tigh
 DAILY_DRAWDOWN_LIMIT  = _getenv_float("KALSHI_DAILY_DRAWDOWN_LIMIT", 0.10)
 MAX_SPREAD_CENTS      = _getenv_int("KALSHI_MAX_SPREAD_CENTS", 10)        # tighter for FOMC
 FEE_CENTS             = _getenv_int("KALSHI_FEE_CENTS", 7)
+
+# ── Signal filtering ──────────────────────────────────────────────────────────
+# Suppress KXFED YES signals where the market price is below this threshold.
+# Data shows YES entries below 60¢ have ~11-13% win rate (avg -55¢ to -116¢/trade).
+# YES entries above 60¢ are profitable; this gate targets the losing population only.
+# Set KALSHI_MIN_YES_ENTRY_PRICE=0.0 to disable.
+MIN_YES_ENTRY_PRICE  = _getenv_float("KALSHI_MIN_YES_ENTRY_PRICE", 0.60)
+
+# ── Kelly calibration ──────────────────────────────────────────────────────────
+# Minimum number of *terminal* trades (exit at 0¢ or 100¢) required before using
+# the terminal-only Kelly calibration.  Below this count the full trade population
+# is used as a fallback to avoid overfitting to a tiny sample.
+MIN_KELLY_TRADES     = _getenv_int("KALSHI_MIN_KELLY_TRADES", 10)
 
 # ── Exit management ───────────────────────────────────────────────────────────
 TAKE_PROFIT_CENTS    = _getenv_int("KALSHI_TAKE_PROFIT_CENTS", 20)

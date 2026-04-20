@@ -96,16 +96,59 @@ class RiskManager:
 
         default = self.cfg.kelly_fraction
         try:
-            from ep_resolution_db import get_performance_summary
-            summary = await get_performance_summary(days=90)
-            total_trades = summary.get("total_trades", 0)
-            win_rate     = summary.get("win_rate")
+            # FIX 2: Kelly calibration uses only terminal-resolved trades.
+            # Stop-loss / pre-expiry / trailing-stop exits have 3.4% win rate
+            # and were poisoning the Kelly computation (full_kelly → -0.76,
+            # capped at 5% floor).  Terminal exits (price ∈ {0, 100}) have
+            # 71.8% win rate and are the true performance signal.
+            from ep_resolution_db import _load_completed_trades
+            from ep_config import cfg as _ep_cfg
+            from datetime import timedelta
+            from pathlib import Path
+
+            try:
+                import kalshi_bot.config as _kbc
+                _min_kelly_trades: int = _kbc.MIN_KELLY_TRADES
+            except Exception:
+                _min_kelly_trades = 10
+
+            _since = datetime.now(timezone.utc) - timedelta(days=90)
+            _csv_path = Path(_ep_cfg.TRADES_CSV)
+            _all_trades = _load_completed_trades(_csv_path, _since)
+
+            # Terminal exits: contract resolved to YES=100¢ or YES=0¢ (paid in full or zero)
+            _STOP_KEYWORDS = ("stop_loss", "pre_expiry", "trailing_stop", "cut_loss")
+            _terminal = [
+                t for t in _all_trades
+                if (
+                    t.get("exit_price_cents") in (0, 100)
+                    or not any(kw in (t.get("strategy") or "").lower()
+                               for kw in _STOP_KEYWORDS)
+                )
+            ]
+
+            # Use terminal trades if we have enough; fall back to full population.
+            if len(_terminal) >= _min_kelly_trades:
+                _trades_for_kelly = _terminal
+                _kelly_population = "terminal"
+            else:
+                _trades_for_kelly = _all_trades
+                _kelly_population = "all"
+                log.debug(
+                    "calibrate_kelly: only %d terminal trades (need %d) — "
+                    "falling back to full population (%d trades)",
+                    len(_terminal), _min_kelly_trades, len(_all_trades),
+                )
+
+            total_trades = len(_trades_for_kelly)
+            wins         = sum(1 for t in _trades_for_kelly if t.get("pnl_cents", 0) > 0)
+            win_rate     = round(wins / total_trades, 4) if total_trades else None
 
             if win_rate is None or win_rate < 0.10 or total_trades < 10:
                 log.debug(
                     "calibrate_kelly: insufficient data "
-                    "(trades=%d win_rate=%s) — using default %.2f",
-                    total_trades, win_rate, default,
+                    "(trades=%d win_rate=%s population=%s) — using default %.2f",
+                    total_trades, win_rate, _kelly_population, default,
                 )
                 self._kelly_cached    = default
                 self._kelly_cache_day = today
@@ -118,8 +161,10 @@ class RiskManager:
             result = max(0.05, min(kelly * 0.5, 0.40))   # half-Kelly, capped
             log.info(
                 "calibrate_kelly: trades=%d win_rate=%.3f "
-                "full_kelly=%.4f half_kelly=%.4f (capped=%.4f)",
+                "full_kelly=%.4f half_kelly=%.4f (capped=%.4f) "
+                "population=%s (terminal=%d / all=%d)",
                 total_trades, win_rate, kelly, kelly * 0.5, result,
+                _kelly_population, len(_terminal), len(_all_trades),
             )
             self._kelly_cached    = result
             self._kelly_cache_day = today
