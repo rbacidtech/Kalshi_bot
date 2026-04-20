@@ -123,9 +123,12 @@ Note: FRED API requires the key as a URL query parameter — no header auth opti
 |----------|---------|-------|
 | `fomc_directional` | KXFED-* | FOMC probability fusion × regime adjustment |
 | `fomc_arb` | KXFED-* pairs | Monotonicity arbitrage (T2.75/T3.00/T3.25 YES) |
+| `fomc_butterfly_arb` | KXFED-* triplets | Convexity violation: P(A)+P(C)−2×P(B) < −0.04 |
+| `calendar_spread_arb` | KXFED-* same strike | Rate-path arb: NO if later_yes > earlier_yes + 0.10 |
+| `cross_series_coherence` | KXFED-* (45+ days out) | GDP-FOMC coherence: low GDPNow → YES on distant cut strikes |
 | `crypto_price` | KXBTC-*, KXETH-* | Log-normal binary option pricing (Deribit DVOL) |
 | `gdp` | KXGDP-* | GDPNow vs. strike comparison |
-| `economic` | KXCPI-*, KXNFP-* | BLS data vs. strike |
+| `economic` | KXCPI-*, KXNFP-* | BLS data vs. strike; ADP leading indicator |
 | `mean_reversion` | BTC-USD (Coinbase) | RSI + Bollinger Bands + z-score |
 
 ---
@@ -504,14 +507,19 @@ Metrics scraped from `:9091` (Intel) and `:9092` (Exec). Includes signal counts,
 | `ep_health.py` | ~500 | Data source health registry + circuit breakers (22 sources) |
 | `ep_telegram.py` | ~320 | Telegram alert client |
 | `ep_coinbase.py` | ~310 | CoinbaseTradeClient: JWT auth, market orders, balance |
+| `ep_polymarket.py` | ~400 | Polymarket Gamma feed: pagination, price matching, arb signals |
+| `ep_pnl_snapshots.py` | ~80 | asyncpg P&L snapshot writer to Postgres (called from Intel heartbeat) |
 | `ep_config.py` | ~80 | Runtime config from env vars, Redis key constants |
-| `kalshi_bot/strategy.py` | ~2330 | Signal generation: FOMC, GDP, crypto, economic scanners |
+| `deploy.sh` | ~80 | Sync + restart both nodes with checksum verification |
+| `kalshi_bot/strategy.py` | ~2700 | Signal generation: FOMC directional, arb, GDP, crypto, economic scanners |
 | `kalshi_bot/models/fomc.py` | ~600 | FOMC probability model: 6-source fusion, confidence scoring |
 | `kalshi_bot/risk.py` | ~225 | RiskManager: Kelly, exposure limits, drawdown halt |
-| `kalshi_bot/executor.py` | ~445 | Kalshi order placement, paper mode, fill confirmation |
+| `kalshi_bot/executor.py` | ~445 | Kalshi order placement, sell-limit exits, fill confirmation |
 | `kalshi_bot/auth.py` | — | RSA-PSS signing for Kalshi API |
 | `kalshi_bot/client.py` | — | HTTP client: retries, backoff (max 8s), async batch |
 | `kalshi_bot/state.py` | — | BotState, MarketState, PositionState dataclasses |
 | `kalshi_bot/websocket.py` | — | Persistent WebSocket, auto-reconnect (max 60s backoff) |
 | `ep_resolution_db.py` | — | Resolution history, performance analytics, Sharpe ratio |
+| `dashboard/` | — | React + Vite + Tailwind dashboard (port 8502 via FastAPI proxy) |
+| `api/` | — | FastAPI SaaS backend: auth, key vault, positions proxy, admin |
 | `docker-compose.yml` | — | Redis, Postgres, Prometheus, Grafana |

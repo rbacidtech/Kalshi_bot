@@ -15,13 +15,20 @@
 ## Redis key layout
 
 ```
-ep:signals          STREAM   Intel → Exec    edge opportunities
-ep:executions       STREAM   Exec  → Intel   fill confirmations
-ep:positions        HASH     Exec writes     ticker → position JSON
-ep:prices           HASH     Intel writes    ticker → price snapshot JSON
-ep:balance          HASH     both write      node_id → balance JSON
-ep:system           STREAM   both write      lifecycle events
-ep:config           HASH     ops writes      runtime override flags
+ep:signals             STREAM   Intel → Exec    edge opportunities
+ep:executions          STREAM   Exec  → Intel   fill confirmations
+ep:positions           HASH     Exec writes     ticker → position JSON
+ep:prices              HASH     Intel writes    ticker → price snapshot JSON
+ep:balance             HASH     both write      node_id → balance JSON
+ep:health              HASH     Intel writes    node_id → health JSON
+ep:system              STREAM   both write      lifecycle events
+ep:config              HASH     ops writes      runtime override flags
+ep:performance         STRING   Exec+Intel      hourly P&L summary JSON (TTL 25h)
+ep:cooldown:{ticker}   STRING   Exec writes     stop-loss cooldown TTL key (30min/2h/24h)
+ep:stopcnt:{ticker}    STRING   Exec writes     stop-loss escalation counter (TTL 7 days)
+ep:cut_loss:{ticker}   STRING   Intel writes    fundamental cut-loss signal (TTL 300s)
+ep:tombstone:{ticker}  STRING   Intel writes    cancel resting order + block re-entry
+ep:bot:config          STRING   Dashboard       SaaS UI state JSON
 ```
 
 ### Consumer groups
@@ -185,16 +192,24 @@ Value: JSON object
 
 ```jsonc
 {
-  "side":        "yes",
-  "contracts":   4,
-  "entry_cents": 72,
-  "fair_value":  0.85,
-  "meeting":     "2025-05",
-  "outcome":     "CUT_25",
-  "close_time":  "2025-05-07T16:00:00Z",  // RFC3339 — used for pre-expiry exits
-  "entered_at":  "2025-05-06T14:32:00Z"
+  "side":            "yes",
+  "contracts":       4,
+  "entry_cents":     72,        // ALWAYS stored as YES-market price × 100 regardless of side
+  "fair_value":      0.85,
+  "meeting":         "2025-05",
+  "outcome":         "CUT_25",
+  "close_time":      "2025-05-07T16:00:00Z",  // RFC3339 — used for pre-expiry exits
+  "entered_at":      "2025-05-06T14:32:00Z",
+  "pending":         false,     // true = pre-write crash guard; exit checker skips pending entries
+  "order_id":        "abc-123", // Kalshi exchange order UUID; "paper" for simulated; "" if unknown
+  "fill_confirmed":  true,      // fill_poll_loop sets this true when exchange confirms fill
+  "high_water_pnl":  8,         // trailing-stop high-water mark in cents P&L
+  "tranche_done":    0,         // 0=none, 1=first tranche exited (BTC or pre-expiry 50%)
+  "asset_class":     "kalshi"   // "kalshi" | "btc_spot"
 }
 ```
+
+**CRITICAL:** `entry_cents` always holds the YES-market price × 100 for both YES and NO positions. The exit P&L formula `move_cents = entry_cents - current_yes_cents` relies on this for correct sign direction on NO positions.
 
 #### `ep:prices` (HASH — Intel writes, Exec reads for exit management)
 
