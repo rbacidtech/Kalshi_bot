@@ -28,12 +28,14 @@ export default {
         'gradient-radial': 'radial-gradient(var(--tw-gradient-stops))',
       },
       keyframes: {
-        fadeIn: { from: { opacity: 0, transform: 'translateY(6px)' }, to: { opacity: 1, transform: 'translateY(0)' } },
-        pulse2: { '0%,100%': { opacity: 1 }, '50%': { opacity: 0.4 } },
+        fadeIn:   { from: { opacity: 0, transform: 'translateY(6px)' }, to: { opacity: 1, transform: 'translateY(0)' } },
+        pulse2:   { '0%,100%': { opacity: 1 }, '50%': { opacity: 0.4 } },
+        slideIn:  { from: { opacity: 0, transform: 'translateX(100%)' }, to: { opacity: 1, transform: 'translateX(0)' } },
       },
       animation: {
-        fadeIn: 'fadeIn 0.25s ease-out',
-        pulse2: 'pulse2 2s ease-in-out infinite',
+        fadeIn:  'fadeIn 0.25s ease-out',
+        pulse2:  'pulse2 2s ease-in-out infinite',
+        slideIn: 'slideIn 0.25s ease-out',
       },
     },
   },

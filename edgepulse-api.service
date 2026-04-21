@@ -1,7 +1,7 @@
 [Unit]
 Description=EdgePulse FastAPI Backend
-After=network.target postgresql.service
-Wants=postgresql.service
+After=network-online.target docker.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -21,11 +21,16 @@ ExecStart=/root/EdgePulse/.venv/bin/uvicorn api.main:app \
 
 Restart=always
 RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=5
+MemoryMax=800M
+MemoryHigh=600M
 
 # Security hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/root/EdgePulse
+SyslogIdentifier=ep-api
 
 [Install]
 WantedBy=multi-user.target

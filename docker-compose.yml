@@ -26,8 +26,8 @@ services:
         --save 300 10
         --appendonly yes
         --appendfsync everysec
-        --maxmemory 512mb
-        --maxmemory-policy allkeys-lru
+        --maxmemory 1gb
+        --maxmemory-policy volatile-lru
         --requirepass 0yy_PSMK4ZuOm6rOl5edyUiZ-7uyHz7Ok7jxh4PJmzM
         --rename-command FLUSHALL ""
         --rename-command FLUSHDB ""

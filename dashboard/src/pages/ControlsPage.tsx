@@ -2,8 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { controls, performance as perfApi } from '../lib/api'
 import {
-  Save, RotateCcw, Activity, Clock, Wifi, CheckCircle2, AlertTriangle,
-  SlidersHorizontal, Cpu, Zap, Bot, ChevronRight,
+  Save, RotateCcw, Activity, Wifi, CheckCircle2, AlertTriangle,
+  SlidersHorizontal, Cpu, Zap, Bot, ChevronRight, XCircle,
 } from 'lucide-react'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -32,8 +32,15 @@ interface SourceHealth {
   error:     string
 }
 
+interface NodeStatus {
+  last_heartbeat_at: string
+  age_s:             number
+  alive:             boolean
+}
+
 interface BotStatus {
   mode?:            string
+  halt_active?:     boolean
   cycle_count?:     number
   last_cycle_at?:   string | null
   ws_connected?:    boolean
@@ -44,6 +51,7 @@ interface BotStatus {
   uptime_seconds?:  number
   node_id?:         string
   sources?:         Record<string, SourceHealth>
+  nodes?:           Record<string, NodeStatus>
 }
 
 type Tab = 'status' | 'strategies' | 'risk' | 'advisor'
@@ -171,32 +179,102 @@ function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) => void 
           key={t.id}
           onClick={() => onChange(t.id)}
           className={[
-            'flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold transition-all duration-150',
+            'flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold transition-all duration-150 min-h-[40px]',
             active === t.id
               ? 'bg-gradient-to-r from-blue-600/30 to-indigo-600/20 text-white shadow-[inset_0_0_12px_rgba(96,165,250,0.12)] border border-blue-500/30'
               : 'text-slate-500 hover:text-slate-300 hover:bg-surface-3',
           ].join(' ')}
         >
           {t.icon}
-          <span className="hidden sm:inline">{t.label}</span>
+          <span className="text-[11px]">{t.label}</span>
         </button>
       ))}
     </div>
   )
 }
 
+// ── Node health pill ─────────────────────────────────────────────────────────
+
+function NodeCard({ label, node, lastCycleAt }: {
+  label: string
+  node?: NodeStatus
+  lastCycleAt?: string | null
+}) {
+  // Use ep:system heartbeat if available, else fall back to last_cycle_at for intel
+  const ts   = node?.last_heartbeat_at ?? lastCycleAt
+  const age  = useTickingRelative(ts)
+  const alive = node ? node.alive : !!lastCycleAt
+
+  const dot  = alive ? 'bg-emerald-400' : 'bg-rose-500'
+  const ring = alive ? 'border-emerald-500/30' : 'border-rose-500/30'
+  const text = alive ? 'text-emerald-400' : 'text-rose-400'
+
+  return (
+    <div className={`rounded-xl border bg-surface-2 p-3 flex items-center gap-3 ${ring}`}>
+      <span className="relative flex h-2.5 w-2.5 shrink-0">
+        {alive && <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${dot} opacity-60`} />}
+        <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${dot}`} />
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-semibold text-slate-300">{label}</p>
+        <p className={`text-[10px] tabular-nums mt-0.5 ${alive ? 'text-slate-500' : 'text-rose-400/70'}`}>
+          {ts ? age : 'No data'}
+          {node && !node.alive && ` · ${node.age_s.toFixed(0)}s stale`}
+        </p>
+      </div>
+      <span className={`text-[10px] font-bold ${text}`}>{alive ? 'UP' : 'DOWN'}</span>
+    </div>
+  )
+}
+
+// ── Source chip with traffic-light age coloring ───────────────────────────────
+
+function SourceChip({ name, src }: { name: string; src: SourceHealth }) {
+  const age = src.age_s ?? null
+  const ok  = src.status === 'ok'
+
+  // Traffic light based on age (seconds)
+  const color =
+    !ok              ? 'bg-rose-500/10 border-rose-500/20 text-rose-400'
+    : age == null    ? 'bg-emerald-500/8 border-emerald-500/20 text-emerald-400'
+    : age < 60       ? 'bg-emerald-500/8 border-emerald-500/20 text-emerald-400'
+    : age < 180      ? 'bg-amber-500/8  border-amber-500/20  text-amber-400'
+    :                  'bg-rose-500/8   border-rose-500/20   text-rose-400'
+
+  const dot =
+    !ok              ? 'bg-rose-400'
+    : age == null    ? 'bg-emerald-400'
+    : age < 60       ? 'bg-emerald-400'
+    : age < 180      ? 'bg-amber-400'
+    :                  'bg-rose-400'
+
+  return (
+    <div className={`flex items-center gap-2 rounded-lg px-2.5 py-2 border text-xs ${color}`}>
+      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
+      <span className="truncate font-medium leading-none">{name.replace(/_/g, ' ')}</span>
+      {age != null && (
+        <span className="ml-auto tabular-nums text-[10px] opacity-70 shrink-0">{age.toFixed(0)}s</span>
+      )}
+      {!ok && src.error && (
+        <span className="ml-1 text-[10px] opacity-60 truncate max-w-[60px]" title={src.error}>err</span>
+      )}
+    </div>
+  )
+}
+
 // ── Status Tab ────────────────────────────────────────────────────────────────
 
-function StatusTab({ status }: { status: BotStatus | undefined }) {
+function StatusTab({ status, onHalt, onResume }: {
+  status: BotStatus | undefined
+  onHalt: () => void
+  onResume: () => void
+}) {
   const lastSeen  = status?.last_cycle_at ?? status?.last_balance_at
-  const isAlive   = !!lastSeen
-  const heartbeat = useTickingRelative(lastSeen)
-
   const h = (status?.health ?? '').toLowerCase()
   const runState =
-    !isAlive                                 ? 'stopped'
-    : h === 'critical' || h.includes('error') ? 'degraded'
-    : h.includes('warn')                     ? 'degraded'
+    !lastSeen                                  ? 'stopped'
+    : h === 'critical' || h.includes('error')  ? 'degraded'
+    : h.includes('warn')                       ? 'degraded'
     : 'running'
 
   const stateGradient =
@@ -206,22 +284,63 @@ function StatusTab({ status }: { status: BotStatus | undefined }) {
 
   const stateColor =
     runState === 'running'  ? 'text-emerald-400' :
-    runState === 'degraded' ? 'text-amber-400'   :
-    'text-rose-400'
+    runState === 'degraded' ? 'text-amber-400'   : 'text-rose-400'
 
   const dotClasses =
     runState === 'running'  ? 'bg-emerald-500' :
-    runState === 'degraded' ? 'bg-amber-400'   :
-    'bg-rose-500'
+    runState === 'degraded' ? 'bg-amber-400'   : 'bg-rose-500'
 
   const stateLabel =
     runState === 'running'  ? 'Running'  :
-    runState === 'degraded' ? 'Degraded' :
-    'Stopped'
+    runState === 'degraded' ? 'Degraded' : 'Stopped'
+
+  const intelNode = status?.nodes?.['intel']
+  const execNode  = status?.nodes?.['exec']
 
   return (
     <div className="space-y-4">
-      {/* Main state banner */}
+      {/* ── Emergency halt banner ─────────────────────────────────────────── */}
+      <div className={`rounded-xl border p-4 flex items-center justify-between gap-4 ${
+        status?.halt_active
+          ? 'bg-rose-500/15 border-rose-500/40'
+          : 'bg-surface-2 border-border'
+      }`}>
+        <div className="flex items-center gap-3">
+          {status?.halt_active
+            ? <XCircle size={18} className="text-rose-400 shrink-0" />
+            : <Zap size={18} className="text-emerald-400 shrink-0" />
+          }
+          <div>
+            <p className={`text-sm font-bold ${status?.halt_active ? 'text-rose-300' : 'text-slate-200'}`}>
+              {status?.halt_active ? 'Trading HALTED' : 'Trading Active'}
+            </p>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {status?.halt_active
+                ? 'No new positions will be opened until resumed'
+                : 'Bot is accepting new signals'}
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={status?.halt_active ? onResume : onHalt}
+          className={`shrink-0 px-4 py-2 rounded-xl text-sm font-bold transition-all duration-150 ${
+            status?.halt_active
+              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30'
+              : 'bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30'
+          }`}
+        >
+          {status?.halt_active ? 'Resume Trading' : 'Halt Trading'}
+        </button>
+      </div>
+
+      {/* ── Two-node heartbeat row ─────────────────────────────────────────── */}
+      <div className="grid grid-cols-2 gap-3">
+        <NodeCard label="Intel Node" node={intelNode} lastCycleAt={status?.last_cycle_at} />
+        <NodeCard label="Exec Node"  node={execNode} />
+      </div>
+
+      {/* ── Main metrics card ──────────────────────────────────────────────── */}
       <div className={`rounded-xl border bg-surface-1 p-5 ${stateGradient}`}>
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
@@ -233,66 +352,61 @@ function StatusTab({ status }: { status: BotStatus | undefined }) {
             </span>
             <span className={`text-base font-bold ${stateColor}`}>{stateLabel}</span>
           </div>
-          {status?.mode && (
-            <span className={status.mode === 'live' ? 'badge-success' : 'badge-muted'}>
-              {status.mode.toUpperCase()}
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            {status?.ws_connected != null && (
+              <span className={`flex items-center gap-1 text-xs font-medium ${status.ws_connected ? 'text-emerald-400' : 'text-slate-500'}`}>
+                <Wifi size={11} />
+                {status.ws_connected ? 'WS' : 'No WS'}
+              </span>
+            )}
+            {status?.mode && (
+              <span className={status.mode === 'live' ? 'badge-success' : 'badge-muted'}>
+                {status.mode.toUpperCase()}
+              </span>
+            )}
+          </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           {[
-            { label: 'Cycles',   value: status?.cycle_count?.toLocaleString() ?? '—' },
-            { label: 'Uptime',   value: fmtUptime(status?.uptime_seconds)            },
-            { label: 'Health',   value: status?.health ?? (isAlive ? 'ok' : '—')     },
-            { label: 'Balance',  value: status?.balance_cents != null ? `$${(status.balance_cents/100).toFixed(2)}` : '—' },
+            { label: 'Session P&L', value: status?.session_pnl != null
+                ? `${status.session_pnl >= 0 ? '+' : ''}$${(status.session_pnl / 100).toFixed(2)}`
+                : '—',
+              color: status?.session_pnl != null
+                ? status.session_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                : 'text-slate-100'
+            },
+            { label: 'Cycles',  value: status?.cycle_count?.toLocaleString() ?? '—', color: 'text-slate-100' },
+            { label: 'Uptime',  value: fmtUptime(status?.uptime_seconds),             color: 'text-slate-100' },
+            { label: 'Balance', value: status?.balance_cents != null
+                ? `$${(status.balance_cents / 100).toFixed(2)}`
+                : '—',
+              color: 'text-slate-100'
+            },
           ].map(m => (
             <div key={m.label} className="bg-black/20 rounded-lg p-3">
               <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">{m.label}</p>
-              <p className="text-sm font-bold text-slate-100 tabular-nums">{m.value}</p>
+              <p className={`text-sm font-bold tabular-nums ${m.color}`}>{m.value}</p>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Footer row */}
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 px-1 text-xs text-slate-500">
-        <div className="flex items-center gap-1.5">
-          <Clock size={12} />
-          <span>Last heartbeat: <span className="text-slate-300 font-medium tabular-nums">{heartbeat}</span></span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <Wifi size={12} className={status?.ws_connected ? 'text-emerald-400' : ''} />
-          <span className={status?.ws_connected ? 'text-emerald-400' : ''}>
-            {status?.ws_connected ? 'WS connected' : 'WS off'}
-          </span>
-        </div>
-        {status?.node_id && (
-          <span className="badge-muted">node: {status.node_id}</span>
-        )}
-      </div>
-
-      {/* Data sources grid */}
+      {/* ── Data sources grid ──────────────────────────────────────────────── */}
       {status?.sources && Object.keys(status.sources).length > 0 && (
         <div className="rounded-xl border border-border bg-surface-2 p-4">
-          <p className="text-xs font-semibold text-slate-400 mb-3">Data Sources</p>
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs font-semibold text-slate-400">Data Sources</p>
+            <div className="flex items-center gap-3 text-[10px] text-slate-600">
+              <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />&lt;60s</span>
+              <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-amber-400" />&lt;3m</span>
+              <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-400" />stale</span>
+            </div>
+          </div>
           <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
-            {Object.entries(status.sources).map(([name, src]) => {
-              const ok = src.status === 'ok'
-              return (
-                <div key={name} className={`flex items-center gap-2 rounded-lg px-2.5 py-1.5 border text-xs ${
-                  ok
-                    ? 'bg-emerald-500/8 border-emerald-500/20 text-emerald-400'
-                    : 'bg-surface-3 border-border text-slate-500'
-                }`}>
-                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${ok ? 'bg-emerald-400' : 'bg-slate-600'}`} />
-                  <span className="truncate font-medium">{name.replace(/_/g, ' ')}</span>
-                  {src.age_s != null && ok && (
-                    <span className="ml-auto tabular-nums text-[10px] opacity-60">{src.age_s.toFixed(0)}s</span>
-                  )}
-                </div>
-              )
-            })}
+            {Object.entries(status.sources).map(([name, src]) => (
+              <SourceChip key={name} name={name} src={src} />
+            ))}
           </div>
         </div>
       )}
@@ -355,10 +469,33 @@ const STRATEGIES: StrategyDef[] = [
   },
 ]
 
-function StrategiesTab({ cfg, update, isSaving }: {
+const STRATEGY_PNL_KEYS: Record<string, string[]> = {
+  enable_fomc:         ['fomc_directional', 'fomc_arb', 'fedwatch+zq', 'kalshi_implied'],
+  enable_weather:      ['fomc_weather', 'weather'],
+  enable_economic:     ['fomc_economic', 'economic'],
+  enable_crypto_price: ['btc_mr', 'btc_mean_reversion', 'btc'],
+  enable_gdp:          ['gdp', 'kxgdp'],
+  enable_sports:       ['sports'],
+}
+
+function stratPnl(key: string, perf: Record<string, any> | undefined): number | null {
+  if (!perf) return null
+  const keys = STRATEGY_PNL_KEYS[key] ?? []
+  let total = 0, found = false
+  for (const [name, s] of Object.entries(perf)) {
+    if (keys.some(k => name.toLowerCase().includes(k.toLowerCase()))) {
+      total += s.pnl_cents
+      found = true
+    }
+  }
+  return found ? total : null
+}
+
+function StrategiesTab({ cfg, update, isSaving, perf }: {
   cfg: BotConfig
   update: <K extends keyof BotConfig>(key: K, value: BotConfig[K]) => void
   isSaving: boolean
+  perf?: Record<string, { trades: number; wins: number; pnl_cents: number }>
 }) {
   const activeCount = STRATEGIES.filter(s => cfg[s.key] as boolean).length
 
@@ -414,6 +551,15 @@ function StrategiesTab({ cfg, update, isSaving }: {
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-semibold text-slate-200">{s.label}</p>
                   <p className="text-xs text-slate-500 mt-1 leading-snug">{s.description}</p>
+                  {(() => {
+                    const pnl = stratPnl(s.key, perf)
+                    if (pnl === null) return null
+                    return (
+                      <p className={`text-xs font-semibold tabular-nums mt-1.5 ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {pnl >= 0 ? '+' : ''}${(pnl / 100).toFixed(2)} (30d)
+                      </p>
+                    )
+                  })()}
                 </div>
                 <Toggle
                   checked={active}
@@ -677,8 +823,9 @@ export default function ControlsPage() {
   const [activeTab, setActiveTab] = useState<Tab>('status')
 
   const { data: serverConfig, isLoading } = useQuery<BotConfig>({
-    queryKey: ['bot-config'],
-    queryFn:  () => controls.getConfig().then(r => r.data),
+    queryKey:        ['bot-config'],
+    queryFn:         () => controls.getConfig().then(r => r.data),
+    refetchInterval: 30_000,
   })
 
   const { data: statusData } = useQuery<BotStatus>({
@@ -707,6 +854,15 @@ export default function ControlsPage() {
     },
   })
 
+  const haltMut   = useMutation({ mutationFn: () => controls.halt(),   onSuccess: () => qc.invalidateQueries({ queryKey: ['bot-status'] }) })
+  const resumeMut = useMutation({ mutationFn: () => controls.resume(),  onSuccess: () => qc.invalidateQueries({ queryKey: ['bot-status'] }) })
+
+  const { data: perfData } = useQuery({
+    queryKey: ['performance', 30],
+    queryFn:  () => perfApi.summary(30).then(r => r.data),
+    staleTime: 60_000,
+  })
+
   function update<K extends keyof BotConfig>(key: K, value: BotConfig[K]) {
     setCfg(prev => prev ? { ...prev, [key]: value } : prev)
     setDirty(true)
@@ -727,6 +883,22 @@ export default function ControlsPage() {
     )
   }
 
+  const RESTART_REQUIRED_KEYS: (keyof BotConfig)[] = [
+    'enable_fomc', 'enable_weather', 'enable_economic', 'enable_sports',
+    'enable_crypto_price', 'enable_gdp', 'paper_trade',
+    'kelly_fraction', 'max_market_exposure', 'daily_drawdown_limit', 'poll_interval',
+  ]
+
+  const LIVE_KEYS: (keyof BotConfig)[] = ['edge_threshold', 'max_contracts', 'min_confidence']
+
+  const dirtyRestartKeys = serverConfig
+    ? RESTART_REQUIRED_KEYS.filter(k => cfg[k] !== serverConfig[k])
+    : []
+
+  const dirtyLiveKeys = serverConfig
+    ? LIVE_KEYS.filter(k => cfg[k] !== serverConfig[k])
+    : []
+
   const isSaving   = saveMut.isPending
   const dirtyCount = countDirtyFields(cfg, serverConfig)
   const showSave   = activeTab === 'strategies' || activeTab === 'risk'
@@ -735,7 +907,7 @@ export default function ControlsPage() {
     <div className="max-w-2xl space-y-0">
 
       {/* ── Page header ──────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between mb-5">
+      <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
         <div>
           <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2">
             <SlidersHorizontal size={18} className="text-indigo-400" />
@@ -776,16 +948,38 @@ export default function ControlsPage() {
       {/* ── Tab bar ──────────────────────────────────────────────────────── */}
       <TabBar active={activeTab} onChange={setActiveTab} />
 
+      {/* ── Restart-required diff banner ─────────────────────────────────── */}
+      {dirty && (dirtyRestartKeys.length > 0 || dirtyLiveKeys.length > 0) && (
+        <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/8 p-3 space-y-2">
+          <p className="text-xs font-semibold text-amber-300 flex items-center gap-1.5">
+            <AlertTriangle size={13} className="shrink-0" />
+            Unsaved changes
+          </p>
+          {dirtyRestartKeys.length > 0 && (
+            <p className="text-xs text-amber-400/80">
+              <span className="font-medium">Restart required:</span>{' '}
+              {dirtyRestartKeys.join(', ')}
+            </p>
+          )}
+          {dirtyLiveKeys.length > 0 && (
+            <p className="text-xs text-emerald-400/80">
+              <span className="font-medium">Live (next cycle):</span>{' '}
+              {dirtyLiveKeys.join(', ')}
+            </p>
+          )}
+        </div>
+      )}
+
       {/* ── Tab content ──────────────────────────────────────────────────── */}
-      {activeTab === 'status'     && <StatusTab     status={statusData} />}
-      {activeTab === 'strategies' && <StrategiesTab cfg={cfg} update={update} isSaving={isSaving} />}
+      {activeTab === 'status'     && <StatusTab status={statusData} onHalt={() => haltMut.mutate()} onResume={() => resumeMut.mutate()} />}
+      {activeTab === 'strategies' && <StrategiesTab cfg={cfg} update={update} isSaving={isSaving} perf={perfData?.by_strategy} />}
       {activeTab === 'risk'       && <RiskTab       cfg={cfg} update={update} isSaving={isSaving} />}
       {activeTab === 'advisor'    && <AdvisorTab    cfg={cfg} />}
 
       {saveMut.isError && (
         <p className="mt-4 text-xs text-rose-400">Failed to save. Please try again.</p>
       )}
-      <div className="pb-6" />
+      <div className="pb-10 md:pb-6" />
     </div>
   )
 }

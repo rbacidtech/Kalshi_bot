@@ -161,7 +161,8 @@ class PortfolioResponse(BaseModel):
     positions: List[PositionResponse]
     total_deployed_cents: int
     total_unrealized_pnl_cents: int
-    balance_cents: Optional[int]
+    balance_cents: Optional[int]          # available cash from Kalshi API
+    total_value_cents: Optional[int]      # available + deployed (total account value)
     position_count: int
 
 

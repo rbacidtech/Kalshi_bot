@@ -231,6 +231,49 @@ async def get_performance_summary(days: int = 30) -> dict:
     # -- Sharpe ----------------------------------------------------------------
     sharpe = _compute_sharpe(trades)
 
+    # -- Streaks ---------------------------------------------------------------
+    streak_current = 0
+    streak_best    = 0
+    _cur_streak    = 0
+    trades_by_time = sorted(trades, key=lambda t: t["exit_ts"])
+    for t in trades_by_time:
+        if t["pnl_cents"] > 0:
+            _cur_streak = _cur_streak + 1 if _cur_streak >= 0 else 1
+        else:
+            _cur_streak = _cur_streak - 1 if _cur_streak <= 0 else -1
+        if _cur_streak > streak_best:
+            streak_best = _cur_streak
+    streak_current = _cur_streak
+
+    # -- Avg win / loss --------------------------------------------------------
+    win_pnls  = [t["pnl_cents"] for t in trades if t["pnl_cents"] > 0]
+    loss_pnls = [t["pnl_cents"] for t in trades if t["pnl_cents"] <= 0]
+    avg_win_cents  = round(sum(win_pnls)  / len(win_pnls),  2) if win_pnls  else 0.0
+    avg_loss_cents = round(sum(loss_pnls) / len(loss_pnls), 2) if loss_pnls else 0.0
+
+    # -- Expectancy (EV per trade in cents) ------------------------------------
+    # expectancy = win_rate * avg_win + loss_rate * avg_loss
+    loss_rate   = 1.0 - win_rate
+    expectancy_cents = round(win_rate * avg_win_cents + loss_rate * avg_loss_cents, 2)
+
+    # -- P&L distribution histogram -------------------------------------------
+    buckets = [
+        ("< -50\u00a2",   lambda c: c < -50),
+        ("-50\u2013-20\u00a2",  lambda c: -50 <= c < -20),
+        ("-20\u20130\u00a2",    lambda c: -20 <= c < 0),
+        ("0\u201320\u00a2",     lambda c: 0 <= c < 20),
+        ("20\u201350\u00a2",    lambda c: 20 <= c < 50),
+        ("> 50\u00a2",     lambda c: c >= 50),
+    ]
+    pnl_distribution = []
+    for label, fn in buckets:
+        bucket_trades = [t for t in trades if fn(t["pnl_cents"])]
+        pnl_distribution.append({
+            "bucket":    label,
+            "count":     len(bucket_trades),
+            "pnl_cents": sum(t["pnl_cents"] for t in bucket_trades),
+        })
+
     return {
         "period_days":        days,
         "total_trades":       total_trades,
@@ -244,6 +287,12 @@ async def get_performance_summary(days: int = 30) -> dict:
         "worst_trade":        worst_trade,
         "avg_hold_time_hours": avg_hold_hours,
         "sharpe_daily":       sharpe,
+        "streak_current":    streak_current,
+        "streak_best":       streak_best,
+        "avg_win_cents":     avg_win_cents,
+        "avg_loss_cents":    avg_loss_cents,
+        "expectancy_cents":  expectancy_cents,
+        "pnl_distribution":  pnl_distribution,
     }
 
 
@@ -345,6 +394,7 @@ class ResolutionDB:
             ("entry_cents", "INTEGER"),
             ("exit_cents",  "INTEGER"),
             ("correct",     "INTEGER"),
+            ("recorded_at", "TEXT"),
         ]:
             try:
                 self._conn.execute(

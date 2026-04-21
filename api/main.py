@@ -6,7 +6,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, status
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,7 +17,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from api.config import get_settings
-from api.database import init_db
+from api.database import get_db, init_db
+from api.redis_client import close_redis
 from api.routers.admin import router as admin_router
 from api.routers.auth import limiter, router as auth_router
 from api.routers.keys import router as keys_router
@@ -35,6 +38,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database tables verified")
     yield
+    await close_redis()
     logger.info("EdgePulse API shutting down")
 
 
@@ -94,8 +98,26 @@ def create_app() -> FastAPI:
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["meta"], include_in_schema=False)
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "env": settings.app_env}
+    async def health(db: AsyncSession = Depends(get_db)) -> dict:
+        checks: dict[str, str] = {"api": "ok", "env": settings.app_env}
+        # Redis check
+        try:
+            from api.redis_client import get_redis
+            r = get_redis()
+            await r.ping()
+            checks["redis"] = "ok"
+        except Exception as e:
+            checks["redis"] = f"error: {e}"
+        # DB check
+        try:
+            await db.execute(text("SELECT 1"))
+            checks["db"] = "ok"
+        except Exception as e:
+            checks["db"] = f"error: {e}"
+
+        overall = "ok" if all(v in ("ok", settings.app_env) for v in checks.values()) else "degraded"
+        checks["status"] = overall
+        return checks
 
     # ── Static dashboard (serve built React app) ──────────────────────────────
     dist_dir = Path(__file__).parent.parent / "dashboard" / "dist"

@@ -14,16 +14,14 @@ export default function Topbar({ title = '', sidebarOpen, onToggleSidebar }: Top
     <header className="sticky top-0 z-30 h-14 flex items-center justify-between px-4 bg-surface-0/80 backdrop-blur border-b border-border">
       {/* Left: sidebar toggle + page title */}
       <div className="flex items-center gap-3">
-        {!sidebarOpen && (
-          <button
-            onClick={onToggleSidebar}
-            className="text-slate-500 hover:text-slate-200 transition-colors p-1.5 rounded-lg hover:bg-surface-2"
-            title="Open sidebar"
-          >
-            <Menu size={18} />
-          </button>
-        )}
-        <h1 className="font-semibold text-slate-100 text-base leading-none">
+        <button
+          onClick={onToggleSidebar}
+          className="text-slate-500 hover:text-slate-200 transition-colors p-1.5 rounded-lg hover:bg-surface-2"
+          title={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
+        >
+          <Menu size={18} />
+        </button>
+        <h1 className="font-semibold text-slate-100 text-sm md:text-base leading-none">
           {title}
         </h1>
       </div>

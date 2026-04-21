@@ -9,19 +9,19 @@ Endpoints (all admin-only):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
-from api.config import get_settings
 from api.dependencies import require_admin
 from api.models import User
+from api.redis_client import get_redis
 from api.routers.auth import limiter
 
 logger = logging.getLogger(__name__)
@@ -32,11 +32,6 @@ _CONFIG_KEY  = "ep:bot:config"   # dashboard UI state (full JSON blob)
 _BOT_CFG_KEY = "ep:config"       # bot live overrides (hash, read each cycle)
 _STATUS_KEY  = "ep:bot:status"
 _BALANCE_KEY = "ep:balance"
-
-
-async def _get_redis() -> aioredis.Redis:
-    settings = get_settings()
-    return aioredis.from_url(settings.redis_url, decode_responses=True)
 
 
 def _env_defaults() -> dict[str, Any]:
@@ -96,12 +91,12 @@ async def get_config(
     _: User = Depends(require_admin),
 ) -> BotConfig:
     """Return effective bot config: env defaults → ep:bot:config UI state → ep:config live overrides."""
-    r = await _get_redis()
+    r = get_redis()
     try:
         raw_ui   = await r.get(_CONFIG_KEY)
         raw_live = await r.hgetall(_BOT_CFG_KEY)
-    finally:
-        await r.aclose()
+    except Exception:
+        raw_ui, raw_live = None, {}
 
     cfg = _env_defaults()
 
@@ -134,7 +129,7 @@ async def patch_config(
     _: User = Depends(require_admin),
 ) -> BotConfig:
     """Write config to Redis. UI state → ep:bot:config; live overrides → ep:config hash."""
-    r = await _get_redis()
+    r = get_redis()
     try:
         # Full UI state for display
         await r.set(_CONFIG_KEY, body.model_dump_json())
@@ -144,8 +139,8 @@ async def patch_config(
             "override_max_contracts":  str(body.max_contracts),
             "override_min_confidence": str(body.min_confidence),
         })
-    finally:
-        await r.aclose()
+    except Exception:
+        pass
     return body
 
 
@@ -159,57 +154,195 @@ def _ts_us_to_iso(ts_us: Any) -> Optional[str]:
         return None
 
 
+def _node_heartbeats_from_stream(entries: list) -> dict[str, float]:
+    """Scan ep:system entries (xrevrange order) → {node_prefix: latest_ts_s}."""
+    seen: dict[str, float] = {}
+    for _eid, fields in entries:
+        raw = fields.get("payload") or fields.get(b"payload")
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw)
+        except Exception:
+            continue
+        if ev.get("event_type") != "HEARTBEAT":
+            continue
+        node = str(ev.get("node", ""))
+        ts_s = float(ev.get("ts_us", 0)) / 1_000_000
+        # Keep only the first (latest) per node prefix
+        prefix = "intel" if node.startswith("intel") else "exec" if node.startswith("exec") else node
+        if prefix not in seen and ts_s:
+            seen[prefix] = ts_s
+        if len(seen) >= 2:
+            break
+    return seen
+
+
 @router.get("/status")
 @limiter.limit("60/minute")
 async def get_status(
     request: Request,
     _: User = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Return latest bot status built from ep:health and ep:balance hashes."""
-    r = await _get_redis()
+    """Return latest bot status built from ep:health, ep:balance, and ep:system."""
+    r = get_redis()
     try:
-        raw_health  = await r.hgetall(_HEALTH_KEY)
-        raw_balance = await r.hgetall(_BALANCE_KEY)
-    finally:
-        await r.aclose()
+        raw_health, raw_balance, sys_entries = await asyncio.gather(
+            r.hgetall(_HEALTH_KEY),
+            r.hgetall(_BALANCE_KEY),
+            r.xrevrange("ep:system", count=200),
+            return_exceptions=True,
+        )
+        if isinstance(raw_health,  Exception): raw_health  = {}
+        if isinstance(raw_balance, Exception): raw_balance = {}
+        if isinstance(sys_entries, Exception): sys_entries = []
+    except Exception:
+        raw_health, raw_balance, sys_entries = {}, {}, []
 
     status: dict[str, Any] = {}
+    now = datetime.now(timezone.utc).timestamp()
 
-    # Parse health from first available node entry
+    # ── Intel node health (ep:health hash) ──────────────────────────────────
     for node_id, raw in raw_health.items():
         try:
-            h = json.loads(raw)
+            h  = json.loads(raw)
             ws = h.get("sources", {}).get("kalshi_ws", {})
             status = {
-                "node_id":      node_id,
-                "health":       h.get("overall", "unknown"),
-                "ws_connected": ws.get("status") == "ok",
+                "node_id":       node_id,
+                "health":        h.get("overall", "unknown"),
+                "ws_connected":  ws.get("status") == "ok",
                 "last_cycle_at": _ts_us_to_iso(h.get("ts_us")),
-                "sources":      h.get("sources", {}),
+                "sources":       h.get("sources", {}),
+                "cycle_count":   h.get("cycle_count"),
+                "uptime_seconds":h.get("uptime_seconds"),
+                "session_pnl":   h.get("session_pnl"),
             }
-            break
         except Exception:
             pass
+        break  # only first intel entry
 
-    # Parse balance — sum across sources, pick mode and timestamp
-    total_balance  = 0
-    mode: Optional[str] = None
+    # ── Per-node heartbeats from ep:system ───────────────────────────────────
+    heartbeats = _node_heartbeats_from_stream(sys_entries)
+    nodes: dict[str, Any] = {}
+    for prefix, ts_s in heartbeats.items():
+        age_s = round(now - ts_s, 1)
+        nodes[prefix] = {
+            "last_heartbeat_at": datetime.fromtimestamp(ts_s, tz=timezone.utc).isoformat(),
+            "age_s": age_s,
+            "alive": age_s < 180,   # stale if > 3 min (heartbeat cadence = 60s)
+        }
+    status["nodes"] = nodes
+
+    # ── Balance — Kalshi and Coinbase kept separate ──────────────────────────
+    kalshi_cents: int           = 0
+    coinbase_cents: int         = 0
+    mode: Optional[str]         = None
     last_balance_at: Optional[str] = None
-    for raw in raw_balance.values():
+    for k, raw in raw_balance.items():
+        key = k.decode() if isinstance(k, bytes) else k
         try:
             b = json.loads(raw)
-            total_balance += b.get("balance_cents", 0)
-            if not mode:
-                mode = b.get("mode")
-            if not last_balance_at:
-                last_balance_at = _ts_us_to_iso(b.get("ts_us"))
+            amt = b.get("balance_cents", 0)
+            if key == "coinbase":
+                coinbase_cents += amt
+            else:
+                kalshi_cents += amt   # intel node = Kalshi available cash
+                if not mode:           mode            = b.get("mode")
+                if not last_balance_at: last_balance_at = _ts_us_to_iso(b.get("ts_us"))
         except Exception:
             pass
 
-    status["balance_cents"]    = total_balance
-    status["mode"]             = mode
-    status["last_balance_at"]  = last_balance_at
+    status["balance_cents"]         = kalshi_cents      # Kalshi available cash only
+    status["coinbase_balance_cents"] = coinbase_cents   # Coinbase separately
+    status["mode"]                  = mode
+    status["last_balance_at"]       = last_balance_at
+
+    # ── Halt state ───────────────────────────────────────────────────────────
+    try:
+        halt_val = await r.hget(_BOT_CFG_KEY, "HALT_TRADING")
+        status["halt_active"] = halt_val in ("1", "true", "True")
+    except Exception:
+        status["halt_active"] = False
+
     return status
+
+
+@router.get("/activity", summary="Recent system events from ep:system Redis stream")
+@limiter.limit("60/minute")
+async def get_activity(
+    request: Request,
+    limit: int = Query(20, ge=5, le=100),
+    _: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """
+    Returns the last N events from the ep:system Redis stream (newest first).
+    Used by the DashboardPage live activity feed.
+    """
+    r = get_redis()
+    try:
+        entries = await r.xrevrange("ep:system", count=limit)
+    except Exception:
+        entries = []
+
+    events = []
+    for entry_id, fields in entries:
+        ts_iso = _ts_us_to_iso(fields.get("ts_us")) if fields.get("ts_us") else None
+        events.append({
+            "id":         str(entry_id),
+            "event_type": fields.get("event_type", ""),
+            "node":       fields.get("node", ""),
+            "detail":     fields.get("detail", ""),
+            "ts":         ts_iso,
+        })
+    return {"events": events}
+
+
+@router.post("/halt", summary="Emergency: halt all new trading immediately")
+@limiter.limit("30/minute")
+async def halt_trading(
+    request: Request,
+    _: User = Depends(require_admin),
+) -> dict[str, Any]:
+    r = get_redis()
+    try:
+        await r.hset(_BOT_CFG_KEY, "HALT_TRADING", "1")
+        await r.set("ep:tombstone:HALT_FLAG", "1", ex=86400)  # visible sentinel
+        logger.warning("HALT_TRADING activated via dashboard")
+        return {"ok": True, "halt_active": True}
+    except Exception as exc:
+        logger.error("halt_trading error: %s", exc)
+        return {"ok": False, "halt_active": None, "error": str(exc)}
+
+
+@router.post("/resume", summary="Resume trading after halt")
+@limiter.limit("30/minute")
+async def resume_trading(
+    request: Request,
+    _: User = Depends(require_admin),
+) -> dict[str, Any]:
+    r = get_redis()
+    try:
+        await r.hdel(_BOT_CFG_KEY, "HALT_TRADING")
+        await r.delete("ep:tombstone:HALT_FLAG")
+        logger.info("HALT_TRADING cleared via dashboard")
+        return {"ok": True, "halt_active": False}
+    except Exception as exc:
+        return {"ok": False, "halt_active": None, "error": str(exc)}
+
+
+@router.get("/halt-status", summary="Check whether HALT_TRADING is active")
+@limiter.limit("60/minute")
+async def get_halt_status(
+    request: Request,
+    _: User = Depends(require_admin),
+) -> dict[str, Any]:
+    r = get_redis()
+    try:
+        val = await r.hget(_BOT_CFG_KEY, "HALT_TRADING")
+        halt_active = val in ("1", "true", "True")
+    except Exception:
+        halt_active = False
+    return {"halt_active": halt_active}
 
 
 @router.post("/ai-suggest")
