@@ -19,15 +19,16 @@ class PositionStore:
 
     async def open(
         self,
-        ticker:      str,
-        side:        str,
-        contracts:   int,
-        entry_cents: int,
-        fair_value:  float,
-        meeting:     str = "",
-        outcome:     str = "",
-        close_time:  str = "",
-        pending:     bool = False,
+        ticker:       str,
+        side:         str,
+        contracts:    int,
+        entry_cents:  int,
+        fair_value:   float,
+        meeting:      str = "",
+        outcome:      str = "",
+        close_time:   str = "",
+        model_source: str = "",
+        pending:      bool = False,
     ) -> None:
         # Guard: never overwrite a confirmed (non-pending) position with a new
         # pending pre-write.  This prevents crash-recovery pre-writes from
@@ -41,15 +42,17 @@ class PositionStore:
             return
 
         pos = {
-            "side":        side,
-            "contracts":   contracts,
-            "entry_cents": entry_cents,
-            "fair_value":  fair_value,
-            "meeting":     meeting,
-            "outcome":     outcome,
-            "close_time":  close_time,
-            "entered_at":  datetime.now(timezone.utc).isoformat(),
-            "pending":     pending,
+            "side":              side,
+            "contracts":         contracts,
+            "contracts_filled":  0,        # updated by fill_poll as exchange reports fills
+            "entry_cents":       entry_cents,
+            "fair_value":        fair_value,
+            "meeting":           meeting,
+            "outcome":           outcome,
+            "close_time":        close_time,
+            "model_source":      model_source,
+            "entered_at":        datetime.now(timezone.utc).isoformat(),
+            "pending":           pending,
         }
         await self._bus.set_position(ticker, pos)
         log.debug("Position opened: %s  side=%s  contracts=%d", ticker, side, contracts)
@@ -93,7 +96,9 @@ class PositionStore:
         total = 0
         for p in positions.values():
             entry     = p.get("entry_cents", 50)
-            contracts = p.get("contracts", 1)
+            # Use contracts_filled when available (partial-fill window);
+            # falls back to contracts (requested size) for pending/unfilled orders.
+            contracts = p.get("contracts_filled") or p.get("contracts", 1)
             if p.get("side") == "no":
                 total += (100 - entry) * contracts
             else:

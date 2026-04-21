@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CLAUDE_MODEL   = os.getenv("LLM_MODEL",            "claude-opus-4-6")
+CLAUDE_MODEL   = os.getenv("LLM_MODEL",            "claude-haiku-4-5-20251001")
 RUN_INTERVAL_H = float(os.getenv("LLM_INTERVAL_HOURS", "4"))
 REDIS_URL      = os.getenv("REDIS_URL",             "redis://localhost:6379/0")
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY",     "")
@@ -99,6 +99,15 @@ Context fields you receive:
     does NOT mean the strategy is failing. Check open_positions for resting orders.
 - model_sources: which model generated the most fills (kalshi_implied+fred vs fred_anchor).
     fred_anchor = CME FedWatch was unavailable; treat those signals with lower weight.
+- strategy_performance: resolved-trade win rates and P&L per model_source (ground truth).
+    overall_win_rate is typically 10–20% — most profit comes from a few large resolution wins
+    (YES bought at 3¢ resolves at 100¢, or NO bought at 97¢ resolves at 0¢).
+    Do NOT interpret low win_rate alone as failure; use expectancy_cents and pnl_usd instead.
+    expectancy_cents > 0 means the system earns money per trade on average — do not tighten.
+    avg_pnl_cents per strategy is the key signal:
+      < -15¢ AND trades >= 10 → strategy is losing money; reduce scale_factor or kelly_fraction.
+      > +25¢ AND trades >= 10 → strategy is working well; you may raise kelly_fraction up to 0.35.
+    avg_win_cents >> |avg_loss_cents| is the expected pattern (asymmetric payoff structure).
 - btc_fear_greed: 0–100 (0=extreme fear, 100=extreme greed).
     > 75 and BTC PnL negative → consider btc_enabled=false or lower scale.
     < 25 and shorts profitable → fear-driven bottom; ease z_threshold slightly.
@@ -164,7 +173,36 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
         except Exception:
             pass
     ctx["open_positions"] = len(positions)
-    ctx["positions"]      = [
+
+    # Full-portfolio summary — computed over ALL positions before the detail cap.
+    # Gives the agent accurate exposure context even when position count > 10.
+    _by_series:     Dict[str, int]   = {}
+    _by_asset:      Dict[str, int]   = {}
+    _by_side:       Dict[str, int]   = {}
+    _total_exp      = 0
+    for t, p in positions.items():
+        series      = t.split("-")[0] if "-" in t else t
+        asset       = p.get("asset_class", "kalshi")
+        side        = p.get("side", "yes")
+        contracts   = int(p.get("contracts") or 0)
+        entry_cents = int(p.get("entry_cents") or 0)
+        cost        = entry_cents if side == "yes" else (100 - entry_cents)
+        _by_series[series]  = _by_series.get(series, 0) + 1
+        _by_asset[asset]    = _by_asset.get(asset, 0) + 1
+        _by_side[side]      = _by_side.get(side, 0) + 1
+        _total_exp         += cost * contracts
+
+    ctx["portfolio_summary"] = {
+        "total_positions":    len(positions),
+        "by_series":          dict(sorted(_by_series.items(), key=lambda x: -x[1])),
+        "by_asset_class":     _by_asset,
+        "by_side":            _by_side,
+        "total_exposure_cents": _total_exp,
+        "total_exposure_usd": round(_total_exp / 100, 2),
+    }
+
+    # Detail list capped at 10 to limit prompt size; summary above covers the rest.
+    ctx["positions"] = [
         {
             "ticker":      t,
             "side":        p.get("side"),
@@ -275,6 +313,43 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
         except Exception:
             pass
     ctx["recent_events"] = events[:5]
+
+    # Historical strategy performance from ep:performance (written hourly by exec).
+    # Gives the agent ground-truth win rates and P&L per model_source from resolved
+    # trades — the Redis execution stream only covers recent entries/rejects and has
+    # no outcome data.  Skip strategies with < 3 trades to suppress noise.
+    raw_perf = await r.get("ep:performance")
+    if raw_perf:
+        try:
+            perf     = json.loads(raw_perf)
+            by_strat = {}
+            for strat, s in perf.get("by_strategy", {}).items():
+                trades = s.get("trades", 0)
+                if trades < 3:
+                    continue
+                wins = s.get("wins", 0)
+                pnl  = s.get("pnl_cents", 0)
+                by_strat[strat] = {
+                    "trades":        trades,
+                    "win_rate":      round(wins / trades, 3) if trades else 0.0,
+                    "pnl_usd":       round(pnl / 100, 2),
+                    "avg_pnl_cents": round(pnl / trades, 1) if trades else 0.0,
+                }
+            ctx["strategy_performance"] = {
+                "period_days":      perf.get("period_days"),
+                "total_trades":     perf.get("total_trades"),
+                "overall_win_rate": perf.get("win_rate"),
+                "total_pnl_usd":    round(perf.get("total_pnl_cents", 0) / 100, 2),
+                "expectancy_cents": perf.get("expectancy_cents"),
+                "avg_win_cents":    perf.get("avg_win_cents"),
+                "avg_loss_cents":   perf.get("avg_loss_cents"),
+                "avg_hold_hours":   perf.get("avg_hold_time_hours"),
+                "by_strategy":      dict(sorted(
+                    by_strat.items(), key=lambda x: -x[1]["pnl_usd"]
+                )),
+            }
+        except Exception:
+            pass
 
     return ctx
 

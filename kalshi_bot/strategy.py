@@ -68,6 +68,20 @@ TAX_RESERVE_RATE  = 0.30    # 30% tax reserve on profits
 MIN_EDGE_GROSS    = 0.12    # 12¢ minimum gross edge (net ~5¢ after fees)
 MIN_LIQUIDITY_FP  = 0.0   # minimum volume_fp to consider market tradeable
 
+# ── YES price gate: model_source values that are EXEMPT ───────────────────────
+# Arb and coherence signals derive edge from relative mispricing between
+# contracts, not from the absolute price level of the YES contract.  The
+# historical analysis that calibrated MIN_YES_ENTRY_PRICE was performed on
+# directional signals only.  These sources bypass that gate wherever it is
+# checked, even if a future refactor moves gate logic.
+_PRICE_GATE_EXEMPT_SOURCES: frozenset = frozenset({
+    "fomc_butterfly_arb",
+    "monotonicity_arb",
+    "calendar_spread_arb",
+    "gdp_fomc_coherence",
+    "cross_series_coherence",
+})
+
 # ── Signal dataclass ──────────────────────────────────────────────────────────
 @dataclass
 class Signal:
@@ -521,12 +535,13 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
 
 
 async def scan_fomc_directional(
-    markets:       list[dict],
-    current_rate:  float,
-    max_contracts: int,
-    treasury_2y:   Optional[float] = None,
-    macro_regime:  Optional[dict]  = None,
-    release_data:  Optional[dict]  = None,
+    markets:              list[dict],
+    current_rate:         float,
+    max_contracts:        int,
+    treasury_2y:          Optional[float] = None,
+    macro_regime:         Optional[dict]  = None,
+    release_data:         Optional[dict]  = None,
+    min_yes_entry_price:  Optional[float] = None,
 ) -> list[Signal]:
     """
     Directional FOMC signals using CME FedWatch + ZQ futures + WSJ consensus.
@@ -545,13 +560,16 @@ async def scan_fomc_directional(
     signals = []
     groups  = _group_fomc_by_meeting(markets)
 
-    # Read the MIN_YES_ENTRY_PRICE config value at call time (lazy import avoids
-    # circular dependency at module load; mirrors the pattern in risk.calibrate_kelly).
-    try:
-        import kalshi_bot.config as _kbc
-        _cfg_min_yes_entry_price: float = _kbc.MIN_YES_ENTRY_PRICE
-    except Exception:
-        _cfg_min_yes_entry_price = 0.60   # safe default if config import fails
+    # min_yes_entry_price: caller-supplied override wins (e.g., calibrated from
+    # resolution DB by ep_advisor); otherwise fall back to env/config default.
+    if min_yes_entry_price is not None:
+        _cfg_min_yes_entry_price: float = min_yes_entry_price
+    else:
+        try:
+            import kalshi_bot.config as _kbc
+            _cfg_min_yes_entry_price = _kbc.MIN_YES_ENTRY_PRICE
+        except Exception:
+            _cfg_min_yes_entry_price = 0.60
 
     # Keep parse_fomc_ticker in sync with the live rate passed in from FRED
     _set_fomc_rate(current_rate)
@@ -688,15 +706,18 @@ async def scan_fomc_directional(
             # YES entries above 60¢ are profitable (+$51.64 at 60-80¢,
             # +$142.72 at 80-100¢).  Only apply to KXFED directional signals —
             # non-FOMC markets (GDP, weather, etc.) are unaffected.
+            # Arb/coherence model sources are exempt: their edge comes from
+            # relative mispricing, not absolute price level (see _PRICE_GATE_EXEMPT_SOURCES).
             if (
                 side == "yes"
                 and ticker.startswith("KXFED")
                 and price < _cfg_min_yes_entry_price
+                and model_src not in _PRICE_GATE_EXEMPT_SOURCES
             ):
                 log.info(
                     "Suppressing low-probability YES: %s market_price=%.2f "
-                    "< MIN_YES_ENTRY_PRICE=%.2f",
-                    ticker, price, _cfg_min_yes_entry_price,
+                    "< MIN_YES_ENTRY_PRICE=%.2f (model=%s)",
+                    ticker, price, _cfg_min_yes_entry_price, model_src,
                 )
                 continue
 
@@ -1257,13 +1278,16 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         if fee_edge < MIN_EDGE_GROSS * 0.5:
             continue
 
-        # Confidence: higher for near-term + multi-source agreement
+        # Confidence: higher for near-term + multi-source agreement.
+        # Same-day weather forecasts are highly reliable — boost to FOMC tier.
         multi_source = len(source_tag) > 1
-        conf = 0.72 if (days_ahead <= 1 and multi_source) else \
-               0.68 if (days_ahead <= 1 or multi_source) else \
-               0.62
+        conf = 0.82 if (days_ahead <= 1 and multi_source) else \
+               0.76 if (days_ahead <= 1 or multi_source) else \
+               0.68
 
-        contracts = min(max_contracts, max(1, int(edge * 60)))
+        # Multiplier raised 60→90: weather markets are daily (high capital velocity),
+        # comparable to FOMC directional at 80 but with extra credit for daily turnover.
+        contracts = min(max_contracts, max(1, int(edge * 90)))
         signals.append(Signal(
             ticker            = ticker,
             title             = title,
@@ -2841,8 +2865,9 @@ async def fetch_signals_async(
     eth_spot:            Optional[float] = None,
     enable_crypto_price: bool  = True,
     enable_gdp:          bool  = True,
-    macro_regime:        Optional[dict] = None,   # NEW: from ep:macro Redis hash
-    release_data:        Optional[dict] = None,   # NEW: from ep:releases Redis hash
+    macro_regime:        Optional[dict] = None,   # from ep:macro Redis hash
+    release_data:        Optional[dict] = None,   # from ep:releases Redis hash
+    min_yes_entry_price: Optional[float] = None,  # calibrated override from ep_advisor
 ) -> list[Signal]:
     """
     Scan all enabled market categories and return fee-adjusted signals.
@@ -2877,6 +2902,7 @@ async def fetch_signals_async(
                 treasury_2y=treasury_2y,
                 macro_regime=macro_regime,
                 release_data=release_data,
+                min_yes_entry_price=min_yes_entry_price,
             )
             dir_sigs = [s for s in dir_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
             all_signals.extend(dir_sigs)

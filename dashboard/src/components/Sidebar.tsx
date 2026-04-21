@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { ChartBar, Key, CreditCard, Shield, SlidersHorizontal, TrendingUp, LogOut, X } from 'lucide-react'
+import { ChartBar, Key, CreditCard, Shield, SlidersHorizontal, TrendingUp, LogOut, X, Brain } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { useAuth } from '../lib/auth'
 import { positions as positionsApi, controls, performance as perfApi } from '../lib/api'
@@ -82,8 +82,9 @@ export default function Sidebar({ onClose }: SidebarProps) {
   ]
 
   if (user?.is_admin) {
+    navItems.push({ to: '/advisor',  icon: <Brain size={16} />,             label: 'Advisor'  })
     navItems.push({ to: '/controls', icon: <SlidersHorizontal size={16} />, label: 'Controls' })
-    navItems.push({ to: '/admin',    icon: <Shield size={16} />,            label: 'Admin' })
+    navItems.push({ to: '/admin',    icon: <Shield size={16} />,            label: 'Admin'    })
   }
 
   const avatarLetter = user?.email?.[0]?.toUpperCase() ?? '?'

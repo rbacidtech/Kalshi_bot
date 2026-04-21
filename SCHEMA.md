@@ -15,20 +15,25 @@
 ## Redis key layout
 
 ```
-ep:signals             STREAM   Intel → Exec    edge opportunities
-ep:executions          STREAM   Exec  → Intel   fill confirmations
-ep:positions           HASH     Exec writes     ticker → position JSON
-ep:prices              HASH     Intel writes    ticker → price snapshot JSON
-ep:balance             HASH     both write      node_id → balance JSON
-ep:health              HASH     Intel writes    node_id → health JSON
-ep:system              STREAM   both write      lifecycle events
-ep:config              HASH     ops writes      runtime override flags
-ep:performance         STRING   Exec+Intel      hourly P&L summary JSON (TTL 25h)
-ep:cooldown:{ticker}   STRING   Exec writes     stop-loss cooldown TTL key (30min/2h/24h)
-ep:stopcnt:{ticker}    STRING   Exec writes     stop-loss escalation counter (TTL 7 days)
-ep:cut_loss:{ticker}   STRING   Intel writes    fundamental cut-loss signal (TTL 300s)
-ep:tombstone:{ticker}  STRING   Intel writes    cancel resting order + block re-entry
-ep:bot:config          STRING   Dashboard       SaaS UI state JSON
+ep:signals                STREAM   Intel → Exec      edge opportunities
+ep:executions             STREAM   Exec  → Intel     fill confirmations
+ep:positions              HASH     Exec writes       ticker → position JSON
+ep:prices                 HASH     Intel writes      ticker → price snapshot JSON
+ep:balance                HASH     both write        node_id → balance JSON
+ep:health                 HASH     Intel writes      node_id → health JSON
+ep:system                 STREAM   both write        lifecycle events
+ep:config                 HASH     ops writes        runtime override flags
+ep:performance            STRING   Exec+Intel        hourly P&L summary JSON (TTL 25h)
+ep:cooldown:{ticker}      STRING   Exec writes       stop-loss cooldown TTL key (30min/2h/24h)
+ep:stopcnt:{ticker}       STRING   Exec writes       stop-loss escalation counter (TTL 7 days)
+ep:cut_loss:{ticker}      STRING   Intel writes      fundamental cut-loss signal (TTL 300s)
+ep:tombstone:{ticker}     STRING   Intel writes      cancel resting order + block re-entry
+ep:bot:config             STRING   Dashboard         SaaS UI state JSON
+ep:alerts                 STREAM   ep_advisor writes advisor alerts (maxlen 500)
+ep:advisor:status         STRING   ep_advisor writes last advisor run snapshot (TTL 2h)
+ep:advisor:spread_wide_since STRING ep_advisor      BTC cross-exchange spread timer
+ep:econ_release:status    STRING   ep_econ_release  next/last economic release metadata (TTL 24h)
+ep:resolutions            HASH     ep_resolution_db  per-series resolution history (last 10)
 ```
 
 ### Consumer groups
@@ -85,6 +90,7 @@ Published by Intel to `ep:signals`. Exec must process or discard within `ttl_ms`
   "confidence":      0.88,    // [0, 1]  model confidence
   "suggested_size":  4,       // contracts / units from Kelly sizing on Intel
   "kelly_fraction":  0.25,    // kelly_f used to produce suggested_size
+  "priority":        3,       // execution priority within batch: 1=arb 2=coherence 3=directional
 
   // ── Risk flags ───────────────────────────────────────────────────────────
   // Exec uses these as advisory. Unknown flags are treated as WARNING.
@@ -205,20 +211,29 @@ Value: JSON object
 
 ```jsonc
 {
-  "side":            "yes",
-  "contracts":       4,
-  "entry_cents":     72,        // ALWAYS stored as YES-market price × 100 regardless of side
-  "fair_value":      0.85,
-  "meeting":         "2025-05",
-  "outcome":         "CUT_25",
-  "close_time":      "2025-05-07T16:00:00Z",  // RFC3339 — used for pre-expiry exits
-  "entered_at":      "2025-05-06T14:32:00Z",
-  "pending":         false,     // true = pre-write crash guard; exit checker skips pending entries
-  "order_id":        "abc-123", // Kalshi exchange order UUID; "paper" for simulated; "" if unknown
-  "fill_confirmed":  true,      // fill_poll_loop sets this true when exchange confirms fill
-  "high_water_pnl":  8,         // trailing-stop high-water mark in cents P&L
-  "tranche_done":    0,         // 0=none, 1=first tranche exited (BTC or pre-expiry 50%)
-  "asset_class":     "kalshi"   // "kalshi" | "btc_spot"
+  "side":              "yes",
+  "contracts":         4,
+  "contracts_filled":  3,        // exchange-confirmed fills; used for exposure calc (fallback: contracts)
+  "entry_cents":       72,       // ALWAYS stored as YES-market price × 100 regardless of side
+  "fair_value":        0.85,
+  "meeting":           "2025-05",
+  "outcome":           "CUT_25",
+  "close_time":        "2025-05-07T16:00:00Z",  // RFC3339 — used for pre-expiry exits
+  "model_source":      "fedwatch+zq",
+  "entered_at":        "2025-05-06T14:32:00Z",
+  "pending":           false,    // true = pre-write crash guard; exit checker skips pending entries
+  "order_id":          "abc-123", // Kalshi exchange order UUID; "paper" for simulated; "" if unknown
+  "fill_confirmed":    true,     // fill_poll_loop sets this true when exchange confirms fill
+  "high_water_pnl":    8,        // trailing-stop high-water mark in cents P&L
+  "tranche_done":      0,        // 0=none, 1=first tranche exited (BTC or pre-expiry 50%)
+  "asset_class":       "kalshi", // "kalshi" | "btc_spot"
+  // Exit TIF escalation fields (set when a resting exit limit order is placed):
+  "pending_exit":      false,    // true = exit limit order resting; skip re-exit until confirmed
+  "exit_order_id":     null,     // order_id of the resting exit limit
+  "exit_order_placed_at": null,  // ISO timestamp when exit was placed
+  "exit_offer_cents":  null,     // current offer price of exit limit
+  "exit_reason":       null,     // "TAKE_PROFIT" | "STOP_LOSS" | etc.
+  "exit_widen_count":  0         // number of TIF widenings applied (max EXIT_TIF_MAX_STEPS=3)
 }
 ```
 

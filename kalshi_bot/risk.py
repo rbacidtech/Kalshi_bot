@@ -31,8 +31,9 @@ class RiskManager:
         self._halted         = False
         self._risk_day       = int(time.time() // 86400)
         # Empirical Kelly cache — refreshed at most once per calendar day
-        self._kelly_cached:    float              = config.kelly_fraction
-        self._kelly_cache_day: Optional[datetime] = None
+        self._kelly_cached:      float              = config.kelly_fraction
+        self._kelly_by_category: dict               = {}   # {bucket: fraction}
+        self._kelly_cache_day:   Optional[datetime] = None
 
     def set_balance(self, balance_cents: int) -> None:
         # Reset at UTC midnight
@@ -75,32 +76,56 @@ class RiskManager:
         self._start_balance = None
         self._halted = False
 
-    async def calibrate_kelly(self, category: str = None) -> float:
+    @staticmethod
+    def _kelly_bucket(model_source: str) -> str:
+        """Map a model_source string to one of three Kelly buckets."""
+        ms = (model_source or "").lower()
+        if ms.endswith("_arb"):
+            return "arb"
+        if "coherence" in ms:
+            return "coherence"
+        if "fred_" in ms or "gdp" in ms:
+            return "economic"
+        return "directional"
+
+    async def calibrate_kelly(self) -> float:
         """
-        Compute an empirical half-Kelly fraction from recent resolved trades.
+        Compute empirical half-Kelly fractions from recent resolved trades.
 
-        Uses the last 90 days of trade history from ep_resolution_db.  Falls
-        back to the configured default (typically 0.25) when there is not yet
-        enough data (< 10 completed trades or win_rate < 0.10).
+        Three changes vs the original:
+          1. Fee-adjusted P&L: subtract 2 × fee_cents (14¢ round-trip) per contract
+             before deciding win/loss — removes the optimistic bias from ignoring fees.
+          2. Per-category Kelly: separate fractions for arb, coherence, economic,
+             and directional buckets.  Falls back to global when a bucket has < 10
+             fee-adjusted terminal trades.
+          3. Still uses only terminal exits (price ∈ {0, 100}) for the same reason
+             as before — stop-loss exits have ~3% win rate and pollute the estimate.
 
-        Result is cached per-instance for 24 hours so the I/O cost is
-        negligible even when called every sizing cycle.
-
-        Formula: Kelly = (p * odds - q) / odds  with odds=1.0 (binary markets),
-        then half-Kelly capped at [0.05, 0.40].
+        Results are cached per-instance for one calendar day.
         """
-        # Refresh at most once per calendar day
         today = datetime.now(timezone.utc).date()
         if self._kelly_cache_day is not None and self._kelly_cache_day == today:
             return self._kelly_cached
 
         default = self.cfg.kelly_fraction
+        fee_rt  = 2 * self.cfg.fee_cents   # round-trip fee per contract (14¢)
+
+        def _half_kelly(trades: list) -> Optional[float]:
+            """Compute half-Kelly from a list of trade dicts (fee-adjusted P&L)."""
+            n = len(trades)
+            if n < 10:
+                return None
+            wins = sum(
+                1 for t in trades
+                if t.get("pnl_cents", 0) - fee_rt * t.get("contracts", 1) > 0
+            )
+            wr = wins / n
+            if wr < 0.10:
+                return None
+            full_k = (wr - (1.0 - wr))       # Kelly = p - q  (odds=1 binary)
+            return max(0.05, min(full_k * 0.5, 0.40))
+
         try:
-            # FIX 2: Kelly calibration uses only terminal-resolved trades.
-            # Stop-loss / pre-expiry / trailing-stop exits have 3.4% win rate
-            # and were poisoning the Kelly computation (full_kelly → -0.76,
-            # capped at 5% floor).  Terminal exits (price ∈ {0, 100}) have
-            # 71.8% win rate and are the true performance signal.
             from ep_resolution_db import _load_completed_trades
             from ep_config import cfg as _ep_cfg
             from datetime import timedelta
@@ -112,25 +137,21 @@ class RiskManager:
             except Exception:
                 _min_kelly_trades = 10
 
-            _since = datetime.now(timezone.utc) - timedelta(days=90)
-            _csv_path = Path(_ep_cfg.TRADES_CSV)
+            _since     = datetime.now(timezone.utc) - timedelta(days=90)
+            _csv_path  = Path(_ep_cfg.TRADES_CSV)
             _all_trades = _load_completed_trades(_csv_path, _since)
 
-            # Terminal exits: contract resolved to YES=100¢ or YES=0¢.
-            # The OR condition (checking model_source for stop keywords) was a bug —
-            # model_source is "fedwatch+zq+wsj", never contains "stop_loss", so
-            # it caused all 647 trades to pass, poisoning Kelly with stop-loss exits.
+            # Terminal exits only (price resolved to 0 or 100¢)
             _terminal = [
                 t for t in _all_trades
                 if t.get("exit_price_cents") in (0, 100)
             ]
 
-            # Use terminal trades if we have enough; fall back to full population.
             if len(_terminal) >= _min_kelly_trades:
-                _trades_for_kelly = _terminal
+                _pool           = _terminal
                 _kelly_population = "terminal"
             else:
-                _trades_for_kelly = _all_trades
+                _pool           = _all_trades
                 _kelly_population = "all"
                 log.debug(
                     "calibrate_kelly: only %d terminal trades (need %d) — "
@@ -138,35 +159,53 @@ class RiskManager:
                     len(_terminal), _min_kelly_trades, len(_all_trades),
                 )
 
-            total_trades = len(_trades_for_kelly)
-            wins         = sum(1 for t in _trades_for_kelly if t.get("pnl_cents", 0) > 0)
-            win_rate     = round(wins / total_trades, 4) if total_trades else None
-
-            if win_rate is None or win_rate < 0.10 or total_trades < 10:
+            # ── Global Kelly ─────────────────────────────────────────────────
+            global_kelly = _half_kelly(_pool)
+            if global_kelly is None:
                 log.debug(
                     "calibrate_kelly: insufficient data "
-                    "(trades=%d win_rate=%s population=%s) — using default %.2f",
-                    total_trades, win_rate, _kelly_population, default,
+                    "(trades=%d population=%s) — using default %.2f",
+                    len(_pool), _kelly_population, default,
                 )
                 self._kelly_cached    = default
                 self._kelly_cache_day = today
                 return default
 
-            p    = win_rate
-            q    = 1.0 - p
-            odds = 1.0
-            kelly = (p * odds - q) / odds          # full Kelly
-            result = max(0.05, min(kelly * 0.5, 0.40))   # half-Kelly, capped
-            log.info(
-                "calibrate_kelly: trades=%d win_rate=%.3f "
-                "full_kelly=%.4f half_kelly=%.4f (capped=%.4f) "
-                "population=%s (terminal=%d / all=%d)",
-                total_trades, win_rate, kelly, kelly * 0.5, result,
-                _kelly_population, len(_terminal), len(_all_trades),
+            # ── Per-category Kelly ────────────────────────────────────────────
+            from collections import defaultdict
+            by_bucket: dict = defaultdict(list)
+            for t in _pool:
+                by_bucket[self._kelly_bucket(t.get("strategy", ""))].append(t)
+
+            cat_kelly: dict = {}
+            for bucket, bucket_trades in by_bucket.items():
+                bk = _half_kelly(bucket_trades)
+                if bk is not None:
+                    cat_kelly[bucket] = bk
+                else:
+                    cat_kelly[bucket] = global_kelly   # fall back to global
+                log.debug(
+                    "calibrate_kelly[%s]: trades=%d kelly=%.4f",
+                    bucket, len(bucket_trades), cat_kelly[bucket],
+                )
+
+            self._kelly_cached      = global_kelly
+            self._kelly_by_category = cat_kelly
+            self._kelly_cache_day   = today
+
+            _total = len(_pool)
+            _wins  = sum(
+                1 for t in _pool
+                if t.get("pnl_cents", 0) - fee_rt * t.get("contracts", 1) > 0
             )
-            self._kelly_cached    = result
-            self._kelly_cache_day = today
-            return result
+            log.info(
+                "calibrate_kelly: trades=%d fee_adj_win_rate=%.3f "
+                "global_half_kelly=%.4f  by_category=%s  population=%s",
+                _total, _wins / _total if _total else 0, global_kelly,
+                {k: f"{v:.3f}" for k, v in cat_kelly.items()},
+                _kelly_population,
+            )
+            return global_kelly
 
         except Exception as exc:
             log.warning("calibrate_kelly failed (%s) — using default %.2f", exc, default)
@@ -179,14 +218,23 @@ class RiskManager:
         balance_cents: int,
         confidence: float = 1.0,
         side: str = "yes",
+        model_source: str = "",
+        vol_multiplier: float = 1.0,
     ) -> int:
         """
-        Confidence-scaled Kelly sizing, net of fees.
+        Confidence-scaled, per-category Kelly sizing, net of fees.
 
-        effective_kelly = kelly_fraction × confidence
-        This means FedWatch+ZQ (conf≈0.90) sizes at 3x a single-source
-        signal (conf≈0.70) for the same edge, automatically rewarding
-        higher-quality information.
+        effective_kelly = kelly_fraction(category) × confidence × vol_multiplier
+
+        kelly_fraction is looked up per model_source bucket (arb / coherence /
+        economic / directional) so each strategy is sized by its own empirical
+        win rate rather than a pooled global.  Falls back to global when a bucket
+        has insufficient history.
+
+        vol_multiplier adjusts for release-proximity volatility:
+          > 1.0 — post-release window (uncertainty resolved, edge confirmed)
+          < 1.0 — pre-release window (high uncertainty, size down)
+          1.0   — default / no adjustment
 
         Kelly denominator depends on side:
           YES: win amount = 1 - market_price  →  kelly_f = edge / (1 - market_price)
@@ -198,8 +246,6 @@ class RiskManager:
             return 0
 
         # Refresh empirical Kelly once per day in the background (non-blocking).
-        # _kelly_cached is seeded to cfg.kelly_fraction at construction; the
-        # first successful async refresh upgrades it to the data-driven value.
         today = datetime.now(timezone.utc).date()
         if self._kelly_cache_day != today:
             try:
@@ -215,7 +261,11 @@ class RiskManager:
                       edge, self.cfg.fee_cents)
             return 0
 
-        effective_kelly = self._kelly_cached * confidence
+        # Per-category Kelly: use bucket-specific fraction when available
+        bucket        = self._kelly_bucket(model_source)
+        base_kelly    = self._kelly_by_category.get(bucket, self._kelly_cached)
+        effective_kelly = base_kelly * confidence * max(0.1, vol_multiplier)
+
         if side == "yes":
             kelly_f = net_edge / max(1 - market_price, 0.01)
         else:

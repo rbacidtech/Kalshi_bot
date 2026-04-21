@@ -27,7 +27,7 @@ import kalshi_bot.config as cfg  # noqa: E402  (must follow sys.path setup)
 MODE          = os.getenv("MODE", "intel").lower()           # "intel" | "exec"
 NODE_ID       = os.getenv("NODE_ID", f"{MODE}-{os.uname().nodename}")
 REDIS_URL     = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-SIGNAL_TTL    = int(os.getenv("EP_SIGNAL_TTL_MS",  "30000"))   # 30 s
+SIGNAL_TTL    = int(os.getenv("EP_SIGNAL_TTL_MS",  "60000"))   # 60 s
 STREAM_BLOCK  = int(os.getenv("EP_STREAM_BLOCK_MS", "5000"))    # 5 s blocking read
 EXIT_INTERVAL = int(os.getenv("EP_EXIT_INTERVAL_S", "60"))      # seconds between exit checks
 

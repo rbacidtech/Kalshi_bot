@@ -28,6 +28,21 @@ from .strategy import Signal
 
 log = logging.getLogger(__name__)
 
+
+class ArbRollbackFailed(RuntimeError):
+    """
+    Raised by execute_arb_legs() when a leg placement fails AND at least one
+    earlier leg could not be cancelled (Kalshi API error during unwind).
+
+    The `unrecovered` attribute carries the legs that are open on Kalshi but
+    were NOT recorded in Redis — the caller must write them as orphaned positions
+    so the exit_checker can close them.
+    """
+    def __init__(self, message: str, unrecovered: list):
+        super().__init__(message)
+        self.unrecovered: list = unrecovered   # [(ticker, side, order_id), ...]
+
+
 CSV_HEADERS = [
     "timestamp", "ticker", "meeting", "outcome", "side", "action",
     "contracts", "price_cents", "fair_value", "edge",
@@ -257,10 +272,16 @@ class Executor:
                     "[ARB ENTRY] Leg %d/%d FAILED (%s %s) — attempting to cancel %d earlier leg(s)",
                     i + 1, len(legs), ticker, side, len(placed),
                 )
-                self._arb_cancel_placed(placed)
+                unrecovered = self._arb_cancel_placed(placed)
+                if unrecovered:
+                    raise ArbRollbackFailed(
+                        f"Arb leg {i + 1}/{len(legs)} failed ({ticker} {side}); "
+                        f"{len(unrecovered)}/{len(placed)} earlier leg(s) could not be cancelled",
+                        unrecovered,
+                    )
                 raise RuntimeError(
                     f"Arb leg {i + 1}/{len(legs)} failed ({ticker} {side}) "
-                    f"after {len(placed)} leg(s) already placed"
+                    f"after {len(placed)} leg(s) already placed — clean rollback"
                 )
 
             placed.append((ticker, side, order_id))
@@ -337,13 +358,15 @@ class Executor:
             log.error("Arb leg %d FAILED for %s %s: %s", leg_index + 1, ticker, side, exc)
             return ""
 
-    def _arb_cancel_placed(self, placed: list) -> None:
+    def _arb_cancel_placed(self, placed: list) -> list:
         """
         Best-effort cancel of already-placed arb legs when a subsequent leg fails.
-        Logs a warning per leg if the cancel itself fails — never raises.
 
-        placed: list of (ticker, side, order_id) tuples
+        Returns a list of (ticker, side, order_id) tuples for legs where the
+        cancel API call failed.  These legs remain open on Kalshi with no Redis
+        record — the caller must write them as orphaned positions.
         """
+        failed: list = []
         for ticker, side, order_id in reversed(placed):
             if order_id == "paper":
                 log.info(
@@ -356,11 +379,13 @@ class Executor:
                     "[ARB UNWIND] Cancelled leg %s %s  order_id=%s", ticker, side, order_id
                 )
             except Exception as exc:
-                log.warning(
+                log.error(
                     "[ARB UNWIND] Cancel FAILED for %s %s order_id=%s: %s "
-                    "(position may be open — check Kalshi dashboard)",
+                    "— leg is OPEN on Kalshi with no Redis record",
                     ticker, side, order_id, exc,
                 )
+                failed.append((ticker, side, order_id))
+        return failed
 
     # ── Exit management ───────────────────────────────────────────────────────
 
@@ -532,8 +557,16 @@ class Executor:
         pos: dict,
         current_cents: int,
         reason: str,
-    ):
-        """Sell an existing position."""
+    ) -> str:
+        """
+        Sell an existing position.
+
+        Returns:
+            "paper"     — paper-mode simulated exit (always succeeds)
+            order_id    — live exit order placed; position marked pending_exit
+                          (caller must keep Redis entry and wait for fill poll)
+            ""          — exit order failed (position kept, caller retries)
+        """
         side      = pos["side"]
         contracts = pos["contracts"]
         # To exit a YES position, sell YES (or equivalently buy NO)
@@ -563,6 +596,11 @@ class Executor:
                 "price=%d¢  reason=%s",
                 ticker[:38], exit_side, contracts, current_cents, reason,
             )
+            del self._positions[ticker]
+            self._save_paper_positions()
+            if self.state is not None:
+                self.state.close_position(ticker, current_cents)
+            return "paper"
         else:
             # Sell the contracts we own (same side as entry).
             # Kalshi has no true market orders — all sells require a limit price.
@@ -579,13 +617,19 @@ class Executor:
             }
             try:
                 resp     = self.client.post("/portfolio/orders", payload)
-                order_id = resp.get("order", {}).get("order_id", "unknown")
+                order_id = resp.get("order", {}).get("order_id", "") or ""
                 self._log_trade(exit_signal, "exit", order_id, "live")
                 log.info(
                     "[LIVE  EXIT ] %-38s  side=%-3s  contracts=%-2d  "
                     "price=%d¢  reason=%s  order_id=%s",
                     ticker[:38], side, contracts, current_cents, reason, order_id,
                 )
+                # Mark in-memory entry as pending_exit so dedup still blocks
+                # re-entry while the exit order rests on the exchange.
+                # Caller (exit_checker) keeps the Redis position and polls for fill.
+                if ticker in self._positions:
+                    self._positions[ticker]["pending_exit"] = True
+                return order_id
             except requests.HTTPError as exc:
                 body = ""
                 try:
@@ -593,13 +637,7 @@ class Executor:
                 except Exception:
                     pass
                 log.error("Exit FAILED for %s: HTTP %s — %s", ticker, exc, body)
-                return   # don't remove from positions if exit failed
+                return ""
             except Exception as exc:
                 log.error("Exit FAILED for %s: %s", ticker, exc)
-                return   # don't remove from positions if exit failed
-
-        # Remove from tracked positions and update shared state P&L
-        del self._positions[ticker]
-        self._save_paper_positions()
-        if self.state is not None:
-            self.state.close_position(ticker, current_cents)
+                return ""

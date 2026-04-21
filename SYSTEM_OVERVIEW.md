@@ -349,9 +349,14 @@ Queries Kalshi `/markets?status=settled` hourly. Records outcomes in SQLite, fee
 
 ### Kalshi risk (`ep_risk.py`, `kalshi_bot/risk.py`)
 
+Kelly fraction is empirically calibrated per category:
+- **Global** (`_kelly_cached`): half-Kelly from all terminal trades, fee-adjusted (14¢ round-trip subtracted)
+- **Per bucket** (`_kelly_by_category`): separate fractions for `arb`, `coherence`, `economic`, `directional`; falls back to global if < 10 qualifying trades in bucket
+- **Vol multiplier**: `0.70` within 7 days before a CPI/GDP print; `1.40` within 48h after; `1.00` otherwise
+
 | Parameter | Value | Env var |
 |---|---|---|
-| Kelly fraction | 0.25 | KALSHI_KELLY_FRACTION |
+| Kelly fraction (global default) | 0.25 | KALSHI_KELLY_FRACTION |
 | Max contracts per signal | 15 | KALSHI_MAX_CONTRACTS |
 | Min edge (gross) | 0.10 (10¢) | KALSHI_EDGE_THRESHOLD |
 | Min confidence | 0.60 | KALSHI_MIN_CONFIDENCE |

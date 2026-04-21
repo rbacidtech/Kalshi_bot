@@ -4,6 +4,87 @@ All notable changes to the EdgePulse distributed trading system are documented h
 
 ---
 
+## [1.7.0] — 2026-04-21  Fee-adjusted Kelly, per-category Kelly, vol-adjusted sizing, advisor nginx fix
+
+### Fee-adjusted Kelly (kalshi_bot/risk.py)
+- **14¢ round-trip fee subtracted before win/loss classification** — Kelly was previously optimistic because `pnl_cents = (exit - entry) * contracts` ignores the 7¢ entry + 7¢ exit fee. Now: `fee_adjusted_pnl = pnl_cents - 2 * fee_cents * contracts`; a trade is a "win" only if the fee-adjusted P&L is positive. Prevents Kelly from sizing up on marginal trades whose gross P&L is positive but net P&L is negative.
+
+### Per-category Kelly (kalshi_bot/risk.py)
+- **`_kelly_bucket(model_source)` static method** — maps model_source to one of four buckets: `arb` (`_arb` suffix), `coherence` (`"coherence"` substring), `economic` (`fred_` or `gdp`), `directional` (everything else).
+- **`_kelly_by_category: dict` field** on `RiskManager` — stores `{bucket: half_kelly_fraction}` from each daily calibration. Populated alongside `_kelly_cached` (global).
+- **`calibrate_kelly()` computes per-bucket fractions** — splits the terminal-trade pool by bucket, runs the same fee-adjusted half-Kelly formula per bucket; falls back to global Kelly if a bucket has < 10 qualifying trades.
+- **`size()` looks up category-specific Kelly** — `base_kelly = _kelly_by_category.get(bucket, _kelly_cached)`. Arb signals (historically near 100% win rate on fee-adjusted basis) no longer under-size relative to the global 72% win rate. Economic signals (lower win rate due to surprise uncertainty) no longer over-size.
+- **`size()` new params**: `model_source: str = ""` (bucket lookup), `vol_multiplier: float = 1.0` (see below). `effective_kelly = base_kelly * confidence * max(0.1, vol_multiplier)`.
+
+### Volatility-adjusted sizing (ep_exec.py, ep_risk.py, ep_econ_release.py)
+- **Pre-release window** (0–168h before print): `vol_multiplier = 0.70` — size economic-bucket signals down 30% in the week before CPI/GDP when uncertainty is highest.
+- **Post-release window** (0–48h after print): `vol_multiplier = 1.40` — size up 40% in the 48h after a confirmed print when uncertainty is resolved and the directional edge is strongest.
+- **`ep_econ_release.py`**: `_last_release_ts` attribute tracks ISO timestamp of last fired release (set in `_react()` regardless of surprise size); included as `last_release_ts` in `ep:econ_release:status` Redis key. TTL bumped 2h→24h so `last_release_ts` survives service restarts within the post-release window.
+- **`ep_exec.py`**: reads `ep:econ_release:status` before Kelly sizing; computes `_vol_multiplier` from `next_time_utc` (pre-release) and `last_release_ts` (post-release); passes to `risk_engine.size(sig, balance_cents, vol_multiplier=_vol_multiplier)`.
+- **`ep_risk.py`**: `UnifiedRiskEngine.size()` accepts `vol_multiplier=1.0` and passes it to `RiskManager.size()`.
+
+### Advisor tab nginx fix (nginx config)
+- **`advisor` missing from nginx proxy pattern** — `/advisor/status` and `/advisor/alerts` requests were falling through the API proxy rule and being served `index.html` by the SPA catch-all. Added `advisor` to the `location ~ ^/(auth|keys|...|advisor|...)` regex in `/etc/nginx/sites-available/edgepulse`. Reloaded nginx.
+
+---
+
+## [1.6.0] — 2026-04-21  Signal priority, partial-fill exposure, exit TIF escalation
+
+### Signal queue prioritization (ep_schema.py, ep_intel.py, ep_bus.py)
+- **`priority` field added to `SignalMessage`** — `int`, default 3. Intel sets 1 for arb (`category=="arb"`, `arb_legs` set, or `model_source.endswith("_arb")`), 2 for coherence (`"coherence" in model_source`), 3 for directional.
+- **Intel publishes in priority order** — `new_signals.sort(key=_signal_priority)` before the publish loop; arb signals land first in the stream every cycle.
+- **Exec sorts each consumed batch** — `consume_signals` buffers each `count=10` batch, sorts by `priority`, then yields in order. Within a 120s window, arb signals are always processed before directional ones regardless of stream insertion order.
+
+### Partial fill exposure (ep_positions.py)
+- **`contracts_filled: 0` initialized in `PositionStore.open()`** — field was previously absent until `_fill_poll_loop` first wrote it; now exists from creation for consistent access.
+- **`total_exposure_cents()` uses `contracts_filled`** — `p.get("contracts_filled") or p.get("contracts", 1)`. During the resting-order window (9 of 15 filled), exposure is now computed on the filled quantity, not the requested size. Prevents over-stating risk on large partially-filled FOMC orders.
+
+### Exit order TIF escalation (kalshi_bot/executor.py, ep_exec.py)
+- **`executor._exit_position` returns `order_id`** (str) — `"paper"` for simulated, actual `order_id` for live, `""` on API failure. Paper exits still delete from `_positions` immediately; live exits set `_positions[ticker]["pending_exit"] = True` to block re-entry.
+- **Exit checker writes `pending_exit` state to Redis** — on a successful live exit, stores `exit_order_id`, `exit_order_placed_at`, `exit_offer_cents`, `exit_reason`, `exit_widen_count=0` instead of immediately closing the position. Subsequent exit-checker cycles skip `pending_exit=True` positions.
+- **TIF escalation in `_fill_poll_loop`** — scans for `pending_exit=True` positions each 90s poll cycle:
+  - Order filled → close position and clear executor entry
+  - Order resting > `EXIT_TIF_STEP_MINUTES` (default 30 min) and `exit_widen_count < EXIT_TIF_MAX_STEPS` (default 3) → cancel resting limit, place new limit at `offer − EXIT_TIF_WIDEN_CENTS` (default 2¢), update state
+  - After 3 steps (90 min total), holds at final price; logs warning
+  - Order canceled externally → close position
+- **Arb-group sibling exits** use same pattern; `_sib_ok` now based on return value instead of `not in executor._positions`.
+- **Resolution-driven exits** call `executor._positions.pop()` immediately (market is over, TIF pointless).
+- **New env vars**: `EXIT_TIF_STEP_MINUTES=30`, `EXIT_TIF_WIDEN_CENTS=2`, `EXIT_TIF_MAX_STEPS=3`
+
+---
+
+## [1.5.0] — 2026-04-21  Arb/coherence YES gate exemption
+
+### YES price gate: arb and coherence signals exempt (kalshi_bot/strategy.py, ep_intel.py)
+- **`_PRICE_GATE_EXEMPT_SOURCES` frozenset** added to `strategy.py` — explicit manifest of model_source values whose edge derives from relative contract mispricing, not absolute price level (`fomc_butterfly_arb`, `monotonicity_arb`, `calendar_spread_arb`, `gdp_fomc_coherence`, `cross_series_coherence`). These bypass `MIN_YES_ENTRY_PRICE` even if future refactors restructure the gate.
+- **`scan_fomc_directional()` gate** extended: condition now includes `and model_src not in _PRICE_GATE_EXEMPT_SOURCES`. Suppression log now prints `model_source` for easier diagnosis.
+- **Treasury auction proximity suppression** (`ep_intel.py`) — previously kept only arb signals (`model_source.endswith("_arb")`); now keeps coherence signals too (`"coherence" in model_source`). `gdp_fomc_coherence` signals for deep OTM KXFED strikes (e.g., KXFED-26DEC-T3.75) were being dropped alongside directional signals during 10Y/30Y auction windows.
+- **FOMC announcement blackout** — same fix; coherence signals now survive the ±2h blackout window around the 2pm ET announcement.
+
+---
+
+## [1.4.0] — 2026-04-21  Arb rollback hardening, signal TTL, resolution-DB calibration
+
+### Arb rollback hardening (kalshi_bot/executor.py, ep_exec.py, tests/)
+- **`ArbRollbackFailed` exception** — raised by `execute_arb_legs()` when a leg fails *and* at least one earlier cancel also fails. Carries `unrecovered: list[(ticker, side, order_id)]` attribute.
+- **`_arb_cancel_placed()` return type** changed from `None` to `list` of failed-cancel tuples. Never raises.
+- **ep_exec.py orphan recovery** — catches `ArbRollbackFailed`; writes each unrecovered leg to `ep:positions` as `model_source="arb_unrecovered"` so `_exit_checker` can close them; fires critical alert to `ep:alerts` stream and Telegram. Plain `RuntimeError` (clean rollback) still handled as before.
+- **`tests/test_arb_rollback.py`** — 6 scenarios: all-legs-succeed, clean-rollback, partial-cancel-failure, paper-mode, `_arb_cancel_placed` return value. All pass.
+
+### Signal TTL bump (ep_config.py, ep_exec.py)
+- **`EP_SIGNAL_TTL_MS` default: 30 s → 60 s** — 13-gate chain + Kelly compute + REST call was causing legitimate signals to expire under Redis latency spikes.
+- **EXPIRED signals now log at INFO** (was DEBUG) — visible in normal log output; easier to monitor rate.
+- **Near-expiry stop suppression reads `ep:config` override** — `kalshi_near_expiry_no_stop_days` key in Redis overrides the env var at runtime without restart.
+
+### Resolution-DB threshold calibration (ep_resolution_db.py, ep_advisor.py, kalshi_bot/strategy.py, ep_intel.py)
+- **`compute_yes_entry_price_gate()`** — bins KXFED YES trades by 5¢ entry price buckets; finds lowest bucket with positive EV; returns calibrated threshold (fraction) or default 0.60 if <20 qualifying trades.
+- **`compute_near_expiry_stop_days()`** — compares short-hold vs long-hold loss rate across KXFED mid-price (30–70¢) trades; finds the hold-day threshold where noise-driven loss rate drops ≥10pp; returns calibrated days or default 7 if insufficient data.
+- **ep_advisor.py** calls both functions each cycle; auto-writes calibrated values to `ep:config` as `override_min_yes_entry_price` and `kalshi_near_expiry_no_stop_days` when data is sufficient; includes calibration results in Claude's context.
+- **`scan_fomc_directional()` + `fetch_signals_async()`** accept `min_yes_entry_price` parameter override — caller-supplied value (from Redis config) wins over env/config default.
+- **ep_intel.py** reads `override_min_yes_entry_price` from `ep:config` each cycle and passes it to `fetch_signals_async`.
+
+---
+
 ## [1.3.0] — 2026-04-20  Performance overhaul: YES filter, Kelly fix, near-certain hold, wider stops, arb execution
 
 ### YES signal suppression (kalshi_bot/strategy.py, kalshi_bot/config.py)

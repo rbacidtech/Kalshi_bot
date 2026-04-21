@@ -25,6 +25,7 @@ from api.routers.keys import router as keys_router
 from api.routers.microsoft import router as microsoft_router
 from api.routers.positions import router as positions_router
 from api.routers.controls import router as controls_router
+from api.routers.advisor import router as advisor_router
 from api.routers.performance import router as performance_router
 from api.routers.subscriptions import router as subscriptions_router
 
@@ -72,6 +73,7 @@ def create_app() -> FastAPI:
 
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(admin_router)
+    app.include_router(advisor_router)
     app.include_router(auth_router)
     app.include_router(microsoft_router)
     app.include_router(keys_router)

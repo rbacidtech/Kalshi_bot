@@ -55,6 +55,11 @@ class SignalMessage:
     suggested_size: int   = 1     # contracts / units (Kelly sized on Intel)
     kelly_fraction: float = 0.0   # fraction of bankroll Kelly recommends
 
+    # ── Execution priority (lower = processed first within a batch) ───────────
+    # 1 = arb/structural  2 = coherence  3 = directional (default)
+    # Intel sets this before publishing; Exec sorts each consumed batch by it.
+    priority: int = 3
+
     # ── Risk flags (advisory — Exec applies its own gates regardless) ─────────
     risk_flags: List[str] = field(default_factory=list)
     # "WIDE_SPREAD" | "LOW_LIQUIDITY" | "STALE_DATA"

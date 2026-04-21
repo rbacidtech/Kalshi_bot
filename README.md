@@ -202,7 +202,10 @@ Edge sanity guards: skips if `edge ≤ 0` or `edge > 0.15` (data anomaly protect
 ### Kelly Sizing
 
 ```
-effective_kelly = kelly_fraction × confidence      # default fraction: 0.25
+# Category lookup: arb | coherence | economic | directional
+bucket          = _kelly_bucket(model_source)
+base_kelly      = kelly_by_category.get(bucket, global_kelly)  # default 0.25
+effective_kelly = base_kelly × confidence × vol_multiplier
 net_edge        = edge − fee_cents
 kelly_f         = net_edge / (1 − market_price)    # YES side
 bet_fraction    = kelly_f × effective_kelly
@@ -213,7 +216,12 @@ contracts       = min(
 )
 ```
 
-Kelly fraction is empirically calibrated from the last 90 days of trades when ≥10 fills are available.
+Kelly is calibrated from the last 90 days of **terminal** trades (exit price ∈ {0, 100}), with **14¢ round-trip fee subtracted** from each trade's P&L before win/loss classification. Four per-category fractions (arb, coherence, economic, directional) are derived from separate buckets; each falls back to the global fraction if < 10 qualifying trades are in that bucket.
+
+**Volatility multiplier** (`vol_multiplier`) for economic release markets:
+- `0.70` — within 7 days before a CPI/GDP print (high uncertainty → size down)
+- `1.40` — within 48h after a confirmed print (uncertainty resolved → size up)
+- `1.00` — default (no release proximity detected)
 
 ### Stop-Loss Escalation (Redis-persisted, survives restarts)
 
@@ -489,7 +497,7 @@ Metrics scraped from `:9091` (Intel) and `:9092` (Exec). Includes signal counts,
 | CME basis strategy | `asset_class = "cme_btc_basis"` is a stub — returns 0 contracts |
 | BTC LONG needs USD cash | Only $0.49 USD available; SELL signals work with existing BTC |
 | Drawdown halt not Redis-persisted | Restarting exec clears an active halt; ERROR log fires on activation |
-| BTC Kelly ignores round-trip fee | 1.2% round-trip (2 × 0.6%) not yet subtracted from Kelly inputs |
+| BTC Kelly ignores round-trip fee | 1.2% round-trip (2 × 0.6%) not yet subtracted from BTC Kelly inputs |
 
 ---
 

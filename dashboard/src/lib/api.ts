@@ -85,6 +85,12 @@ export const controls = {
   haltStatus:  () => api.get('/controls/halt-status'),
 }
 
+export const advisor = {
+  alerts: (limit = 20, severity?: string) =>
+    api.get('/advisor/alerts', { params: { limit, ...(severity ? { severity } : {}) } }),
+  status: () => api.get('/advisor/status'),
+}
+
 export const admin = {
   users:     (page = 1, per_page = 20) => api.get('/admin/users', { params: { page, per_page } }),
   user:      (id: string) => api.get(`/admin/users/${id}`),
