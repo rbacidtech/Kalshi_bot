@@ -1244,7 +1244,18 @@ async def _exit_checker(
                 # exit_order_id is being polled in _fill_poll_loop.
                 # Do not trigger a second exit attempt while one is resting.
                 if pos.get("pending_exit"):
-                    continue
+                    # Recovery: if pending_exit=True but exit_order_id was never
+                    # written (crash between setting the guard and placing the
+                    # order), reset so the exit_checker can retry.
+                    if not pos.get("exit_order_id"):
+                        await positions.update_fields(ticker, {"pending_exit": False})
+                        log.warning(
+                            "Recovered stuck pending_exit for %s "
+                            "(pending=True but no exit_order_id — resetting)",
+                            ticker,
+                        )
+                    else:
+                        continue
 
                 price_data   = prices.get(ticker)
                 stale_price  = (
@@ -1742,11 +1753,11 @@ return cnt
                                         ticker, _pc_exc,
                                     )
 
-                        # For paper mode: mark pending_exit=True before calling
-                        # _exit_position so that if positions.close() fails and
-                        # the position persists in Redis, the next exit-checker
-                        # cycle skips it (prevents repeated CSV exit rows).
-                        if cfg.PAPER_TRADE and not pos.get("pending_exit"):
+                        # Set pending_exit=True BEFORE placing the order (all
+                        # modes).  If exec crashes between this write and the
+                        # Kalshi API call, the recovery check above resets it
+                        # (no exit_order_id means order was never placed).
+                        if not pos.get("pending_exit"):
                             await positions.update_fields(ticker, {"pending_exit": True})
 
                         _exit_order_id = ""
@@ -1769,10 +1780,9 @@ return cnt
                             _exit_order_id = "divergence"  # treat as success
 
                         if not _exit_order_id:
-                            # Kalshi API rejected the exit order. Retain the Redis
-                            # position so the exit_checker retries after backoff.
-                            # Clear any premature stop-loss cooldown so re-entry is
-                            # not blocked while we wait for the exit to succeed.
+                            # Kalshi API rejected the exit order. Clear the guard
+                            # so the exit_checker can retry after backoff.
+                            await positions.update_fields(ticker, {"pending_exit": False})
                             _exit_api_failed[ticker] = time.time()
                             log.warning(
                                 "Exit order rejected by Kalshi for %s — "
@@ -1791,16 +1801,16 @@ return cnt
                             # _fill_poll_loop will confirm the fill and close the
                             # Redis entry once the limit order executes.
                             # Also handles TIF escalation if it rests too long.
+                            # (pending_exit=True was already written above.)
                             side_for_offer = pos.get("side", "yes")
                             _offer = (current_cents if side_for_offer == "yes"
                                       else (100 - current_cents))
                             await positions.update_fields(ticker, {
-                                "pending_exit":        True,
-                                "exit_order_id":       _exit_order_id,
+                                "exit_order_id":        _exit_order_id,
                                 "exit_order_placed_at": datetime.now(timezone.utc).isoformat(),
-                                "exit_offer_cents":    _offer,
-                                "exit_reason":         exit_reason,
-                                "exit_widen_count":    0,
+                                "exit_offer_cents":     _offer,
+                                "exit_reason":          exit_reason,
+                                "exit_widen_count":     0,
                             })
                             log.info(
                                 "Exit order resting: %s  offer=%d¢  order_id=%.8s",
