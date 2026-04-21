@@ -293,6 +293,22 @@ class CoinbaseTradeClient:
         return total_cents if total_cents > 0 else None
 
 
+# ── BTC spot price (public, no auth) ─────────────────────────────────────────
+
+async def fetch_btc_spot_usd() -> float:
+    """
+    Fetch the current BTC-USD spot price from the Coinbase public API.
+    Returns 0.0 on any failure so callers can treat it as 'unknown'.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+            resp.raise_for_status()
+            return float(resp.json()["data"]["amount"])
+    except Exception:
+        return 0.0
+
+
 # ── Size helper ───────────────────────────────────────────────────────────────
 
 def btc_base_size(btc_price: float, balance_cents: int) -> str:

@@ -26,6 +26,7 @@ import DashboardPage from './pages/DashboardPage'
 import KeysPage from './pages/KeysPage'
 import SubscriptionPage from './pages/SubscriptionPage'
 import AdminPage from './pages/AdminPage'
+import AdvisorPage from './pages/AdvisorPage'
 import ControlsPage from './pages/ControlsPage'
 import PerformancePage from './pages/PerformancePage'
 
@@ -78,6 +79,7 @@ export default function App() {
           <Route path="/performance"  element={<PerformancePage />} />
           <Route path="/keys"         element={<KeysPage />} />
           <Route path="/subscription" element={<SubscriptionPage />} />
+          <Route path="/advisor"      element={<RequireAdmin><AdvisorPage /></RequireAdmin>} />
           <Route path="/controls"     element={<RequireAdmin><ControlsPage /></RequireAdmin>} />
           <Route path="/admin"        element={<RequireAdmin><AdminPage /></RequireAdmin>} />
           <Route path="/"             element={<Navigate to="/dashboard" replace />} />

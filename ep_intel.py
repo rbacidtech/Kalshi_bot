@@ -621,18 +621,22 @@ async def _release_monitor_loop(bus: RedisBus) -> None:
 
 def _classify_regime(regime: dict) -> str:
     """Return human-readable macro regime label."""
-    t10y2y   = regime.get("t10y2y", 0)
-    pce      = regime.get("pce_yoy", 0)
-    core_cpi = regime.get("core_cpi_yoy", 0)
-    vix      = regime.get("vix", 15)
+    t10y2y        = regime.get("t10y2y", 0)
+    pce           = regime.get("pce_yoy", 0)
+    core_cpi      = regime.get("core_cpi_yoy", 0)
+    vix           = regime.get("vix", 15)
+    baa10y_regime = regime.get("baa10y_regime", "normal")
 
+    # Stressed credit spreads override other indicators — systemic risk signal
+    if baa10y_regime == "stressed":
+        return "RISK_OFF"
     if t10y2y < -0.50 and pce < 2.5:
         return "EASING_STRONGLY"
     elif t10y2y < 0 or pce < 2.0:
         return "EASING"
     elif pce > 3.0 or core_cpi > 3.5:
         return "TIGHTENING"
-    elif vix > 30:
+    elif vix > 30 or baa10y_regime == "elevated":
         return "RISK_OFF"
     else:
         return "NEUTRAL"
@@ -697,6 +701,38 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
     except Exception:
         pass
 
+    # BAA10Y credit spread from ep_datasources Redis cache
+    try:
+        _baa10y_raw = await bus._r.get("ep:macro:baa10y")
+        if _baa10y_raw:
+            _baa10y_data = json.loads(_baa10y_raw)
+            regime["baa10y_spread"] = _baa10y_data.get("spread_pct", 0)
+            regime["baa10y_regime"] = _baa10y_data.get("regime", "normal")
+            log.info(
+                "BAA10Y: %.2f%%  regime=%s  3w_change=%.2f%%",
+                _baa10y_data.get("spread_pct", 0),
+                _baa10y_data.get("regime", "normal"),
+                _baa10y_data.get("change_3w", 0),
+            )
+    except Exception as _b10y_exc:
+        log.debug("BAA10Y Redis read skipped: %s", _b10y_exc)
+
+    # WALCL Fed balance sheet — log + publish to ep:macro; no trading decisions yet
+    try:
+        _walcl_raw = await bus._r.get("ep:macro:walcl")
+        if _walcl_raw:
+            _walcl_data = json.loads(_walcl_raw)
+            regime["walcl_trend"]         = _walcl_data.get("trend", "")
+            regime["walcl_4w_change_pct"] = _walcl_data.get("change_4w_pct", 0)
+            log.info(
+                "WALCL: $%.1fT  4wk_chg=%.2f%%  trend=%s",
+                _walcl_data.get("walcl_billion", 0) / 1000,
+                _walcl_data.get("change_4w_pct", 0),
+                _walcl_data.get("trend", "unknown"),
+            )
+    except Exception as _walcl_exc:
+        log.debug("WALCL Redis read skipped: %s", _walcl_exc)
+
     # Publish to Redis ep:macro for exec node access
     macro_hash: dict = {"ts": str(time.time())}
     for k, v in regime.items():
@@ -724,12 +760,23 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
         )
 
 
-# ── Order-book imbalance filter ────────────────────────────────────────────────
-# Minimum ratio of directional depth to opposing depth before a signal is kept.
-# YES signal: yes_bid_depth / no_bid_depth >= _MIN_OB_IMBALANCE
-# NO  signal: no_bid_depth  / yes_bid_depth >= _MIN_OB_IMBALANCE
-# Set to 0.0 via env to disable (passes all signals through).
-_MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "0.70"))
+# ── Order-book imbalance filter + confidence scaler ───────────────────────────
+# Imbalance = directional_depth / opposing_depth.
+# YES signal: yes_bid_depth / no_bid_depth
+# NO  signal: no_bid_depth  / yes_bid_depth
+#
+# Hard floor: signals below _MIN_OB_IMBALANCE are dropped (book actively
+# opposes the trade direction).  Set to 0.0 via env to disable entirely.
+#
+# Continuous scaling: passing signals get a confidence multiplier derived from
+# how far imbalance is above/below neutral (1.0):
+#   imbalance = _MIN_OB_IMBALANCE → × _OB_CONF_FLOOR_MULT (mild penalty)
+#   imbalance = 1.0               → × 1.0 (neutral)
+#   imbalance = _OB_CONF_PEAK_IMB → × _OB_CONF_PEAK_MULT (capped boost)
+_MIN_OB_IMBALANCE   = float(os.getenv("MIN_OB_IMBALANCE",    "0.70"))
+_OB_CONF_FLOOR_MULT = float(os.getenv("OB_CONF_FLOOR_MULT",  "0.90"))  # mult at hard floor
+_OB_CONF_PEAK_MULT  = float(os.getenv("OB_CONF_PEAK_MULT",   "1.15"))  # cap for strong book
+_OB_CONF_PEAK_IMB   = float(os.getenv("OB_CONF_PEAK_IMB",    "3.00"))  # imbalance at cap
 
 # ── BTC realized-vol threshold adjuster ────────────────────────────────────────
 # Rolling in-memory price buffer — no Redis read needed; populated each cycle.
@@ -743,22 +790,23 @@ async def _enrich_orderbook_imbalance(
     min_imb: float = _MIN_OB_IMBALANCE,
 ) -> List[Signal]:
     """
-    Fetch Kalshi orderbooks for candidate signals and drop those where the
-    order book pushes against the signal direction.
+    Fetch Kalshi orderbooks for candidate signals.  Two effects:
 
-    Kalshi orderbook structure:
-      {"orderbook": {"yes": [[price_cents, qty], ...],
-                     "no":  [[price_cents, qty], ...]}}
+    1. Hard drop: signals where imbalance < min_imb are removed (book actively
+       opposes the trade — the opposing side has materially more depth).
 
-    yes[] = bids to buy YES (bullish pressure)
-    no[]  = bids to buy NO  (bearish / sell-YES pressure)
+    2. Confidence scaling: passing signals have sig.confidence multiplied by a
+       factor derived from how strongly the book supports the trade direction.
+       The multiplier is piecewise-linear:
+         imbalance = min_imb  →  × _OB_CONF_FLOOR_MULT  (mild penalty)
+         imbalance = 1.0      →  × 1.0                  (neutral)
+         imbalance ≥ peak_imb →  × _OB_CONF_PEAK_MULT   (capped boost)
+       Because confidence feeds directly into Kelly sizing, a book imbalance of
+       3:1 in your favour meaningfully increases position size; one at the floor
+       slightly reduces it.
 
-    For a YES signal: yes_depth / no_depth must be >= min_imb.
-    For a NO  signal: no_depth  / yes_depth must be >= min_imb.
-
-    Arb-pair signals (arb_partner set) are passed through without filtering
-    — they're balance-neutral by construction.
-    Signals with no orderbook data (API error) are also passed through.
+    Arb-pair signals (arb_partner set) bypass both effects — balance-neutral.
+    Signals with no orderbook data (API error) pass through unchanged.
     """
     if not signals or min_imb <= 0.0:
         return signals
@@ -787,23 +835,20 @@ async def _enrich_orderbook_imbalance(
     kept = []
     for sig, ob in zip(to_check, books):
         if ob is None:
-            # No data — don't block the signal
-            kept.append(sig)
+            kept.append(sig)   # no data — pass through unchanged
             continue
 
         book       = ob.get("orderbook", {})
         yes_levels = book.get("yes", [])   # YES bids: [[price, qty], ...]
         no_levels  = book.get("no",  [])   # NO  bids: [[price, qty], ...]
 
-        # Sum top-5 levels; qty is element [1] of each pair
         yes_depth = sum(int(row[1]) for row in yes_levels[:5]) if yes_levels else 0
         no_depth  = sum(int(row[1]) for row in no_levels[:5])  if no_levels  else 0
 
-        # Populate existing book_depth field with total visible liquidity
         sig.book_depth = yes_depth + no_depth
 
         if yes_depth == 0 and no_depth == 0:
-            kept.append(sig)   # empty book — don't block
+            kept.append(sig)   # empty book — pass through unchanged
             continue
 
         imbalance = (
@@ -811,14 +856,32 @@ async def _enrich_orderbook_imbalance(
             else no_depth  / max(yes_depth, 1)
         )
 
-        if imbalance >= min_imb:
-            kept.append(sig)
-        else:
+        if imbalance < min_imb:
             log.info(
-                "OB filter dropped %-38s  side=%-3s  imbalance=%.2f < %.2f"
-                "  (yes_depth=%d  no_depth=%d)",
+                "OB dropped  %-38s  side=%-3s  imbalance=%.2f < %.2f"
+                "  (yes=%d  no=%d)",
                 sig.ticker[:38], sig.side, imbalance, min_imb, yes_depth, no_depth,
             )
+            continue
+
+        # Piecewise-linear confidence multiplier
+        if imbalance <= 1.0:
+            t    = (imbalance - min_imb) / max(1.0 - min_imb, 1e-9)
+            mult = _OB_CONF_FLOOR_MULT + t * (1.0 - _OB_CONF_FLOOR_MULT)
+        else:
+            t    = min(1.0, (imbalance - 1.0) / max(_OB_CONF_PEAK_IMB - 1.0, 1e-9))
+            mult = 1.0 + t * (_OB_CONF_PEAK_MULT - 1.0)
+
+        old_conf       = sig.confidence
+        sig.confidence = max(0.10, min(0.99, sig.confidence * mult))
+
+        log.debug(
+            "OB scale    %-38s  side=%-3s  imbalance=%.2f  mult=%.3f"
+            "  conf %.2f→%.2f  (yes=%d  no=%d)",
+            sig.ticker[:38], sig.side, imbalance, mult,
+            old_conf, sig.confidence, yes_depth, no_depth,
+        )
+        kept.append(sig)
 
     return kept + arb
 
@@ -988,6 +1051,24 @@ async def _exec_watchdog_loop(bus: RedisBus, interval: int = 60) -> None:
                 if stale_count > 0:
                     log.info("Exec watchdog: exec recovered (exec_age=%.0fs)", exec_age_s)
                 stale_count = 0
+
+            # Mark exec_heartbeat OK if exec node published a HEARTBEAT recently.
+            try:
+                _sys_entries = await bus._r.xrevrange("ep:system", count=20)
+                for _eid, _fields in _sys_entries:
+                    _raw = _fields.get("payload") or _fields.get(b"payload")
+                    if not _raw:
+                        continue
+                    _ev = json.loads(_raw)
+                    if (_ev.get("event_type") == "HEARTBEAT"
+                            and str(_ev.get("node", "")).startswith("exec")):
+                        _hb_age = (time.time() * 1_000_000 - float(_ev.get("ts_us", 0))) / 1_000_000
+                        if _hb_age < 180:
+                            from ep_health import health as _wdg_health
+                            _wdg_health.mark_ok("exec_heartbeat", f"hb {_hb_age:.0f}s ago")
+                        break
+            except Exception:
+                pass
 
         except Exception as exc:
             log.debug("Exec watchdog error: %s", exc)
@@ -1211,11 +1292,13 @@ async def intel_main() -> None:
             # gates and Kelly sizing reflect the actual capital on hand.
             # Only skip the network call when there are no real credentials.
             balance_cents = 100_000   # fallback ($1,000) if fetch not possible
+            _portfolio_value_cents = 0
             if cfg.API_KEY_ID:
                 try:
-                    bal                  = client.get("/portfolio/balance")
-                    balance_cents        = bal.get("balance", 0)
-                    _last_balance_cents  = balance_cents   # save for fallback
+                    bal                       = client.get("/portfolio/balance")
+                    balance_cents             = bal.get("balance", 0)
+                    _portfolio_value_cents    = bal.get("portfolio_value", 0)
+                    _last_balance_cents       = balance_cents   # save for fallback
                 except Exception:
                     if _last_balance_cents is not None:
                         balance_cents = _last_balance_cents
@@ -1226,7 +1309,7 @@ async def intel_main() -> None:
                         # keep balance_cents = 100_000 as safe fallback
             if balance_cents is not None:
                 state.set_balance(balance_cents)
-                await bus.set_balance(balance_cents, state.mode)
+                await bus.set_balance(balance_cents, state.mode, _portfolio_value_cents)
                 metrics.update_balance(balance_cents)
 
             # ── Coinbase balance (USD + BTC holdings) ─────────────────────────
@@ -1346,7 +1429,25 @@ async def intel_main() -> None:
                                     f"ws={len(snapshot.prices)} rest={len(_kxfed_snap)}")
             else:
                 _src_health.mark_fail("kalshi_ws", "no prices from WS or REST")
+            if _redis_has_prices:
+                _src_health.mark_ok("kalshi_rest", f"{len(_kxfed_snap)} tickers via REST")
             _src_health.mark_ok("redis")
+            # Mark exec_heartbeat OK if exec node published a fresh HEARTBEAT.
+            try:
+                _exec_sys = await bus._r.xrevrange("ep:system", count=20)
+                for _eid, _eflds in _exec_sys:
+                    _epayload = _eflds.get("payload") or _eflds.get(b"payload")
+                    if not _epayload:
+                        continue
+                    _eev = json.loads(_epayload)
+                    if (_eev.get("event_type") == "HEARTBEAT"
+                            and str(_eev.get("node", "")).startswith("exec")):
+                        _ehb_age = (time.time() * 1_000_000 - float(_eev.get("ts_us", 0))) / 1_000_000
+                        if _ehb_age < 180:
+                            _src_health.mark_ok("exec_heartbeat", f"hb {_ehb_age:.0f}s ago")
+                        break
+            except Exception:
+                pass
             _src_health.log_cycle_summary()
 
             # ── Redis config overrides (dashboard writes these to ep:config) ────
@@ -1355,6 +1456,7 @@ async def intel_main() -> None:
             _ov_conf   = await bus.get_config_override("override_min_confidence")
             _ov_hbc    = await bus.get_config_override("override_hours_before_close")
             _ov_rate   = await bus.get_config_override("CURRENT_FED_RATE")
+            _ov_myep   = await bus.get_config_override("override_min_yes_entry_price")
 
             try:
                 edge_threshold = float(_ov_edge) if _ov_edge else cfg.EDGE_THRESHOLD
@@ -1405,6 +1507,13 @@ async def intel_main() -> None:
             # no asyncio.run() wrapper needed (or allowed) here.
             signals: List[Signal] = []
             try:
+                _min_yep: Optional[float] = None
+                if _ov_myep:
+                    try:
+                        _min_yep = float(_ov_myep)
+                    except (ValueError, TypeError):
+                        log.warning("Malformed override_min_yes_entry_price=%r — using default", _ov_myep)
+
                 signals = await asyncio.wait_for(
                     fetch_signals_async(
                         client               = client,
@@ -1422,54 +1531,55 @@ async def intel_main() -> None:
                         enable_gdp           = os.getenv("ENABLE_GDP", "true") == "true",
                         markets_cache        = markets_cache,
                         btc_spot             = btc_strategy.last_spot if btc_strategy else None,
+                        min_yes_entry_price  = _min_yep,
                     ),
                     timeout=90.0,
                 )
             except asyncio.TimeoutError:
                 log.warning("Signal generation timeout (>90s) — using partial results (signals=[])")
                 signals = []
-
-                # ── Orderbook imbalance filter ─────────────────────────────────
-                # Drop signals where the live order book contradicts the direction
-                # (e.g., a YES signal when NO buyers outnumber YES buyers ≥ 1.4×).
-                # Runs after strategy filtering so we only hit the orderbook API
-                # for the small set of already-qualified candidates.
-                if signals:
-                    _before = len(signals)
-                    signals = await _enrich_orderbook_imbalance(signals, client)
-                    _dropped = _before - len(signals)
-                    if _dropped:
-                        log.info("OB filter: dropped %d/%d signals (imbalance)", _dropped, _before)
-
-                # ── Behavioral adjustments (late-money + recency bias) ─────────
-                # Applied after OB filter so adjustments only hit candidate signals.
-                for _sig in signals:
-                    # Late-money spike: accelerating volume → market may be crowded
-                    _cur_vol = _market_vol_map.get(_sig.ticker, 0.0)
-                    if is_late_money_spike(_sig.ticker, _cur_vol):
-                        _sig.confidence = max(0.10, _sig.confidence * 0.90)
-                        log.info(
-                            "Late-money spike: %-38s  confidence → %.2f",
-                            _sig.ticker[:38], _sig.confidence,
-                        )
-                    # Recency bias: recent surprise outcome → temper fair value
-                    _series = _sig.ticker.split("-")[0] if "-" in _sig.ticker else _sig.ticker
-                    _bias   = await recency_bias_adj(_series, bus)
-                    if _bias != 0.0:
-                        _sig.fair_value = max(0.01, min(0.99, _sig.fair_value + _bias))
-                        _sig.edge       = _sig.fair_value - _sig.market_price
-
-                state.set_signals([{
-                    "ticker":       s.ticker,       "side":        s.side,
-                    "fair_value":   s.fair_value,   "market_price": s.market_price,
-                    "edge":         s.edge,         "confidence":  s.confidence,
-                    "contracts":    s.contracts,    "model_source": s.model_source,
-                    "spread_cents": s.spread_cents,
-                } for s in signals])
-                for s in signals:
-                    state.update_fair_value(s.ticker, s.fair_value, s.edge, s.confidence)
             except Exception:
                 log.exception("Signal generation failed.")
+
+            # ── Orderbook imbalance filter ─────────────────────────────────
+            # Drop signals where the live order book contradicts the direction
+            # (e.g., a YES signal when NO buyers outnumber YES buyers ≥ 1.4×).
+            # Runs after strategy filtering so we only hit the orderbook API
+            # for the small set of already-qualified candidates.
+            if signals:
+                _before = len(signals)
+                signals = await _enrich_orderbook_imbalance(signals, client)
+                _dropped = _before - len(signals)
+                if _dropped:
+                    log.info("OB filter: dropped %d/%d signals (imbalance)", _dropped, _before)
+
+            # ── Behavioral adjustments (late-money + recency bias) ─────────
+            # Applied after OB filter so adjustments only hit candidate signals.
+            for _sig in signals:
+                # Late-money spike: accelerating volume → market may be crowded
+                _cur_vol = _market_vol_map.get(_sig.ticker, 0.0)
+                if is_late_money_spike(_sig.ticker, _cur_vol):
+                    _sig.confidence = max(0.10, _sig.confidence * 0.90)
+                    log.info(
+                        "Late-money spike: %-38s  confidence → %.2f",
+                        _sig.ticker[:38], _sig.confidence,
+                    )
+                # Recency bias: recent surprise outcome → temper fair value
+                _series = _sig.ticker.split("-")[0] if "-" in _sig.ticker else _sig.ticker
+                _bias   = await recency_bias_adj(_series, bus)
+                if _bias != 0.0:
+                    _sig.fair_value = max(0.01, min(0.99, _sig.fair_value + _bias))
+                    _sig.edge       = _sig.fair_value - _sig.market_price
+
+            state.set_signals([{
+                "ticker":       s.ticker,       "side":        s.side,
+                "fair_value":   s.fair_value,   "market_price": s.market_price,
+                "edge":         s.edge,         "confidence":  s.confidence,
+                "contracts":    s.contracts,    "model_source": s.model_source,
+                "spread_cents": s.spread_cents,
+            } for s in signals])
+            for s in signals:
+                state.update_fair_value(s.ticker, s.fair_value, s.edge, s.confidence)
 
             # ── Publish REST-derived Kalshi prices to Redis ───────────────────
             # The WebSocket only delivers ticks when a trade occurs.  On thin
@@ -1651,10 +1761,75 @@ async def intel_main() -> None:
                     _move_now, _move_fomc_count,
                 )
 
+            # ── SOFR rate fusion for FOMC directional signals ─────────────────
+            # SOFR SR1 (1-month futures) implies near-term Fed policy.  When
+            # the futures-implied rate diverges ≥ 15 bps from current fed_rate,
+            # it corroborates the directional bias → cap-boost to 0.85 confidence.
+            # Alignment: SOFR-implied higher → market expects hike → boosts YES-above.
+            try:
+                _sofr_raw = await bus._r.get("ep:sofr:sr1")
+                if _sofr_raw:
+                    _sofr_data    = json.loads(_sofr_raw)
+                    _sofr_implied = float(_sofr_data.get("implied_rate_pct", 0))
+                    _sofr_delta   = _sofr_implied - current_fed_rate
+                    _sofr_count   = 0
+                    for s in signals:
+                        if s.category != "fomc" or s.model_source.endswith("_arb"):
+                            continue
+                        _tup = s.ticker.upper()
+                        if "ABOVE" in _tup and _sofr_delta >= 0.15:
+                            s.confidence = round(min(0.85, s.confidence * 1.08), 3)
+                            _sofr_count += 1
+                        elif "BELOW" in _tup and _sofr_delta <= -0.15:
+                            s.confidence = round(min(0.85, s.confidence * 1.08), 3)
+                            _sofr_count += 1
+                    if _sofr_count:
+                        log.info(
+                            "SOFR SR1 implied %.2f%% (Δ%+.2f vs fed_rate %.2f%%) "
+                            "→ fused into %d FOMC directional signal(s)",
+                            _sofr_implied, _sofr_delta, current_fed_rate, _sofr_count,
+                        )
+            except Exception as _sofr_exc:
+                log.debug("SOFR fusion skipped: %s", _sofr_exc)
+
+            # ── Treasury auction proximity suppression ────────────────────────
+            # 10Y/30Y auctions create large duration supply that disrupts rate
+            # markets; skip new FOMC directional signals within 24 h of such an
+            # auction.  Arb and coherence signals are structural and are always kept.
+            def _is_structural_signal(s) -> bool:
+                ms = getattr(s, "model_source", "") or ""
+                return ms.endswith("_arb") or "coherence" in ms
+            try:
+                _auct_raw = await bus._r.get("ep:treasury_auctions")
+                if _auct_raw:
+                    _auct_data  = json.loads(_auct_raw)
+                    _suppressed = [
+                        a for a in _auct_data.get("upcoming_24h", [])
+                        if a.get("tenor") in ("10-Year", "30-Year")
+                    ]
+                    if _suppressed:
+                        _auc_count = sum(
+                            1 for s in signals
+                            if s.category == "fomc" and not _is_structural_signal(s)
+                        )
+                        signals = [
+                            s for s in signals
+                            if not (s.category == "fomc"
+                                    and not _is_structural_signal(s))
+                        ]
+                        _tickers_str = ", ".join(a.get("tenor", "?") for a in _suppressed)
+                        log.warning(
+                            "Treasury auction proximity: %s within 24h "
+                            "— dropped %d FOMC directional signal(s), arb+coherence kept",
+                            _tickers_str, _auc_count,
+                        )
+            except Exception as _auct_exc:
+                log.debug("Treasury auction suppression skipped: %s", _auct_exc)
+
             # ── FOMC announcement day blackout ────────────────────────────────
             # On meeting days, Kalshi prices whipsaw around the 2pm ET announcement.
             # Suppress new FOMC directional signals for ±N hours around 18:00 UTC.
-            # Arb signals are structural and are always kept.
+            # Arb and coherence signals are structural and are always kept.
             _blackout_hours = int(os.getenv("FOMC_ANNOUNCE_BLACKOUT_HOURS", "2"))
             if _blackout_hours > 0:
                 import kalshi_bot.models.fomc as _fomc_mod
@@ -1669,15 +1844,15 @@ async def intel_main() -> None:
                 if _in_blackout:
                     _bl_count = sum(
                         1 for s in signals
-                        if s.category == "fomc" and not s.model_source.endswith("_arb")
+                        if s.category == "fomc" and not _is_structural_signal(s)
                     )
                     signals = [
                         s for s in signals
-                        if not (s.category == "fomc" and not s.model_source.endswith("_arb"))
+                        if not (s.category == "fomc" and not _is_structural_signal(s))
                     ]
                     log.warning(
                         "FOMC announcement blackout active (%s ±%dh of %02d:00 UTC)"
-                        " — suppressed %d directional signal(s), arb kept",
+                        " — suppressed %d directional signal(s), arb+coherence kept",
                         _today_str, _blackout_hours, _ANNOUNCE_HOUR, _bl_count,
                     )
 
@@ -1701,6 +1876,48 @@ async def intel_main() -> None:
                     new_signals.append(_ps)
             if _poly_sigs:
                 log.info("Polymarket: %d divergence signal(s) added", len(_poly_sigs))
+
+            # ── Econ consensus edge filter ─────────────────────────────────────
+            # Drop economic signals where the indicator is within 0.3σ of consensus
+            # — the market already priced this; no differentiated edge to capture.
+            try:
+                _cons_raw = await bus._r.get("ep:econ_consensus")
+                if _cons_raw:
+                    _cons_events = json.loads(_cons_raw).get("events", [])
+                    if _cons_events:
+                        _cons_pre  = len(new_signals)
+                        _kept_sigs = []
+                        for _s in new_signals:
+                            if _s.category not in ("economic", "fomc_economic"):
+                                _kept_sigs.append(_s)
+                                continue
+                            _t_up = _s.ticker.upper()
+                            _match = next(
+                                (e for e in _cons_events
+                                 if e.get("indicator", "").upper() in _t_up
+                                 or _t_up in e.get("indicator", "").upper()),
+                                None,
+                            )
+                            if not _match:
+                                _kept_sigs.append(_s)
+                                continue
+                            _dev_sigma = float(_match.get("deviation_sigma", 1.0))
+                            if abs(_dev_sigma) < 0.3:
+                                log.info(
+                                    "Consensus filter: dropped %s (σ=%.2f, indicator=%s)",
+                                    _s.ticker, _dev_sigma, _match.get("indicator"),
+                                )
+                            else:
+                                _kept_sigs.append(_s)
+                        new_signals = _kept_sigs
+                        _removed = _cons_pre - len(new_signals)
+                        if _removed:
+                            log.info(
+                                "Econ consensus filter: removed %d signal(s) within 0.3σ",
+                                _removed,
+                            )
+            except Exception as _cons_exc:
+                log.debug("Consensus filter skipped: %s", _cons_exc)
 
             # ── Improvement 5: Cross-meeting Bayes coherence arbitrage ────────
             def _market_mid(m: dict) -> float:
@@ -1756,6 +1973,58 @@ async def intel_main() -> None:
             except Exception as _exc:
                 log.warning("election_ensemble scan failed: %s", _exc)
 
+            # ── PredictIt divergence scanner (Redis-cached) ───────────────────
+            # Compare cached PredictIt prices to live Kalshi prices for Fed/macro
+            # markets.  Generates divergence signals where spread ≥ 5¢.
+            # Runs in parallel to Polymarket — catches cross-venue mispricings.
+            try:
+                _pi_cache_raw = await bus._r.get("ep:predictit:markets")
+                if _pi_cache_raw:
+                    _pi_markets   = json.loads(_pi_cache_raw).get("markets", [])
+                    _pi_price_map: dict = {}
+                    for _pim in _pi_markets:
+                        _pi_yes = float(_pim.get("yes_price", 0) or 0)
+                        if _pi_yes > 0:
+                            _pi_key = _pim.get("name", "").upper().replace(" ", "_")
+                            _pi_price_map[_pi_key] = _pi_yes
+
+                    _pi_div_count = 0
+                    _kalshi_mid_map: dict = {
+                        m.get("ticker", ""): _market_mid(m) * 100
+                        for m in markets_cache if m.get("ticker", "")
+                    }
+                    for _k_ticker, _k_price in _kalshi_mid_map.items():
+                        _k_up = _k_ticker.upper()
+                        if not any(kw in _k_up for kw in ("FED", "KXFED")):
+                            continue
+                        for _pi_slug, _pi_yes in _pi_price_map.items():
+                            if not any(kw in _pi_slug for kw in ("FED", "RATE", "FOMC", "HIKE", "CUT")):
+                                continue
+                            _spread_c = abs(_k_price - _pi_yes)
+                            if _spread_c < 5.0 or _k_ticker in current_positions:
+                                continue
+                            _side = "no" if _k_price > _pi_yes else "yes"
+                            _pi_msg = SignalMessage(
+                                ticker       = _k_ticker,
+                                side         = _side,
+                                confidence   = round(min(0.72, 0.60 + _spread_c / 200.0), 3),
+                                edge         = round(_spread_c / 100.0, 4),
+                                fair_value   = round(_pi_yes / 100.0, 4),
+                                market_price = round(_k_price / 100.0, 4),
+                                contracts    = 1,
+                                strategy     = "predictit_divergence",
+                                asset_class  = "fomc",
+                                model_source = "predictit_divergence",
+                                source_node  = NODE_ID,
+                            )
+                            new_signals.append(_pi_msg)
+                            _pi_div_count += 1
+                            break   # one signal per Kalshi ticker
+                    if _pi_div_count:
+                        log.info("PredictIt divergence: %d signal(s) added", _pi_div_count)
+            except Exception as _pi_exc:
+                log.debug("PredictIt divergence scanner skipped: %s", _pi_exc)
+
             # ── Improvement 8: BLS release pre-positioning ────────────────────
             try:
                 from kalshi_bot.strategy import scan_bls_preposition
@@ -1779,6 +2048,31 @@ async def intel_main() -> None:
                     log.info("BLS pre-position: %d strangle leg(s) published", len(_bls_sigs))
             except Exception as _exc:
                 log.warning("bls_preposition scan failed: %s", _exc)
+
+            # ── BTC datasource pre-reads (cross-exchange gate + Deribit skew) ──
+            _btc_spread_bps    = 0.0
+            _btc_spread_gate   = True   # True = signals allowed
+            _deribit_skew_pct  = 0.0
+            try:
+                _cx_raw = await bus._r.get("ep:btc:cross_exchange")
+                if _cx_raw:
+                    _cx_data         = json.loads(_cx_raw)
+                    _btc_spread_bps  = float(_cx_data.get("spread_bps", 0))
+                    if _btc_spread_bps > 15.0:
+                        _btc_spread_gate = False
+                        log.warning(
+                            "BTC cross-exchange spread=%.1f bps > 15 "
+                            "— mean-reversion signals suppressed (fragmented market)",
+                            _btc_spread_bps,
+                        )
+            except Exception as _cx_exc:
+                log.debug("BTC cross-exchange gate read failed: %s", _cx_exc)
+            try:
+                _deribit_raw = await bus._r.get("ep:deribit:skew")
+                if _deribit_raw:
+                    _deribit_skew_pct = float(json.loads(_deribit_raw).get("skew_pct", 0))
+            except Exception as _der_exc:
+                log.debug("Deribit skew read failed: %s", _der_exc)
 
             # ── BTC mean-reversion signals ────────────────────────────────────
             if btc_strategy:
@@ -1809,6 +2103,27 @@ async def intel_main() -> None:
                     )
                     # Dedup: skip BTC-USD if already held
                     new_btc = [m for m in btc_msgs if m.ticker not in current_positions]
+
+                    # Gate: suppress signals when cross-exchange spread too wide
+                    if not _btc_spread_gate and new_btc:
+                        log.info(
+                            "BTC spread gate: suppressed %d signal(s) (spread=%.1f bps)",
+                            len(new_btc), _btc_spread_bps,
+                        )
+                        new_btc = []
+
+                    # Deribit skew: adjust BTC signal confidence based on options market
+                    # Positive skew (put IV > call IV) → bearish tilt → penalize YES signals
+                    if abs(_deribit_skew_pct) >= 3.0 and new_btc:
+                        for _bm in new_btc:
+                            if _deribit_skew_pct > 5.0 and _bm.side == "yes":
+                                _bm.confidence = round(_bm.confidence * 0.90, 3)
+                            elif _deribit_skew_pct < -3.0 and _bm.side == "no":
+                                _bm.confidence = round(_bm.confidence * 0.95, 3)
+                        log.debug(
+                            "Deribit skew=%.1f%% applied to %d BTC signal(s)",
+                            _deribit_skew_pct, len(new_btc),
+                        )
 
                     # Publish BTC price + indicators to Redis for Exec exit checks
                     if btc_strategy.last_spot:
@@ -1859,6 +2174,19 @@ async def intel_main() -> None:
                 for m in (*markets_cache, *fomc_cache)
             }
 
+            # ── Priority ordering: arb first, coherence second, directional last ─
+            def _signal_priority(s) -> int:
+                ms = getattr(s, "model_source", "") or ""
+                if (getattr(s, "category", "") == "arb"
+                        or getattr(s, "arb_legs", None) is not None
+                        or ms.endswith("_arb")):
+                    return 1
+                if "coherence" in ms:
+                    return 2
+                return 3
+
+            new_signals.sort(key=_signal_priority)
+
             published = 0
             for sig in new_signals:
                 try:
@@ -1872,6 +2200,8 @@ async def intel_main() -> None:
                             msg.close_time = _mkt.get("close_time") or _mkt.get("expiration_time")
                         except Exception:
                             pass
+
+                    msg.priority = _signal_priority(sig)
 
                     # ── Fix 1: adjust edge to ask price, not mid ───────────────
                     # market_price is the mid; actual fill costs the ask.

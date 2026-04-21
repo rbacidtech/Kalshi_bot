@@ -147,15 +147,19 @@ class RedisBus:
                 )
                 if not results:
                     continue
+                _batch: list = []
                 for _stream, entries in results:
                     for entry_id, mapping in entries:
                         try:
                             sig = SignalMessage.from_redis(mapping)
-                            yield entry_id, sig
+                            _batch.append((entry_id, sig))
                         except Exception as exc:
                             log.warning("Malformed signal %s — acking and skipping: %s",
                                         entry_id, exc)
                             await self.ack_signal(entry_id)
+                _batch.sort(key=lambda x: getattr(x[1], "priority", 3))
+                for entry_id, sig in _batch:
+                    yield entry_id, sig
 
             except aioredis.ResponseError as exc:
                 if "NOGROUP" in str(exc):
@@ -321,11 +325,12 @@ class RedisBus:
 
     # ── Balance state ─────────────────────────────────────────────────────────
 
-    async def set_balance(self, balance_cents: int, mode: str) -> None:
+    async def set_balance(self, balance_cents: int, mode: str, portfolio_value_cents: int = 0) -> None:
         await self._r.hset(EP_BALANCE, self.node_id, json.dumps({
-            "balance_cents": balance_cents,
-            "mode":          mode,
-            "ts_us":         int(time.time() * 1_000_000),
+            "balance_cents":         balance_cents,
+            "portfolio_value_cents": portfolio_value_cents,
+            "mode":                  mode,
+            "ts_us":                 int(time.time() * 1_000_000),
         }))
 
     async def get_all_balances(self) -> Dict[str, dict]:

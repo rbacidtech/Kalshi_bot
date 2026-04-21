@@ -1,0 +1,37 @@
+[Unit]
+Description=EdgePulse Exec Node (order execution)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/root/EdgePulse/.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/EdgePulse/.venv/bin/python3 -u ep_exec.py
+
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Resource limits
+MemoryMax=1500M
+MemoryHigh=1200M
+CPUQuota=150%
+
+# Watchdog
+WatchdogSec=300
+
+# Logging
+StandardOutput=append:/root/EdgePulse/output/logs/exec.log
+StandardError=append:/root/EdgePulse/output/logs/exec.log
+SyslogIdentifier=ep-exec
+
+# Security
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

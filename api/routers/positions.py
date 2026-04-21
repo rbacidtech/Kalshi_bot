@@ -118,18 +118,29 @@ async def get_positions(
         # Balance from Redis (intel node publishes each cycle)
         raw_balance = await r.hgetall("ep:balance")
         balance_cents: Optional[int] = None
+        portfolio_value_cents: Optional[int] = None
         for k, v in raw_balance.items():
             key = k.decode() if isinstance(k, bytes) else k
             if "intel" in key.lower() or "kalshi" in key.lower():
                 try:
-                    balance_cents = int(json.loads(v).get("balance_cents", 0))
+                    parsed = json.loads(v)
+                    balance_cents = int(parsed.get("balance_cents", 0))
+                    pv = parsed.get("portfolio_value_cents")
+                    if pv is not None:
+                        portfolio_value_cents = int(pv)
                     break
                 except Exception:
                     pass
 
-        # True portfolio value = available cash + current market value of positions
-        # (current market value = cost_basis + unrealized_pnl)
-        total_value = (balance_cents + total_deployed + total_unrealized) if balance_cents is not None else None
+        # True portfolio value: use Kalshi's own portfolio_value when available
+        # (balance = available cash, portfolio_value = open position market value)
+        if balance_cents is not None:
+            if portfolio_value_cents is not None:
+                total_value = balance_cents + portfolio_value_cents
+            else:
+                total_value = balance_cents + total_deployed + total_unrealized
+        else:
+            total_value = None
 
         return PortfolioResponse(
             positions                  = sorted(positions, key=lambda p: p.ticker),

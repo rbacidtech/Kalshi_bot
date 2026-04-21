@@ -27,11 +27,12 @@ from ep_bus import RedisBus
 from ep_positions import PositionStore
 from ep_risk import UnifiedRiskEngine
 from ep_adapters import message_to_kalshi_signal
-from ep_coinbase import CoinbaseTradeClient
+from ep_coinbase import CoinbaseTradeClient, fetch_btc_spot_usd
 from ep_risk import BTC_UNIT
 from ep_metrics import metrics
 from ep_telegram import telegram
 from ep_resolution_db import ResolutionDB, poll_resolutions_loop
+from kalshi_bot.executor import ArbRollbackFailed
 
 
 def _safe_key(ticker: str) -> str:
@@ -81,6 +82,14 @@ _kalshi_api_failure_ts: float = 0.0      # time of first failure in current run
 # ── Resting order TTL ─────────────────────────────────────────────────────────
 _RESTING_ORDER_MAX_HOURS = 4
 
+# ── Exit TIF escalation ────────────────────────────────────────────────────────
+# If a live exit limit order hasn't filled in _EXIT_TIF_STEP_MINUTES, replace
+# it with a new limit _EXIT_TIF_WIDEN_CENTS lower (more aggressive sell).
+# Repeat up to _EXIT_TIF_MAX_STEPS times, then hold at the final price.
+_EXIT_TIF_STEP_MINUTES = int(os.getenv("EXIT_TIF_STEP_MINUTES", "30"))
+_EXIT_TIF_WIDEN_CENTS  = int(os.getenv("EXIT_TIF_WIDEN_CENTS",  "2"))
+_EXIT_TIF_MAX_STEPS    = int(os.getenv("EXIT_TIF_MAX_STEPS",    "3"))
+
 # ── Per-category exposure limits ──────────────────────────────────────────────
 # Group Kalshi series into macro buckets so a single correlated theme
 # (e.g., three FOMC rate targets) can't dominate the portfolio.
@@ -92,6 +101,45 @@ _CATEGORY_MAP: dict = {
 _MAX_CATEGORY_PCT = 0.60   # 60 % of balance per macro category
 _MAX_SERIES_PCT   = 0.60   # 60 % per series (e.g., all KXFED markets)
 _MAX_MARKET_PCT   = 0.15   # 15 % per single market
+
+# ── Long-game capital cap ─────────────────────────────────────────────────────
+# Positions settling > LONG_GAME_HORIZON_DAYS out are "long-game" bets.
+# Cap them at 30% of balance so 70% stays available for active/daily trading.
+_LONG_GAME_HORIZON_DAYS = int(os.getenv("LONG_GAME_HORIZON_DAYS", "90"))
+_LONG_GAME_MAX_PCT      = float(os.getenv("LONG_GAME_MAX_PCT", "0.30"))
+
+
+def _tiered_take_profit(base_tp: int, hours_remaining: float) -> int:
+    """
+    Scale take-profit threshold down for shorter-dated positions so they
+    behave like active trades rather than hold-to-resolution bets.
+
+    Days to expiry → effective TP:
+      ≤  3 days  (weather/near-expiry) : base ÷ 5  (min 5¢)
+      ≤ 30 days  (next FOMC)           : base ÷ 3  (min 8¢)
+      ≤ 90 days  (Jun–Sep FOMC)        : base ÷ 2  (min 12¢)
+      > 90 days  (long-game)           : full base (hold for larger moves)
+    """
+    days = hours_remaining / 24
+    if days <= 3:   return max(5,  base_tp // 5)
+    if days <= 30:  return max(8,  base_tp // 3)
+    if days <= 90:  return max(12, base_tp // 2)
+    return base_tp
+
+
+def _tiered_trailing_stop(base_ts: int, hours_remaining: float) -> int:
+    """
+    Tighter trailing stops for short-dated positions — protect gains faster
+    when time value is low.
+
+      ≤  3 days : base ÷ 3  (min 3¢)
+      ≤ 30 days : base ÷ 2  (min 5¢)
+      > 30 days : full base
+    """
+    days = hours_remaining / 24
+    if days <= 3:  return max(3, base_ts // 3)
+    if days <= 30: return max(5, base_ts // 2)
+    return base_ts
 
 # ── Near-certain resolution threshold ────────────────────────────────────────
 # When a Kalshi YES price is at or below this threshold (e.g. 8¢), the contract
@@ -164,8 +212,8 @@ async def _process_signal(
     # ── TTL ───────────────────────────────────────────────────────────────────
     if sig.is_expired():
         age_ms = (int(time.time() * 1_000_000) - sig.ts_us) // 1_000
-        log.debug("Discarding expired signal %s (age=%dms > ttl=%dms)",
-                  sig.ticker, age_ms, sig.ttl_ms)
+        log.info("EXPIRED signal %s  age=%dms  ttl=%dms  (bump EP_SIGNAL_TTL_MS if frequent)",
+                 sig.ticker, age_ms, sig.ttl_ms)
         return ExecutionReport(
             signal_id     = sig.signal_id,
             ticker        = sig.ticker,
@@ -300,13 +348,44 @@ async def _process_signal(
     if sig.asset_class == "kalshi" and llm_kal_on == "0":
         return _rejected("LLM_KALSHI_DISABLED")
 
+    # ── Volatility-adjusted sizing multiplier ────────────────────────────────
+    # For economic release markets (GDP, CPI…) the edge quality is asymmetric:
+    # - Pre-release (0–7 days before print): high model uncertainty → size down 30%
+    # - Post-release (0–48h after print): uncertainty resolved → size up 40%
+    # Only applies when ep:econ_release:status is available and the signal is
+    # in the economic Kelly bucket (fred_* / gdp model_source).
+    _vol_multiplier = 1.0
+    _ms = (sig.model_source or "").lower()
+    if "fred_" in _ms or "gdp" in _ms:
+        try:
+            _econ_raw = await bus._r.get("ep:econ_release:status")
+            if _econ_raw:
+                _econ = json.loads(_econ_raw if isinstance(_econ_raw, str) else _econ_raw.decode())
+                _now = datetime.now(timezone.utc)
+                _next_ts = _econ.get("next_time_utc")
+                _last_ts = _econ.get("last_release_ts")
+                if _next_ts:
+                    _next_dt = datetime.fromisoformat(_next_ts.replace("Z", "+00:00"))
+                    _hours_to_release = (_next_dt - _now).total_seconds() / 3600
+                    if 0 < _hours_to_release <= 168:   # within 7 days before release
+                        _vol_multiplier = 0.70
+                        log.debug("vol_multiplier=0.70 (pre-release %.0fh)", _hours_to_release)
+                if _last_ts and _vol_multiplier == 1.0:
+                    _last_dt = datetime.fromisoformat(_last_ts.replace("Z", "+00:00"))
+                    _hours_since = (_now - _last_dt).total_seconds() / 3600
+                    if 0 <= _hours_since <= 48:        # within 48h after print
+                        _vol_multiplier = 1.40
+                        log.debug("vol_multiplier=1.40 (post-release %.0fh ago)", _hours_since)
+        except Exception as _ve:
+            log.debug("vol_multiplier lookup error: %s", _ve)
+
     # ── Kelly sizing ──────────────────────────────────────────────────────────
     # Apply llm_kelly_fraction if the LLM has set one. asyncio is cooperative —
     # no await occurs between the override and restore, so this is race-free.
     orig_kelly = risk_engine._kalshi.cfg.kelly_fraction
     if llm_kelly:
         risk_engine._kalshi.cfg.kelly_fraction = max(0.05, min(0.50, float(llm_kelly)))
-    contracts = risk_engine.size(sig, balance_cents)
+    contracts = risk_engine.size(sig, balance_cents, vol_multiplier=_vol_multiplier)
     risk_engine._kalshi.cfg.kelly_fraction = orig_kelly   # always restore
 
     # Apply LLM scale factor after Kelly sizing (0.5 = half size, 1.5 = +50%)
@@ -389,6 +468,46 @@ async def _process_signal(
                      _sig_cost, balance_cents * _MAX_MARKET_PCT, sig.ticker)
             return _rejected("MARKET_LIMIT")
 
+    # ── Long-game capital cap ─────────────────────────────────────────────────
+    # Positions settling > _LONG_GAME_HORIZON_DAYS out are capped at
+    # _LONG_GAME_MAX_PCT of balance so active/daily capital stays available.
+    if sig.asset_class == "kalshi" and sig.close_time:
+        try:
+            _ct = datetime.fromisoformat(sig.close_time.replace("Z", "+00:00"))
+            _days_out = (_ct - datetime.now(timezone.utc)).total_seconds() / 86400
+            if _days_out > _LONG_GAME_HORIZON_DAYS:
+                _lg_deployed = 0
+                _lg_all = _all_pos if "_all_pos" in dir() else await positions.get_all()
+                for _lp in _lg_all.values():
+                    _lp_ct = _lp.get("close_time", "")
+                    if not _lp_ct:
+                        continue
+                    try:
+                        _lp_exp  = datetime.fromisoformat(_lp_ct.replace("Z", "+00:00"))
+                        _lp_days = (_lp_exp - datetime.now(timezone.utc)).total_seconds() / 86400
+                    except Exception:
+                        continue
+                    if _lp_days > _LONG_GAME_HORIZON_DAYS:
+                        _lp_e = _lp.get("entry_cents", 0)
+                        _lp_c = int(_lp.get("contracts", 0))
+                        _lg_deployed += (100 - _lp_e) * _lp_c if _lp.get("side") == "no" else _lp_e * _lp_c
+                _lg_limit = balance_cents * _LONG_GAME_MAX_PCT
+                if _lg_deployed + _sig_cost > _lg_limit:
+                    _lg_capacity = max(0, int(_lg_limit - _lg_deployed))
+                    _unit = _sig_cost // contracts if contracts > 0 else _sig_cost
+                    _lg_max = max(0, _lg_capacity // _unit) if _unit > 0 else 0
+                    if _lg_max <= 0:
+                        log.info("Long-game cap full (%.0f¢/%.0f¢) — skipping %s (%.0fd out)",
+                                 _lg_deployed, _lg_limit, sig.ticker, _days_out)
+                        return _rejected("LONG_GAME_CAP")
+                    if _lg_max < contracts:
+                        log.info("Long-game cap: trimming %s %d→%d contracts (%.0fd out)",
+                                 sig.ticker, contracts, _lg_max, _days_out)
+                        contracts = _lg_max
+                        _sig_cost = _unit * contracts
+        except Exception as _lg_exc:
+            log.debug("Long-game cap check failed for %s: %s", sig.ticker, _lg_exc)
+
     # ── Risk approval ─────────────────────────────────────────────────────────
     try:
         open_exposure = await positions.total_exposure_cents()
@@ -410,15 +529,16 @@ async def _process_signal(
         else int(sig.market_price * 100)
     )
     await positions.open(
-        ticker      = sig.ticker,
-        side        = sig.side,
-        contracts   = contracts,
-        entry_cents = _entry_cents,
-        fair_value  = sig.fair_value,
-        meeting     = sig.meeting or "",
-        outcome     = sig.outcome or "",
-        close_time  = sig.close_time or "",
-        pending     = True,
+        ticker       = sig.ticker,
+        side         = sig.side,
+        contracts    = contracts,
+        entry_cents  = _entry_cents,
+        fair_value   = sig.fair_value,
+        meeting      = sig.meeting or "",
+        outcome      = sig.outcome or "",
+        close_time   = sig.close_time or "",
+        model_source = sig.model_source or "",
+        pending      = True,
     )
 
     # ── Execute (route by asset class) ───────────────────────────────────────
@@ -457,15 +577,16 @@ async def _process_signal(
                 _entry_c = (100 - _leg_price) if _leg_side == "no" else _leg_price
                 await positions.close(_leg_ticker)   # clear any stale entry first
                 await positions.open(
-                    ticker      = _leg_ticker,
-                    side        = _leg_side,
-                    contracts   = 1,
-                    entry_cents = _entry_c,
-                    fair_value  = sig.fair_value,
-                    meeting     = sig.meeting or "",
-                    outcome     = sig.outcome or "",
-                    close_time  = sig.close_time or "",
-                    pending     = False,
+                    ticker       = _leg_ticker,
+                    side         = _leg_side,
+                    contracts    = 1,
+                    entry_cents  = _entry_c,
+                    fair_value   = sig.fair_value,
+                    meeting      = sig.meeting or "",
+                    outcome      = sig.outcome or "",
+                    close_time   = sig.close_time or "",
+                    model_source = sig.model_source or "",
+                    pending      = False,
                 )
                 await positions.update_fields(_leg_ticker, {
                     "order_id":       _oid,
@@ -477,8 +598,64 @@ async def _process_signal(
                 "[ARB ENTRY] %d legs registered in Redis  arb_id=%s  signal_id=%.8s",
                 len(sig.arb_legs), arb_id, sig.signal_id,
             )
+        except ArbRollbackFailed as _arb_exc:
+            # Partial unwind: some earlier legs are open on Kalshi with no Redis record.
+            # Write each unrecovered leg as an orphaned position so exit_checker can
+            # close it on the next cycle.  Then fire a critical alert so the operator
+            # knows there is untracked exposure that must be resolved.
+            log.error(
+                "ARB ROLLBACK PARTIAL: %d unrecovered leg(s) — writing to Redis as orphaned  "
+                "signal_id=%.8s",
+                len(_arb_exc.unrecovered), sig.signal_id,
+            )
+            for _ot, _os, _ooid in _arb_exc.unrecovered:
+                try:
+                    await positions.close(_ot)   # clear stale entry if any
+                    await positions.open(
+                        ticker       = _ot,
+                        side         = _os,
+                        contracts    = 1,
+                        entry_cents  = 50,        # unknown fill; midpoint is safe default
+                        fair_value   = 0.5,
+                        model_source = "arb_unrecovered",
+                        pending      = False,
+                    )
+                    await positions.update_fields(_ot, {
+                        "order_id":       _ooid,
+                        "fill_confirmed": True,   # we know it filled (cancel returned error)
+                        "arb_unrecovered": True,
+                    })
+                    log.error("Orphaned leg written to Redis: %s %s order_id=%s", _ot, _os, _ooid)
+                except Exception as _we:
+                    log.error("Failed to write orphaned leg %s to Redis: %s", _ot, _we)
+            # Emit critical alert
+            _alert_msg = (
+                f"ARB ROLLBACK PARTIAL: {len(_arb_exc.unrecovered)} unrecovered leg(s) "
+                f"written to Redis as 'arb_unrecovered'. "
+                f"Exit checker will attempt to close. "
+                f"Verify on Kalshi dashboard. signal={sig.signal_id[:8]}"
+            )
+            try:
+                if bus._r:
+                    await bus._r.xadd("ep:alerts", {"payload": json.dumps({
+                        "ts":           datetime.now(timezone.utc).isoformat(),
+                        "severity":     "critical",
+                        "category":     "system",
+                        "title":        "Arb unwind partial — untracked exposure",
+                        "message":      _alert_msg,
+                        "action":       "Check Kalshi dashboard; arb_unrecovered positions queued for exit",
+                        "auto_applied": False,
+                    })}, maxlen=500, approximate=True)
+            except Exception:
+                pass
+            try:
+                from ep_telegram import telegram
+                await telegram.send_alert(f"[CRITICAL] {_alert_msg}", level="critical")
+            except Exception:
+                pass
         except RuntimeError as _arb_exc:
-            log.warning("Multi-leg arb FAILED: %s  signal_id=%.8s", _arb_exc, sig.signal_id)
+            log.warning("Multi-leg arb FAILED (clean rollback): %s  signal_id=%.8s",
+                        _arb_exc, sig.signal_id)
         executed = _arb_ok
     elif sig.asset_class == "kalshi":
         if sig.ticker in executor._positions:
@@ -512,15 +689,16 @@ async def _process_signal(
                     sig.ticker, ex_pos.get("fill_confirmed", False),
                 )
                 await positions.open(
-                    ticker      = sig.ticker,
-                    side        = ex_pos.get("side", "yes"),
-                    contracts   = int(ex_pos.get("contracts", 1)),
-                    entry_cents = int(ex_pos.get("entry_cents", 50)),
-                    fair_value  = float(ex_pos.get("fair_value", 0.5)),
-                    meeting     = ex_pos.get("meeting", ""),
-                    outcome     = ex_pos.get("outcome", ""),
-                    close_time  = ex_pos.get("close_time", ""),
-                    pending     = False,
+                    ticker       = sig.ticker,
+                    side         = ex_pos.get("side", "yes"),
+                    contracts    = int(ex_pos.get("contracts", 1)),
+                    entry_cents  = int(ex_pos.get("entry_cents", 50)),
+                    fair_value   = float(ex_pos.get("fair_value", 0.5)),
+                    meeting      = ex_pos.get("meeting", ""),
+                    outcome      = ex_pos.get("outcome", ""),
+                    close_time   = ex_pos.get("close_time", ""),
+                    model_source = ex_pos.get("model_source", ""),
+                    pending      = False,
                 )
                 await positions.update_fields(sig.ticker, {
                     "order_id":       ex_pos.get("order_id", ""),
@@ -678,14 +856,15 @@ async def _process_signal(
             partner_order_id = executor.execute(partner_sig)
             if partner_order_id:
                 await positions.open(
-                    ticker      = sig.arb_partner,
-                    side        = "no",
-                    contracts   = contracts,
-                    entry_cents = int((1.0 - partner_price) * 100),
-                    fair_value  = 1.0 - sig.fair_value,
-                    meeting     = sig.meeting or "",
-                    outcome     = sig.outcome or "",
-                    close_time  = sig.close_time or "",
+                    ticker       = sig.arb_partner,
+                    side         = "no",
+                    contracts    = contracts,
+                    entry_cents  = int((1.0 - partner_price) * 100),
+                    fair_value   = 1.0 - sig.fair_value,
+                    meeting      = sig.meeting or "",
+                    outcome      = sig.outcome or "",
+                    close_time   = sig.close_time or "",
+                    model_source = sig.model_source or "",
                 )
                 await positions.update_fields(sig.arb_partner, {
                     "order_id":       partner_order_id,
@@ -1024,9 +1203,12 @@ async def _exit_checker(
                 log.debug("Cut-loss consumer error (non-fatal): %s", _cle)
 
             # ── Redis config overrides (written by dashboard → ep:config) ─────
-            _ov_tp  = await bus.get_config_override("override_take_profit_cents")
-            _ov_sl  = await bus.get_config_override("override_stop_loss_cents")
-            _ov_hbc = await bus.get_config_override("override_hours_before_close")
+            _ov_tp, _ov_sl, _ov_hbc, _ov_ts = await asyncio.gather(
+                bus.get_config_override("override_take_profit_cents"),
+                bus.get_config_override("override_stop_loss_cents"),
+                bus.get_config_override("override_hours_before_close"),
+                bus.get_config_override("override_trailing_stop_cents"),
+            )
             # Guard against zero/negative and malformed overrides.
             # Malformed values (e.g. "abc" written directly via redis-cli) raise
             # ValueError from int(float(x)) — fall back to cfg default and log.
@@ -1045,12 +1227,23 @@ async def _exit_checker(
             except (ValueError, TypeError):
                 log.warning("Malformed override_hours_before_close=%r — using default", _ov_hbc)
                 hours_before_close = cfg.HOURS_BEFORE_CLOSE
+            try:
+                trailing_stop_base = max(1, int(float(_ov_ts))) if _ov_ts else cfg.TRAILING_STOP_CENTS
+            except (ValueError, TypeError):
+                log.warning("Malformed override_trailing_stop_cents=%r — using default", _ov_ts)
+                trailing_stop_base = cfg.TRAILING_STOP_CENTS
 
             tickers     = list(current_positions.keys())
             prices      = await bus.get_prices(tickers)
             stale_cutoff = int(time.time() * 1_000_000) - 300 * 1_000_000   # 5 min
 
             for ticker, pos in current_positions.items():
+                # ── Skip positions already queued for exit ────────────────────
+                # exit_order_id is being polled in _fill_poll_loop.
+                # Do not trigger a second exit attempt while one is resting.
+                if pos.get("pending_exit"):
+                    continue
+
                 price_data   = prices.get(ticker)
                 stale_price  = (
                     not price_data
@@ -1089,6 +1282,9 @@ async def _exit_checker(
                                     "— closing Redis only",
                                     ticker,
                                 )
+                            # Resolution is final — remove from executor immediately
+                            # rather than waiting for fill poll (market is over).
+                            executor._positions.pop(ticker, None)
                             await positions.close(ticker)
                             _s = pos.get("side", "yes")
                             if _s in ("yes", "buy"):
@@ -1345,21 +1541,26 @@ async def _exit_checker(
                         except (ValueError, TypeError):
                             pass
 
+                # ── Hours to close (for tiered exit thresholds) ───────────────
+                _hours_to_close: float = float("inf")
+                if close_time_str and asset_class == "kalshi":
+                    try:
+                        _htc_dt = datetime.fromisoformat(
+                            close_time_str.replace("Z", "+00:00")
+                        )
+                        _hours_to_close = (
+                            _htc_dt - datetime.now(timezone.utc)
+                        ).total_seconds() / 3600
+                    except Exception:
+                        pass
+
                 # ── Trailing stop ─────────────────────────────────────────────
                 if exit_reason is None:
-                    _ov_ts = await bus.get_config_override("override_trailing_stop_cents")
-                    try:
-                        trailing_stop_cents = (
-                            max(1, int(float(_ov_ts))) if _ov_ts else cfg.TRAILING_STOP_CENTS
-                        )
-                    except (ValueError, TypeError):
-                        log.warning("Malformed override_trailing_stop_cents=%r — using default",
-                                    _ov_ts)
-                        trailing_stop_cents = cfg.TRAILING_STOP_CENTS
+                    trailing_stop_cents = _tiered_trailing_stop(trailing_stop_base, _hours_to_close)
                     if (hwm_pnl >= trailing_stop_cents
                             and (hwm_pnl - move_cents) >= trailing_stop_cents):
                         exit_reason = (
-                            f"trailing_stop (peak={hwm_pnl}¢, now={move_cents}¢)"
+                            f"trailing_stop (peak={hwm_pnl}¢, now={move_cents}¢, ts={trailing_stop_cents}¢)"
                         )
 
                 # ── BTC mean-reversion exit: price crossed back through mid-BB ──
@@ -1430,14 +1631,19 @@ async def _exit_checker(
                     exit_reason = f"cut_loss_intel (signal_reversed, pnl={move_cents:+d}¢)"
 
                 # ── Take-profit / stop-loss ───────────────────────────────────
-                if exit_reason is None and move_cents >= take_profit_cents:
-                    exit_reason = f"take_profit (+{move_cents}¢)"
+                _effective_tp = _tiered_take_profit(take_profit_cents, _hours_to_close)
+                if exit_reason is None and move_cents >= _effective_tp:
+                    exit_reason = f"take_profit (+{move_cents}¢, tp={_effective_tp}¢)"
                 elif exit_reason is None and move_cents <= -stop_loss_cents:
                     # Suppress stop-loss within N days of resolution on Kalshi
                     # contracts — prediction markets resolve to 0 or 100¢, so
                     # a correct directional bet should hold through noise.
                     # Hard cap: never suppress if loss exceeds 2× stop (catastrophic).
-                    _near_days = int(os.getenv("KALSHI_NEAR_EXPIRY_NO_STOP_DAYS", "7"))
+                    try:
+                        _nd_override = await bus.get_config_override("kalshi_near_expiry_no_stop_days")
+                        _near_days = int(_nd_override) if _nd_override else int(os.getenv("KALSHI_NEAR_EXPIRY_NO_STOP_DAYS", "7"))
+                    except Exception:
+                        _near_days = int(os.getenv("KALSHI_NEAR_EXPIRY_NO_STOP_DAYS", "7"))
                     _suppress = False
                     _catastrophic = move_cents <= -(stop_loss_cents * 2)
                     if close_time_str and asset_class == "kalshi" and not _catastrophic:
@@ -1534,27 +1740,26 @@ return cnt
                                         ticker, _pc_exc,
                                     )
 
-                        _kalshi_exit_ok = False
+                        _exit_order_id = ""
                         try:
                             # Pass contracts explicitly so _exit_position uses the
                             # right count even when pos["contracts"]=0 (tombstone)
                             # but contracts_filled is set from a prior fill_poll run.
-                            executor._exit_position(
+                            _exit_order_id = executor._exit_position(
                                 ticker,
                                 {**pos, "contracts": contracts},
                                 current_cents,
                                 exit_reason,
                             )
-                            _kalshi_exit_ok = ticker not in executor._positions
                         except KeyError:
                             log.warning(
                                 "Exit: %s not in executor._positions "
                                 "(state divergence — closing Redis entry only)",
                                 ticker,
                             )
-                            _kalshi_exit_ok = True
+                            _exit_order_id = "divergence"  # treat as success
 
-                        if not _kalshi_exit_ok:
+                        if not _exit_order_id:
                             # Kalshi API rejected the exit order. Retain the Redis
                             # position so the exit_checker retries after backoff.
                             # Clear any premature stop-loss cooldown so re-entry is
@@ -1569,7 +1774,30 @@ return cnt
                                 _exit_cooldown.pop(ticker, None)
                             continue
 
-                    await positions.close(ticker)   # only reached on successful exit
+                        # Paper / forced close: close immediately
+                        if _exit_order_id in ("paper", "divergence") or cfg.PAPER_TRADE:
+                            await positions.close(ticker)
+                        else:
+                            # Live exit order placed — don't close yet.
+                            # _fill_poll_loop will confirm the fill and close the
+                            # Redis entry once the limit order executes.
+                            # Also handles TIF escalation if it rests too long.
+                            side_for_offer = pos.get("side", "yes")
+                            _offer = (current_cents if side_for_offer == "yes"
+                                      else (100 - current_cents))
+                            await positions.update_fields(ticker, {
+                                "pending_exit":        True,
+                                "exit_order_id":       _exit_order_id,
+                                "exit_order_placed_at": datetime.now(timezone.utc).isoformat(),
+                                "exit_offer_cents":    _offer,
+                                "exit_reason":         exit_reason,
+                                "exit_widen_count":    0,
+                            })
+                            log.info(
+                                "Exit order resting: %s  offer=%d¢  order_id=%.8s",
+                                ticker, _offer, _exit_order_id,
+                            )
+                            continue  # skip positions.close and arb-group exit below
 
                     # ── Arb-group atomicity: when any leg of a butterfly stops out,
                     # immediately exit all remaining sibling legs sharing the same
@@ -1597,24 +1825,38 @@ return cnt
                                 "[ARB-ATOM] Exiting sibling leg %s  arb_id=%s",
                                 _sib_ticker, _exit_arb_id,
                             )
-                            _sib_ok = False
+                            _sib_oid = ""
                             try:
-                                executor._exit_position(
+                                _sib_oid = executor._exit_position(
                                     _sib_ticker,
                                     {**_sib_pos, "contracts": _sib_cts},
                                     _sib_cents,
                                     _sib_rsn,
                                 )
-                                _sib_ok = _sib_ticker not in executor._positions
                             except KeyError:
-                                _sib_ok = True   # already gone from executor state
+                                _sib_oid = "divergence"
                             except Exception as _sib_exc:
                                 log.warning(
                                     "ARB-ATOM sibling exit failed for %s: %s",
                                     _sib_ticker, _sib_exc,
                                 )
-                            if _sib_ok:
-                                await positions.close(_sib_ticker)
+                            if _sib_oid:
+                                if _sib_oid in ("paper", "divergence") or cfg.PAPER_TRADE:
+                                    executor._positions.pop(_sib_ticker, None)
+                                    await positions.close(_sib_ticker)
+                                else:
+                                    _sib_offer = (
+                                        _sib_cents if _sib_pos.get("side", "yes") == "yes"
+                                        else (100 - _sib_cents)
+                                    )
+                                    await positions.update_fields(_sib_ticker, {
+                                        "pending_exit":         True,
+                                        "exit_order_id":        _sib_oid,
+                                        "exit_order_placed_at": datetime.now(timezone.utc).isoformat(),
+                                        "exit_offer_cents":     _sib_offer,
+                                        "exit_reason":          _sib_rsn,
+                                        "exit_widen_count":     0,
+                                    })
                             else:
                                 log.warning(
                                     "ARB-ATOM: Kalshi rejected exit for %s — "
@@ -1650,14 +1892,15 @@ return cnt
                     )
                     if db is not None:
                         db.record_trade_outcome(
-                            ticker      = ticker,
-                            series      = ticker.split("-")[0] if "-" in ticker else ticker,
-                            side        = side,
-                            contracts   = contracts,
-                            entry_cents = entry_cents,
-                            exit_cents  = current_cents,
-                            pnl_cents   = pnl_cents,
-                            correct     = pnl_cents > 0,
+                            ticker       = ticker,
+                            series       = ticker.split("-")[0] if "-" in ticker else ticker,
+                            side         = side,
+                            contracts    = contracts,
+                            entry_cents  = entry_cents,
+                            exit_cents   = current_cents,
+                            pnl_cents    = pnl_cents,
+                            correct      = pnl_cents > 0,
+                            model_source = pos.get("model_source", ""),
                         )
 
         except asyncio.CancelledError:
@@ -1673,6 +1916,8 @@ async def _fill_poll_loop(
     positions: PositionStore,
     client:    "KalshiClient",
     executor:  "Executor" = None,
+    bus:       "RedisBus"  = None,
+    db:        "ResolutionDB" = None,
 ) -> None:
     """
     Async task: periodically poll Kalshi for fill status of resting limit orders.
@@ -1691,14 +1936,183 @@ async def _fill_poll_loop(
         await asyncio.sleep(_FILL_POLL_INTERVAL)
         try:
             all_pos = await positions.get_all()
+
+            # ── Exit TIF escalation: poll resting exit orders ─────────────────
+            for ticker, pos in all_pos.items():
+                if not pos.get("pending_exit"):
+                    continue
+                exit_oid = pos.get("exit_order_id", "")
+                if not exit_oid or exit_oid == "paper":
+                    continue
+                try:
+                    _e_resp  = await asyncio.to_thread(
+                        client.get, f"/portfolio/orders/{exit_oid}"
+                    )
+                    _e_order = _e_resp.get("order", {})
+                    _e_status     = _e_order.get("status", "")
+                    _e_fill_count = float(_e_order.get("fill_count_fp", 0) or 0)
+                    _e_total      = float(_e_order.get("initial_count_fp", 1) or 1)
+
+                    if _e_status == "filled" or _e_fill_count >= _e_total:
+                        executor._positions.pop(ticker, None)
+                        await positions.close(ticker)
+                        log.info("EXIT FILLED ✓ %s  order_id=%.8s", ticker, exit_oid)
+
+                        # ── Record trade outcome for Kelly calibration ────────────
+                        _lf_contracts = int(_e_fill_count or
+                                            pos.get("contracts_filled") or
+                                            pos.get("contracts", 1))
+                        _lf_side      = pos.get("side", "yes")
+                        _lf_entry     = int(pos.get("entry_cents", 50))
+                        _lf_reason    = pos.get("exit_reason", "live_exit_filled")
+                        # Prefer actual fill price from exchange; fall back to offer
+                        _lf_price_key = ("yes_price_dollars" if _lf_side == "yes"
+                                         else "no_price_dollars")
+                        _lf_raw       = _e_order.get(_lf_price_key)
+                        _lf_cents     = (int(float(_lf_raw) * 100) if _lf_raw is not None
+                                         else int(pos.get("exit_offer_cents", 50)))
+                        _lf_move  = (_lf_cents - _lf_entry if _lf_side in ("yes", "buy")
+                                     else _lf_entry - _lf_cents)
+                        _lf_pnl   = _lf_move * _lf_contracts
+
+                        if db is not None:
+                            try:
+                                db.record_trade_outcome(
+                                    ticker       = ticker,
+                                    series       = ticker.split("-")[0] if "-" in ticker else ticker,
+                                    side         = _lf_side,
+                                    contracts    = _lf_contracts,
+                                    entry_cents  = _lf_entry,
+                                    exit_cents   = _lf_cents,
+                                    pnl_cents    = _lf_pnl,
+                                    correct      = _lf_pnl > 0,
+                                    model_source = pos.get("model_source", ""),
+                                )
+                            except Exception as _lf_db_exc:
+                                log.warning("fill_poll DB record failed %s: %s",
+                                            ticker, _lf_db_exc)
+
+                        if bus is not None:
+                            try:
+                                _lf_fee = cfg.FEE_CENTS * _lf_contracts
+                                await bus.publish_execution(ExecutionReport(
+                                    ticker        = ticker,
+                                    asset_class   = pos.get("asset_class", "kalshi"),
+                                    side          = "no" if _lf_side == "yes" else "yes",
+                                    contracts     = _lf_contracts,
+                                    fill_price    = _lf_cents / 100,
+                                    status        = "filled",
+                                    mode          = "live",
+                                    edge_captured = (_lf_pnl - _lf_fee) / 100,
+                                ))
+                            except Exception as _lf_rpt_exc:
+                                log.warning("fill_poll ExecutionReport failed %s: %s",
+                                            ticker, _lf_rpt_exc)
+
+                        try:
+                            await telegram.send_exit(
+                                ticker        = ticker,
+                                side          = _lf_side,
+                                contracts     = _lf_contracts,
+                                current_cents = _lf_cents,
+                                reason        = _lf_reason,
+                                pnl_cents     = _lf_pnl,
+                                mode          = "live",
+                            )
+                        except Exception as _lf_tg_exc:
+                            log.debug("fill_poll telegram failed %s: %s",
+                                      ticker, _lf_tg_exc)
+
+                    elif _e_status == "canceled":
+                        # Externally canceled — accept whatever filled, or just close
+                        executor._positions.pop(ticker, None)
+                        await positions.close(ticker)
+                        log.warning(
+                            "Exit order canceled externally: %s order_id=%.8s "
+                            "fill=%d/%d — closing position",
+                            ticker, exit_oid, int(_e_fill_count), int(_e_total),
+                        )
+
+                    elif _e_status == "resting":
+                        widen_count = int(pos.get("exit_widen_count", 0))
+                        placed_at_s = pos.get("exit_order_placed_at", "")
+                        if not placed_at_s or widen_count >= _EXIT_TIF_MAX_STEPS:
+                            continue
+                        try:
+                            _placed_dt = datetime.fromisoformat(
+                                placed_at_s.replace("Z", "+00:00")
+                            )
+                            _age_min = (
+                                datetime.now(timezone.utc) - _placed_dt
+                            ).total_seconds() / 60
+                        except (ValueError, TypeError):
+                            continue
+
+                        if _age_min < _EXIT_TIF_STEP_MINUTES:
+                            continue
+
+                        # Escalate: cancel resting limit, place a new one 2¢ more aggressive
+                        cur_offer   = int(pos.get("exit_offer_cents", 50))
+                        new_offer   = max(1, cur_offer - _EXIT_TIF_WIDEN_CENTS)
+                        pos_side    = pos.get("side", "yes")
+                        price_field = "yes_price" if pos_side == "yes" else "no_price"
+                        _cts        = int(pos.get("contracts_filled") or pos.get("contracts", 1))
+
+                        try:
+                            await asyncio.to_thread(
+                                client._request, "DELETE",
+                                f"/portfolio/orders/{exit_oid}",
+                            )
+                        except Exception as _tif_del:
+                            log.debug("TIF cancel failed for %s: %s", ticker, _tif_del)
+
+                        payload = {
+                            "action": "sell", "type": "limit",
+                            "ticker": ticker, "side": pos_side,
+                            "count": _cts, price_field: new_offer,
+                        }
+                        try:
+                            _new_resp = await asyncio.to_thread(
+                                client.post, "/portfolio/orders", payload
+                            )
+                            _new_oid = _new_resp.get("order", {}).get("order_id", "") or ""
+                        except Exception as _tif_exc:
+                            log.error("TIF escalation order failed for %s: %s", ticker, _tif_exc)
+                            _new_oid = ""
+
+                        if _new_oid:
+                            await positions.update_fields(ticker, {
+                                "exit_order_id":        _new_oid,
+                                "exit_order_placed_at": datetime.now(timezone.utc).isoformat(),
+                                "exit_offer_cents":     new_offer,
+                                "exit_widen_count":     widen_count + 1,
+                            })
+                            log.info(
+                                "TIF escalation: %s  offer %d¢→%d¢  step=%d/%d  "
+                                "new_order=%.8s",
+                                ticker, cur_offer, new_offer,
+                                widen_count + 1, _EXIT_TIF_MAX_STEPS, _new_oid,
+                            )
+                        else:
+                            log.warning(
+                                "TIF escalation: new order failed for %s  "
+                                "holding at offer=%d¢", ticker, cur_offer,
+                            )
+
+                except Exception as _ep_exc:
+                    log.debug("Exit poll error for %s: %s", ticker, _ep_exc)
+
+            # ── Entry fill polling: confirm resting entry orders ───────────────
             for ticker, pos in all_pos.items():
                 order_id = pos.get("order_id", "")
-                # Skip: no order_id, paper trades, BTC, already confirmed
+                # Skip: no order_id, paper trades, BTC, already confirmed, pending exit
                 if not order_id or order_id == "paper":
                     continue
                 if ticker == "BTC-USD":
                     continue
                 if pos.get("fill_confirmed"):
+                    continue
+                if pos.get("pending_exit"):
                     continue
 
                 try:
@@ -2263,15 +2677,16 @@ async def exec_main() -> None:
         if executor._positions:
             for _ticker, _pos in executor._positions.items():
                 await positions.open(
-                    ticker      = _ticker,
-                    side        = _pos.get("side", "yes"),
-                    contracts   = int(_pos.get("contracts", 1)),
-                    entry_cents = int(_pos.get("entry_cents", 50)),
-                    fair_value  = float(_pos.get("fair_value", 0.5)),
-                    meeting     = _pos.get("meeting", ""),
-                    outcome     = _pos.get("outcome", ""),
-                    close_time  = _pos.get("close_time", ""),
-                    pending     = False,
+                    ticker       = _ticker,
+                    side         = _pos.get("side", "yes"),
+                    contracts    = int(_pos.get("contracts", 1)),
+                    entry_cents  = int(_pos.get("entry_cents", 50)),
+                    fair_value   = float(_pos.get("fair_value", 0.5)),
+                    meeting      = _pos.get("meeting", ""),
+                    outcome      = _pos.get("outcome", ""),
+                    close_time   = _pos.get("close_time", ""),
+                    model_source = _pos.get("model_source", ""),
+                    pending      = False,
                 )
             log.info("Startup: synced %d disk positions → Redis", len(executor._positions))
 
@@ -2287,13 +2702,15 @@ async def exec_main() -> None:
         log.info("Paper trade mode — skipping orphan order reconciliation.")
 
     # ── Coinbase client (BTC execution) ──────────────────────────────────────
-    coinbase = CoinbaseTradeClient()
-    _cb_usd   = await coinbase.get_usd_balance_cents()
-    _cb_total = await coinbase.get_total_balance_cents(btc_price_usd=75000.0)
+    coinbase    = CoinbaseTradeClient()
+    _cb_usd     = await coinbase.get_usd_balance_cents()
+    _btc_spot   = await fetch_btc_spot_usd()
+    _cb_total   = await coinbase.get_total_balance_cents(btc_price_usd=_btc_spot)
     log.info(
-        "Coinbase connectivity: USD=$%.2f  total=$%.2f",
+        "Coinbase connectivity: USD=$%.2f  total=$%.2f  BTC spot=$%.0f",
         (_cb_usd   or 0) / 100,
         (_cb_total or 0) / 100,
+        _btc_spot,
     )
 
     # ── Resolution DB (SQLite — records market outcomes for behavioral module) ─
@@ -2307,7 +2724,7 @@ async def exec_main() -> None:
             _exit_checker(bus, positions, executor, risk_engine, db, coinbase),
             _heartbeat_loop(bus),
             poll_resolutions_loop(client, bus, db),
-            _fill_poll_loop(positions, client, executor),
+            _fill_poll_loop(positions, client, executor, bus, db),
             _performance_publisher_loop(bus),
         )
     except (asyncio.CancelledError, KeyboardInterrupt):

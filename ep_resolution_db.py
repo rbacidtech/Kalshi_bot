@@ -375,26 +375,28 @@ class ResolutionDB:
         """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS trade_outcomes (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker      TEXT,
-                series      TEXT,
-                side        TEXT,
-                contracts   INTEGER,
-                entry_cents INTEGER,
-                exit_cents  INTEGER,
-                pnl_cents   INTEGER,
-                correct     INTEGER,
-                recorded_at TEXT
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker       TEXT,
+                series       TEXT,
+                side         TEXT,
+                contracts    INTEGER,
+                entry_cents  INTEGER,
+                exit_cents   INTEGER,
+                pnl_cents    INTEGER,
+                correct      INTEGER,
+                recorded_at  TEXT,
+                model_source TEXT
             )
         """)
         self._conn.commit()
         # Migrations: add columns that were added after initial deployment
         for _col, _typedef in [
-            ("series",      "TEXT"),
-            ("entry_cents", "INTEGER"),
-            ("exit_cents",  "INTEGER"),
-            ("correct",     "INTEGER"),
-            ("recorded_at", "TEXT"),
+            ("series",       "TEXT"),
+            ("entry_cents",  "INTEGER"),
+            ("exit_cents",   "INTEGER"),
+            ("correct",      "INTEGER"),
+            ("recorded_at",  "TEXT"),
+            ("model_source", "TEXT"),
         ]:
             try:
                 self._conn.execute(
@@ -433,7 +435,8 @@ class ResolutionDB:
 
     def record_trade_outcome(self, *, ticker: str, series: str, side: str,
                               contracts: int, entry_cents: int, exit_cents: int,
-                              pnl_cents: int, correct: bool) -> None:
+                              pnl_cents: int, correct: bool,
+                              model_source: str = "") -> None:
         if self._conn is None:
             return
         from datetime import datetime, timezone as _tz
@@ -441,10 +444,11 @@ class ResolutionDB:
             self._conn.execute(
                 """INSERT INTO trade_outcomes
                    (ticker, series, side, contracts, entry_cents, exit_cents,
-                    pnl_cents, correct, recorded_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pnl_cents, correct, recorded_at, model_source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (ticker, series, side, contracts, entry_cents, exit_cents,
-                 pnl_cents, 1 if correct else 0, datetime.now(_tz.utc).isoformat()),
+                 pnl_cents, 1 if correct else 0, datetime.now(_tz.utc).isoformat(),
+                 model_source),
             )
             self._conn.commit()
         except Exception as exc:
@@ -455,7 +459,7 @@ async def poll_resolutions_loop(
     client,
     bus,
     db: ResolutionDB,
-    interval: int = 3600,
+    interval: int = 300,
 ) -> None:
     """
     Periodically poll open positions against the Kalshi API to detect resolved
@@ -480,8 +484,392 @@ async def poll_resolutions_loop(
                         if existing != result:
                             db.record_resolution(ticker, result)
                             log.info("Resolution: %s → %s", ticker, result)
+
+                            # Write to ep:resolutions Redis hash so recency_bias_adj()
+                            # in ep_behavioral.py has data to read. price_before is
+                            # captured from ep:prices at resolution time (best available).
+                            _series = ticker.split("-")[0] if "-" in ticker else ticker
+                            _price_before = 50
+                            try:
+                                _pr = await bus._r.hget("ep:prices", ticker)
+                                if _pr:
+                                    _price_before = int(json.loads(_pr).get("yes_price", 50))
+                            except Exception:
+                                pass
+                            try:
+                                _cur = await bus._r.hget("ep:resolutions", _series)
+                                _blob = json.loads(_cur) if _cur else {"outcomes": []}
+                                _blob["outcomes"].append({
+                                    "price_before": _price_before,
+                                    "resolved_yes": result == "yes",
+                                    "ts": int(datetime.now(timezone.utc).timestamp()),
+                                })
+                                _blob["outcomes"] = _blob["outcomes"][-10:]
+                                await bus._r.hset("ep:resolutions", _series, json.dumps(_blob))
+                                log.debug(
+                                    "ep:resolutions updated: %s price_before=%d resolved_yes=%s",
+                                    _series, _price_before, result == "yes",
+                                )
+                            except Exception as exc:
+                                log.warning("ep:resolutions Redis write error for %s: %s", _series, exc)
                 except Exception as exc:
                     log.debug("poll_resolutions: %s — %s", ticker, exc)
         except Exception as exc:
             log.warning("poll_resolutions_loop error: %s", exc)
         await _asyncio.sleep(interval)
+
+
+# ── Advisor helper functions ───────────────────────────────────────────────────
+
+async def get_rolling_strategy_health(
+    recent_n:   int = 20,
+    baseline_n: int = 50,
+) -> dict:
+    """
+    Compare per-strategy win rate: last recent_n trades vs last baseline_n trades.
+
+    Returns a dict keyed by strategy name:
+        status:             "degrading" | "improving" | "stable" | "insufficient_data"
+        recent_n:           actual trades in recent window
+        baseline_n:         actual trades in baseline window
+        recent_win_rate:    float or None
+        baseline_win_rate:  float or None
+        recent_pnl_cents:   int or None
+        baseline_pnl_cents: int or None
+        delta_win_rate:     float or None (positive = improving)
+
+    Threshold: ±10pp win-rate change triggers degrading/improving.
+    Requires ≥ 3 trades in both windows; otherwise "insufficient_data".
+    """
+    now   = datetime.now(timezone.utc)
+    since = now - timedelta(days=365)
+    trades = _load_completed_trades(Path(cfg.TRADES_CSV), since)
+
+    by_strat: Dict[str, list] = defaultdict(list)
+    for t in sorted(trades, key=lambda x: x["exit_ts"]):
+        by_strat[t["strategy"]].append(t)
+
+    def _stats(ts: list) -> Optional[dict]:
+        if not ts:
+            return None
+        n    = len(ts)
+        wins = sum(1 for t in ts if t["pnl_cents"] > 0)
+        pnl  = sum(t["pnl_cents"] for t in ts)
+        return {"n": n, "win_rate": round(wins / n, 3), "pnl_cents": pnl}
+
+    result: dict = {}
+    for strat, strat_trades in by_strat.items():
+        baseline = strat_trades[-baseline_n:]
+        recent   = strat_trades[-recent_n:]
+        b        = _stats(baseline)
+        r        = _stats(recent)
+
+        if not b or b["n"] < 3 or not r or r["n"] < 3:
+            status = "insufficient_data"
+        else:
+            delta = r["win_rate"] - b["win_rate"]
+            if delta <= -0.10:
+                status = "degrading"
+            elif delta >= 0.10:
+                status = "improving"
+            else:
+                status = "stable"
+
+        result[strat] = {
+            "status":             status,
+            "recent_n":           len(recent),
+            "baseline_n":         len(baseline),
+            "recent_win_rate":    r["win_rate"]   if r else None,
+            "baseline_win_rate":  b["win_rate"]   if b else None,
+            "recent_pnl_cents":   r["pnl_cents"]  if r else None,
+            "baseline_pnl_cents": b["pnl_cents"]  if b else None,
+            "delta_win_rate":     round(r["win_rate"] - b["win_rate"], 3)
+                                  if r and b else None,
+        }
+
+    return result
+
+
+def get_concentration_metrics(positions: dict) -> dict:
+    """
+    Compute portfolio concentration from the ep:positions dict.
+
+    Returns:
+        total_exposure_cents: int
+        total_exposure_usd:   float
+        by_category:          {cat: {exposure_cents, count, pct}}
+        by_meeting:           {meeting: {exposure_cents, count, pct}}
+        largest_position:     {ticker, exposure_cents, side}
+        max_category_pct:     float
+        max_category_name:    str or None
+    """
+    def _category(ticker: str, model_source: str) -> str:
+        src = (model_source or "").lower()
+        if ticker == "BTC-USD":
+            return "btc_spot"
+        if "fomc" in src or "fed" in src or "kxfed" in src:
+            return "fomc"
+        if "btc" in src:
+            return "btc"
+        if "arb" in src:
+            return "arb"
+        if "gdp" in src:
+            return "gdp"
+        series = (ticker.split("-")[0] if "-" in ticker else ticker).upper()
+        if series.startswith("KXFED"):
+            return "fomc"
+        if series.startswith("KXBTC"):
+            return "btc"
+        if series.startswith("KXGDP"):
+            return "gdp"
+        return "other"
+
+    total_exp: int = 0
+    by_cat:  Dict[str, dict] = defaultdict(lambda: {"exposure_cents": 0, "count": 0})
+    by_meet: Dict[str, dict] = defaultdict(lambda: {"exposure_cents": 0, "count": 0})
+    largest: dict = {"ticker": None, "exposure_cents": 0, "side": None}
+
+    for ticker, p in positions.items():
+        side        = p.get("side", "yes")
+        entry_cents = int(p.get("entry_cents", 50) or 50)
+        contracts   = int(p.get("contracts", 1) or 1)
+        cost        = (100 - entry_cents) if side == "no" else entry_cents
+        exp         = cost * contracts
+        total_exp  += exp
+
+        cat     = _category(ticker, p.get("model_source", "") or "")
+        meeting = p.get("meeting") or "unknown"
+
+        by_cat[cat]["exposure_cents"]    += exp
+        by_cat[cat]["count"]             += 1
+        by_meet[meeting]["exposure_cents"] += exp
+        by_meet[meeting]["count"]          += 1
+
+        if exp > largest["exposure_cents"]:
+            largest = {"ticker": ticker, "exposure_cents": exp, "side": side}
+
+    cat_result: dict  = {}
+    max_cat_pct       = 0.0
+    max_cat_name: Optional[str] = None
+    for cat, d in by_cat.items():
+        pct = round(d["exposure_cents"] / total_exp, 3) if total_exp > 0 else 0.0
+        cat_result[cat] = {**d, "pct": pct}
+        if pct > max_cat_pct:
+            max_cat_pct  = pct
+            max_cat_name = cat
+
+    meet_result: dict = {}
+    for m, d in by_meet.items():
+        pct = round(d["exposure_cents"] / total_exp, 3) if total_exp > 0 else 0.0
+        meet_result[m] = {**d, "pct": pct}
+
+    return {
+        "total_exposure_cents": total_exp,
+        "total_exposure_usd":   round(total_exp / 100, 2),
+        "by_category":          cat_result,
+        "by_meeting":           meet_result,
+        "largest_position":     largest,
+        "max_category_pct":     round(max_cat_pct, 3),
+        "max_category_name":    max_cat_name,
+    }
+
+
+def get_kelly_by_strategy(positions: dict, balance_cents: int) -> dict:
+    """
+    Return per-strategy deployed capital and implied Kelly fraction of balance.
+
+        deployed_cents:  actual capital tied up (cost basis)
+        deployed_usd:    float
+        fraction:        deployed_cents / balance_cents
+        position_count:  number of open positions for this strategy
+    """
+    by_strat: Dict[str, dict] = defaultdict(lambda: {"deployed_cents": 0, "position_count": 0})
+
+    for ticker, p in positions.items():
+        strat       = (p.get("model_source") or "unknown").strip() or "unknown"
+        side        = p.get("side", "yes")
+        entry_cents = int(p.get("entry_cents", 50) or 50)
+        contracts   = int(p.get("contracts", 1) or 1)
+        cost        = (100 - entry_cents) if side == "no" else entry_cents
+        by_strat[strat]["deployed_cents"]  += cost * contracts
+        by_strat[strat]["position_count"]  += 1
+
+    result: dict = {}
+    for strat, d in by_strat.items():
+        frac = round(d["deployed_cents"] / balance_cents, 4) if balance_cents > 0 else 0.0
+        result[strat] = {
+            "deployed_cents": d["deployed_cents"],
+            "deployed_usd":   round(d["deployed_cents"] / 100, 2),
+            "fraction":       frac,
+            "position_count": d["position_count"],
+        }
+
+    return result
+
+
+# ── Threshold calibration from resolution history ─────────────────────────────
+
+def compute_yes_entry_price_gate(
+    min_trades_per_bucket: int = 10,
+    bucket_size_cents:     int = 5,
+    default:               float = 0.60,
+) -> dict:
+    """
+    Compute the YES entry price threshold below which KXFED directional trades
+    are unprofitable, derived from completed trade history.
+
+    Returns a dict:
+        calibrated:  float — lowest price (fraction 0–1) where EV turns positive
+        default:     float — fallback value used if data is insufficient
+        used_default: bool
+        sample_size: int  — total KXFED YES trades analysed
+        buckets:     dict — {bucket_floor_cents: {"n", "ev_cents", "win_rate"}}
+        note:        str
+    """
+    now   = datetime.now(timezone.utc)
+    since = now - timedelta(days=365)
+    trades = _load_completed_trades(Path(cfg.TRADES_CSV), since)
+
+    # Filter to KXFED YES directional trades only (not arb legs)
+    kxfed_yes = [
+        t for t in trades
+        if t["side"] == "yes"
+        and t["ticker"].startswith("KXFED")
+        and "arb" not in (t["strategy"] or "").lower()
+    ]
+
+    buckets: Dict[int, list] = defaultdict(list)
+    for t in kxfed_yes:
+        floor = (t["entry_price_cents"] // bucket_size_cents) * bucket_size_cents
+        buckets[floor].append(t["pnl_cents"])
+
+    bucket_stats: dict = {}
+    profitable_floors = []
+
+    for floor_c in sorted(buckets):
+        pnls = buckets[floor_c]
+        if len(pnls) < min_trades_per_bucket:
+            continue
+        n      = len(pnls)
+        ev     = sum(pnls) / n
+        wins   = sum(1 for p in pnls if p > 0)
+        wr     = round(wins / n, 3)
+        bucket_stats[floor_c] = {"n": n, "ev_cents": round(ev, 1), "win_rate": wr}
+        if ev > 0:
+            profitable_floors.append(floor_c)
+
+    if not profitable_floors or len(kxfed_yes) < min_trades_per_bucket * 2:
+        return {
+            "calibrated":  default,
+            "default":     default,
+            "used_default": True,
+            "sample_size": len(kxfed_yes),
+            "buckets":     bucket_stats,
+            "note":        f"insufficient data ({len(kxfed_yes)} trades, need ≥{min_trades_per_bucket * 2})",
+        }
+
+    # The gate should be the floor of the lowest profitable bucket (as a fraction).
+    # If the minimum profitable floor is ≥ 30¢ and ≤ 90¢ we trust it; else use default.
+    calibrated_cents = min(profitable_floors)
+    calibrated = calibrated_cents / 100.0
+    if not (0.30 <= calibrated <= 0.90):
+        return {
+            "calibrated":  default,
+            "default":     default,
+            "used_default": True,
+            "sample_size": len(kxfed_yes),
+            "buckets":     bucket_stats,
+            "note":        f"computed threshold {calibrated:.2f} outside safe range [0.30, 0.90]",
+        }
+
+    return {
+        "calibrated":  calibrated,
+        "default":     default,
+        "used_default": False,
+        "sample_size": len(kxfed_yes),
+        "buckets":     bucket_stats,
+        "note":        f"lowest profitable bucket: {calibrated_cents}¢",
+    }
+
+
+def compute_near_expiry_stop_days(
+    min_trades: int   = 15,
+    default:    int   = 7,
+) -> dict:
+    """
+    Estimate the near-expiry stop-suppression window from trade outcomes.
+
+    Method: look at KXFED trades with negative pnl (stopped or wrong direction).
+    Among those, "correct_but_stopped" trades — where the model was right but
+    the exit was premature — are proxied by: pnl_cents < 0 AND entry_price_cents
+    between 30¢ and 70¢ (active zone where stop-loss noise is most common) AND
+    hold_seconds < N * 86400.  Compare the stop-loss rate across hold-time buckets
+    to find the cutoff where noise-driven exits dominate.
+
+    Returns a dict:
+        calibrated:   int — recommended suppression window in days
+        default:      int — fallback
+        used_default: bool
+        sample_size:  int
+        note:         str
+    """
+    now   = datetime.now(timezone.utc)
+    since = now - timedelta(days=365)
+    trades = _load_completed_trades(Path(cfg.TRADES_CSV), since)
+
+    # KXFED trades in the active price zone (30–70¢) — neither near-certain nor speculative
+    kxfed = [
+        t for t in trades
+        if t["ticker"].startswith("KXFED")
+        and 30 <= t["entry_price_cents"] <= 70
+        and "arb" not in (t["strategy"] or "").lower()
+    ]
+
+    if len(kxfed) < min_trades:
+        return {
+            "calibrated":  default,
+            "default":     default,
+            "used_default": True,
+            "sample_size": len(kxfed),
+            "note":        f"insufficient data ({len(kxfed)} trades, need ≥{min_trades})",
+        }
+
+    # Group by hold_days bucket and compute loss rate
+    day_buckets: Dict[int, list] = defaultdict(list)
+    for t in kxfed:
+        hold_days = min(int(t["hold_seconds"] / 86400), 30)
+        day_buckets[hold_days].append(t["pnl_cents"])
+
+    # Find the hold-day threshold where the loss rate drops sharply.
+    # Below this threshold, most losses are noise (suggest suppressing stops there).
+    thresholds_to_check = list(range(3, 15))
+    best_threshold = default
+
+    for N in thresholds_to_check:
+        short_trades = [p for d, ps in day_buckets.items() if d < N for p in ps]
+        long_trades  = [p for d, ps in day_buckets.items() if d >= N for p in ps]
+        if len(short_trades) < 5 or len(long_trades) < 5:
+            continue
+        short_loss_rate = sum(1 for p in short_trades if p < 0) / len(short_trades)
+        long_loss_rate  = sum(1 for p in long_trades  if p < 0) / len(long_trades)
+        # If short-hold loss rate is meaningfully worse, N is a candidate threshold
+        if short_loss_rate - long_loss_rate >= 0.10:
+            best_threshold = N
+            break  # take the first (smallest) N that shows the improvement
+
+    if best_threshold < 3 or best_threshold > 21:
+        return {
+            "calibrated":  default,
+            "default":     default,
+            "used_default": True,
+            "sample_size": len(kxfed),
+            "note":        f"computed threshold {best_threshold}d outside safe range [3, 21]",
+        }
+
+    return {
+        "calibrated":  best_threshold,
+        "default":     default,
+        "used_default": best_threshold == default,
+        "sample_size": len(kxfed),
+        "note":        f"short-hold loss rate materially higher for holds <{best_threshold}d",
+    }

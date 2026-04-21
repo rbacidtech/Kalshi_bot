@@ -95,7 +95,7 @@ _SOURCES: Dict[str, DataSource] = {
     "bls_nfp":       DataSource("bls_nfp",       stale_seconds=86400 * 35,  critical=False),
 
     # ── Infrastructure ───────────────────────────────────────────────────────
-    "redis":         DataSource("redis",         stale_seconds=30,          critical=True),
+    "redis":         DataSource("redis",         stale_seconds=90,          critical=True),
     "exec_heartbeat": DataSource("exec_heartbeat", stale_seconds=180,       critical=True),
 }
 

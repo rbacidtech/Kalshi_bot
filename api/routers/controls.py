@@ -23,6 +23,9 @@ from api.dependencies import require_admin
 from api.models import User
 from api.redis_client import get_redis
 from api.routers.auth import limiter
+from api.database import get_db
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -178,11 +181,53 @@ def _node_heartbeats_from_stream(entries: list) -> dict[str, float]:
     return seen
 
 
+async def _session_pnl_from_db(db: AsyncSession) -> Optional[int]:
+    """
+    Compute today's session P&L from pnl_snapshots.
+    Session P&L = (latest total value) - (first-of-day total value)
+    Total value = balance_cents + deployed_cents + unrealized_pnl_cents
+    Returns None if fewer than 2 snapshots exist for today.
+    """
+    try:
+        today_utc = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        result = await db.execute(text("""
+            SELECT balance_cents, deployed_cents, unrealized_pnl_cents
+            FROM pnl_snapshots
+            WHERE ts >= :today
+            ORDER BY ts ASC
+            LIMIT 1
+        """), {"today": today_utc})
+        start_row = result.fetchone()
+        if start_row is None:
+            return None
+
+        result2 = await db.execute(text("""
+            SELECT balance_cents, deployed_cents, unrealized_pnl_cents
+            FROM pnl_snapshots
+            ORDER BY ts DESC
+            LIMIT 1
+        """))
+        latest_row = result2.fetchone()
+        if latest_row is None:
+            return None
+
+        def _total(row) -> int:
+            return (row[0] or 0) + (row[1] or 0) + (row[2] or 0)
+
+        return _total(latest_row) - _total(start_row)
+    except Exception as exc:
+        logger.debug("session_pnl query failed: %s", exc)
+        return None
+
+
 @router.get("/status")
 @limiter.limit("60/minute")
 async def get_status(
     request: Request,
     _: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Return latest bot status built from ep:health, ep:balance, and ep:system."""
     r = get_redis()
@@ -215,7 +260,7 @@ async def get_status(
                 "sources":       h.get("sources", {}),
                 "cycle_count":   h.get("cycle_count"),
                 "uptime_seconds":h.get("uptime_seconds"),
-                "session_pnl":   h.get("session_pnl"),
+                "session_pnl":   await _session_pnl_from_db(db),
             }
         except Exception:
             pass

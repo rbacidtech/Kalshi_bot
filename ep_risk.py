@@ -30,15 +30,22 @@ class UnifiedRiskEngine:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def size(self, sig: SignalMessage, balance_cents: int) -> int:
+    def size(
+        self,
+        sig: SignalMessage,
+        balance_cents: int,
+        vol_multiplier: float = 1.0,
+    ) -> int:
         """Return number of contracts / units to trade. 0 = skip."""
         if sig.asset_class == "kalshi":
             return self._kalshi.size(
-                edge          = sig.edge,
-                market_price  = sig.market_price,
-                balance_cents = balance_cents,
-                confidence    = sig.confidence,
-                side          = sig.side,
+                edge           = sig.edge,
+                market_price   = sig.market_price,
+                balance_cents  = balance_cents,
+                confidence     = sig.confidence,
+                side           = sig.side,
+                model_source   = sig.model_source or "",
+                vol_multiplier = vol_multiplier,
             )
         if sig.asset_class == "btc_spot":
             return self._size_btc(sig, balance_cents)
@@ -108,12 +115,7 @@ class UnifiedRiskEngine:
         """
         if not sig.btc_price or balance_cents <= 0:
             return 0
-        # TODO: Coinbase charges a 0.6% taker fee on each leg (entry + exit).
-        # Round-trip cost ≈ 1.2% of notional.  The effective edge used here
-        # (_BTC_RISK_PER_TRADE) does NOT yet subtract this fee, so sizing is
-        # slightly optimistic.  To fix: multiply risk_usd by (1 - 2*COINBASE_TAKER_FEE)
-        # where COINBASE_TAKER_FEE = 0.006, i.e. use risk_usd * 0.988 for sizing.
-        risk_usd          = (balance_cents / 100) * _BTC_RISK_PER_TRADE
+        risk_usd          = (balance_cents / 100) * _BTC_RISK_PER_TRADE * (1 - 2 * 0.006)
         price_per_unit_usd = sig.btc_price * BTC_UNIT
         if price_per_unit_usd <= 0:
             return 0
