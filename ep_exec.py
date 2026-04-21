@@ -1201,12 +1201,23 @@ async def _exit_checker(
                 # Kalshi before we own the position returns HTTP 400.  The
                 # fill_poll_loop will set fill_confirmed=True once the order matches,
                 # at which point exit checks resume normally.
-                if asset_class == "kalshi" and not pos.get("fill_confirmed", True):
-                    log.debug(
-                        "Skipping exit for %s — limit order not yet fill-confirmed",
-                        ticker,
-                    )
-                    continue
+                #
+                # Exception: if contracts_filled > 0 we already own those contracts
+                # and must be able to stop-loss out.  In that case exit checks run
+                # on the filled portion; the resting remainder is canceled first in
+                # the exit execution block below.
+                _is_partial_unconfirmed = (
+                    asset_class == "kalshi"
+                    and not pos.get("fill_confirmed", True)
+                )
+                if _is_partial_unconfirmed:
+                    if int(pos.get("contracts_filled") or 0) == 0:
+                        log.debug(
+                            "Skipping exit for %s — no fills yet", ticker
+                        )
+                        continue
+                    # contracts was set to contracts_filled at line above — P&L
+                    # and all exit conditions are computed on the filled portion.
 
                 # P&L from our perspective (positive = profit):
                 #   YES / BTC-buy:  price rose → win
@@ -1501,6 +1512,28 @@ return cnt
                         # retain the Redis position and retry next cycle, rather than
                         # silently dropping it (which would leave an untracked Kalshi
                         # position and cause the divergence handler to loop forever).
+                        # Cancel the resting remainder before exiting filled
+                        # contracts so the order can't keep filling mid-exit.
+                        if _is_partial_unconfirmed:
+                            _rem_order = pos.get("order_id", "")
+                            if _rem_order and _rem_order != "paper":
+                                try:
+                                    await asyncio.to_thread(
+                                        executor.client._request, "DELETE",
+                                        f"/portfolio/orders/{_rem_order}",
+                                    )
+                                    log.info(
+                                        "Canceled resting remainder before "
+                                        "partial-fill exit: %s  order=%s",
+                                        ticker, _rem_order,
+                                    )
+                                except Exception as _pc_exc:
+                                    log.debug(
+                                        "Remainder cancel failed for %s "
+                                        "(proceeding with exit): %s",
+                                        ticker, _pc_exc,
+                                    )
+
                         _kalshi_exit_ok = False
                         try:
                             # Pass contracts explicitly so _exit_position uses the
