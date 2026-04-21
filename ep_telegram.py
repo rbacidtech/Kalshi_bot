@@ -21,13 +21,22 @@ Usage:
     await telegram.send_daily_summary(pnl_cents, trades, win_rate, open_positions)
 """
 
+import json
 import os
+import re
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 
 from ep_config import log
+
+_REDIS_URL = os.getenv("REDIS_URL", "")
+
+# Strip HTML tags for dashboard text
+def _strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
 
 _TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN",         "")
 _CHANNEL    = os.getenv("TELEGRAM_CHANNEL_ID",        "")
@@ -61,12 +70,31 @@ class TelegramAlerter:
 
         self._last_send_ts: float = 0.0               # epoch of last successful send
         self._recent_texts: dict  = {}                # text → epoch of last send
+        self._redis = None                            # lazy Redis client for dashboard mirroring
 
         if self.enabled:
             log.info("Telegram alerts enabled → channel=%s  min_edge=%.2f",
                      self._channel, self._min_edge)
         else:
             log.info("Telegram disabled — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHANNEL_ID to enable")
+
+    async def _push_to_dashboard(self, notification: dict) -> None:
+        """Write a notification to Redis ep:notifications for the dashboard."""
+        if not _REDIS_URL:
+            return
+        try:
+            if self._redis is None:
+                import redis.asyncio as aioredis
+                self._redis = aioredis.from_url(_REDIS_URL, decode_responses=True)
+            notification.setdefault("ts", datetime.now(timezone.utc).isoformat())
+            await self._redis.xadd(
+                "ep:notifications",
+                {k: (str(v) if v is not None else "") for k, v in notification.items()},
+                maxlen=500,
+                approximate=True,
+            )
+        except Exception as exc:
+            log.debug("Dashboard notification write failed: %s", exc)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -141,10 +169,15 @@ class TelegramAlerter:
         level: "INFO" | "WARNING" | "CRITICAL"  (case-insensitive)
         CRITICAL alerts also go to TELEGRAM_ADMIN_ID if configured.
         """
+        level_lower = level.lower()
+        await self._push_to_dashboard({
+            "type":     "alert",
+            "severity": level_lower,
+            "message":  message,
+        })
         if not self.enabled:
             return False
         try:
-            level_lower = level.lower()
             emoji = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}.get(level_lower, "ℹ️")
             text  = f"{emoji} <b>EdgePulse</b>: {message}"
             ok    = await self._send(self._channel, text)
@@ -167,6 +200,16 @@ class TelegramAlerter:
         Send a formatted trade execution alert.  Returns True on success.
         Silently no-ops if TELEGRAM_BOT_TOKEN is not configured.
         """
+        await self._push_to_dashboard({
+            "type":        "trade_alert",
+            "severity":    "info",
+            "ticker":      ticker,
+            "side":        side,
+            "contracts":   contracts,
+            "entry_cents": entry_cents,
+            "strategy":    strategy,
+            "message":     f"NEW TRADE: {ticker} {side.upper()} ×{contracts} @ {entry_cents}¢  {strategy}",
+        })
         if not self.enabled:
             return False
         try:
@@ -186,6 +229,13 @@ class TelegramAlerter:
         Send alert when a circuit breaker opens.  Returns True on success.
         Silently no-ops if TELEGRAM_BOT_TOKEN is not configured.
         """
+        await self._push_to_dashboard({
+            "type":          "circuit_breaker",
+            "severity":      "warning",
+            "name":          name,
+            "failure_count": failure_count,
+            "message":       f"CIRCUIT BREAKER OPEN: {name}  failures={failure_count}",
+        })
         if not self.enabled:
             return False
         try:
@@ -220,6 +270,17 @@ class TelegramAlerter:
         Legacy signature (keyword, backwards-compatible):
             fills, rejects, pnl_str, top_markets
         """
+        sign    = "+" if pnl_cents >= 0 else ""
+        pnl_usd = pnl_cents / 100.0
+        await self._push_to_dashboard({
+            "type":           "daily_summary",
+            "severity":       "info",
+            "pnl_cents":      pnl_cents,
+            "trades":         trades,
+            "win_rate":       win_rate,
+            "open_positions": open_positions,
+            "message":        f"Daily Summary: P&L {sign}${pnl_usd:.2f}  trades={trades}  win_rate={win_rate:.1f}%  open={open_positions}",
+        })
         if not self.enabled:
             return False
         try:
@@ -266,6 +327,18 @@ class TelegramAlerter:
         strategy:    str   = "",
     ) -> bool:
         """Alert on a new entry fill."""
+        await self._push_to_dashboard({
+            "type":        "fill",
+            "severity":    "info",
+            "ticker":      ticker,
+            "side":        side,
+            "contracts":   contracts,
+            "price_cents": price_cents,
+            "mode":        mode,
+            "edge":        edge,
+            "strategy":    strategy,
+            "message":     f"{'LIVE' if mode == 'live' else 'PAPER'} FILL: {ticker} {side.upper()} ×{contracts} @ {price_cents}¢  edge={edge:.3f}",
+        })
         if not self.enabled:
             return False
         if edge < self._min_edge:
@@ -296,6 +369,18 @@ class TelegramAlerter:
         mode:          str = "paper",
     ) -> bool:
         """Alert on an exit (take-profit, stop-loss, pre-expiry, etc.)."""
+        await self._push_to_dashboard({
+            "type":          "exit",
+            "severity":      "info",
+            "ticker":        ticker,
+            "side":          side,
+            "contracts":     contracts,
+            "current_cents": current_cents,
+            "reason":        reason,
+            "pnl_cents":     pnl_cents,
+            "mode":          mode,
+            "message":       f"{'LIVE' if mode == 'live' else 'PAPER'} EXIT: {ticker} {side.upper()} ×{contracts} @ {current_cents}¢  P&L={pnl_cents:+.0f}¢  {reason}",
+        })
         if not self.enabled:
             return False
         try:
