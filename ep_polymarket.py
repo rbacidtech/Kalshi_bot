@@ -190,12 +190,26 @@ class PolymarketFeed:
         Find the most relevant Polymarket market for a Kalshi signal.
         Uses series prefix to determine search keywords, then picks the
         active market with the highest 24h volume.
+
+        For KXFED threshold tickers (e.g. KXFED-26JUN-T3.75), applies a
+        second filter requiring the Polymarket question to mention the specific
+        rate level (e.g. "3.75").  Without this, all FOMC tickers map to the
+        same highest-volume rate-change question ("Will the Fed raise/cut 25bps?")
+        which is a structurally different question from a rate-level threshold.
         """
         series_prefix = sig.ticker.split("-")[0] if "-" in sig.ticker else sig.ticker
         keywords = _SERIES_KEYWORDS.get(series_prefix, [])
         if not keywords:
             log.debug("Polymarket: no keyword mapping for series prefix %r", series_prefix)
             return None
+
+        # Extract rate threshold for KXFED-...-T{rate} tickers
+        rate_threshold: Optional[float] = None
+        if series_prefix == "KXFED" and "-T" in sig.ticker:
+            try:
+                rate_threshold = float(sig.ticker.split("-T")[-1])
+            except (ValueError, IndexError):
+                pass
 
         candidates = []
         for pm in self._poly_markets:
@@ -206,6 +220,31 @@ class PolymarketFeed:
         if not candidates:
             log.debug("Polymarket: 0 candidates for %s (keywords=%s)", sig.ticker, keywords)
             return None
+
+        # For rate-threshold KXFED tickers, filter to questions that mention the
+        # specific rate level.  This prevents rate-change questions ("Will Fed
+        # raise/cut 25bps?") from matching rate-level questions ("Rate above 3.75%?").
+        if rate_threshold is not None:
+            # Build candidate rate strings, always keeping ≥1 decimal place so
+            # "3.0" never becomes bare "3" (which would match "3.75", "30", etc.).
+            rate_2dec = f"{rate_threshold:.2f}"              # "3.75", "3.00"
+            stripped  = rate_2dec.rstrip("0")                # "3.75", "3."
+            if stripped.endswith("."):
+                stripped += "0"                              # "3." → "3.0"
+            rate_strs = list(dict.fromkeys([rate_2dec, stripped]))  # dedup, preserve order
+            rate_candidates = [
+                pm for pm in candidates
+                if any(rs in pm.question for rs in rate_strs)
+            ]
+            if rate_candidates:
+                candidates = rate_candidates
+            else:
+                log.debug(
+                    "Polymarket: no rate-specific match for %s (rate=%.2f) — "
+                    "skipping rather than returning wrong market",
+                    sig.ticker, rate_threshold,
+                )
+                return None
 
         best = max(candidates, key=lambda m: m.volume_24h)
 
