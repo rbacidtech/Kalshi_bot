@@ -116,15 +116,13 @@ class RiskManager:
             _csv_path = Path(_ep_cfg.TRADES_CSV)
             _all_trades = _load_completed_trades(_csv_path, _since)
 
-            # Terminal exits: contract resolved to YES=100¢ or YES=0¢ (paid in full or zero)
-            _STOP_KEYWORDS = ("stop_loss", "pre_expiry", "trailing_stop", "cut_loss")
+            # Terminal exits: contract resolved to YES=100¢ or YES=0¢.
+            # The OR condition (checking model_source for stop keywords) was a bug —
+            # model_source is "fedwatch+zq+wsj", never contains "stop_loss", so
+            # it caused all 647 trades to pass, poisoning Kelly with stop-loss exits.
             _terminal = [
                 t for t in _all_trades
-                if (
-                    t.get("exit_price_cents") in (0, 100)
-                    or not any(kw in (t.get("strategy") or "").lower()
-                               for kw in _STOP_KEYWORDS)
-                )
+                if t.get("exit_price_cents") in (0, 100)
             ]
 
             # Use terminal trades if we have enough; fall back to full population.

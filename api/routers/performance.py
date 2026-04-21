@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -11,19 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.database import get_db
 from api.dependencies import get_current_active_user as require_auth
+from api.redis_client import get_redis
 
 router = APIRouter(prefix="/performance", tags=["performance"])
-
-REDIS_URL = os.getenv("REDIS_URL", "")
-
-
-async def _get_redis():
-    try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(REDIS_URL, decode_responses=True)
-        return r
-    except Exception:
-        return None
 
 
 @router.get("", summary="Performance summary from exec node")
@@ -37,18 +26,13 @@ async def get_performance(
 
     Falls back to zeros if the key is absent or Redis is unreachable.
     """
-    r = await _get_redis()
+    r = get_redis()
     raw: Optional[str] = None
     if r:
         try:
             raw = await r.get("ep:performance")
         except Exception:
             pass
-        finally:
-            try:
-                await r.aclose()
-            except Exception:
-                pass
 
     if raw:
         try:
@@ -73,6 +57,12 @@ async def get_performance(
         "worst_trade": None,
         "avg_hold_time_hours": 0.0,
         "sharpe_daily": None,
+        "streak_current": 0,
+        "streak_best": 0,
+        "avg_win_cents": 0.0,
+        "avg_loss_cents": 0.0,
+        "expectancy_cents": 0.0,
+        "pnl_distribution": [],
     }
 
 
@@ -111,5 +101,42 @@ async def get_pnl_history(
                 "position_count": row.position_count,
             }
         return list(buckets.values())
+    except Exception:
+        return []
+
+
+@router.get("/equity-curve", summary="Daily cumulative realized P&L for equity curve chart")
+async def get_equity_curve(
+    days: int = Query(90, ge=7, le=365),
+    _user=Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns daily cumulative realized P&L over the requested window.
+    For each UTC calendar day, takes the last snapshot's realized_pnl_cents value
+    (which is already cumulative from the source).
+    Used by the PerformancePage equity curve chart.
+    """
+    from api.models import PnlSnapshot
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        result = await db.execute(
+            select(PnlSnapshot)
+            .where(PnlSnapshot.ts >= since)
+            .order_by(PnlSnapshot.ts.asc())
+        )
+        rows = result.scalars().all()
+        # Bucket by UTC calendar day — keep the last snapshot per day
+        buckets: dict[str, int] = {}
+        for row in rows:
+            ts = row.ts if isinstance(row.ts, datetime) else datetime.fromisoformat(str(row.ts))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            day = ts.strftime("%Y-%m-%d")
+            buckets[day] = row.realized_pnl_cents
+        return [
+            {"date": day, "cumulative_pnl_cents": pnl}
+            for day, pnl in buckets.items()
+        ]
     except Exception:
         return []

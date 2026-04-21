@@ -127,12 +127,17 @@ async def get_positions(
                 except Exception:
                     pass
 
+        # True portfolio value = available cash + current market value of positions
+        # (current market value = cost_basis + unrealized_pnl)
+        total_value = (balance_cents + total_deployed + total_unrealized) if balance_cents is not None else None
+
         return PortfolioResponse(
-            positions               = sorted(positions, key=lambda p: p.ticker),
-            total_deployed_cents    = total_deployed,
+            positions                  = sorted(positions, key=lambda p: p.ticker),
+            total_deployed_cents       = total_deployed,
             total_unrealized_pnl_cents = total_unrealized,
-            balance_cents           = balance_cents,
-            position_count          = len(positions),
+            balance_cents              = balance_cents,
+            total_value_cents          = total_value,
+            position_count             = len(positions),
         )
     finally:
         await r.aclose()

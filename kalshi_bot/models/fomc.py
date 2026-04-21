@@ -2444,9 +2444,12 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
             else:
                 fw_source_label = "fedwatch"
 
+            # External-only blend: Kalshi market price is what we trade against,
+            # not a signal. Including it at 65% weight makes fair_value circular
+            # (fair ≈ market) and destroys edge. FedWatch+ZQ+WSJ define fair value.
             blended, confidence, sources, data_quality = _fuse_sources(
                 fw_mp.probs, zq_probs_dict, wsj_for_meeting,
-                kalshi_implied  = kalshi_probs,
+                kalshi_implied  = None,
                 fedwatch_source = fw_source_label,
             )
             if data_quality == "fallback_only":
@@ -2531,7 +2534,7 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
                     # Revert: re-run fusion without macro adjustment (blended already set)
                     blended, confidence, sources, data_quality = _fuse_sources(
                         fw_mp.probs, zq_probs_dict, wsj_for_meeting,
-                        kalshi_implied  = kalshi_probs,
+                        kalshi_implied  = None,
                         fedwatch_source = fw_source_label,
                     )
 

@@ -142,15 +142,21 @@ def signal_quality_score(sig: "Signal") -> float:
 
 
 def _fee_adjusted_edge(fair_value: float, market_price: float, side: str) -> float:
-    """Compute edge net of Kalshi fees."""
+    """Compute edge net of Kalshi fees.
+
+    Convention: fair_value = P(YES wins), market_price = YES market price, for both sides.
+    YES: win = (1-price)*(1-fee), lose = price.
+    NO:  win = price*(1-fee), lose = (1-price). P(NO wins) = 1-fair_value.
+    """
     if side == "yes":
         net_win  = (1.0 - market_price) * (1 - KALSHI_FEE_RATE)
         net_lose = market_price
         ev = fair_value * net_win - (1 - fair_value) * net_lose
     else:
+        # P(NO wins) = 1 - fair_value; profit = YES_price*(1-fee); loss = NO_price
         net_win  = market_price * (1 - KALSHI_FEE_RATE)
         net_lose = 1.0 - market_price
-        ev = fair_value * net_win - (1 - fair_value) * net_lose
+        ev = (1 - fair_value) * net_win - fair_value * net_lose
     return ev
 
 
@@ -615,7 +621,7 @@ async def scan_fomc_directional(
                 # Apply proximity adjustment to model confidence, then 2Y delta
                 confidence = max(0.40, min(0.95,
                     _fomc_proximity_confidence(model_conf) + tsy_conf_adj))
-                model_src  = "kalshi_implied+fred"
+                model_src  = "fedwatch+zq+wsj"
             else:
                 # FRED rate-anchor fallback (unchanged from prior implementation)
                 rate_diff_bps = (strike - current_rate) * 100
@@ -646,9 +652,10 @@ async def scan_fomc_directional(
                     fair_yes = 0.02
                 else:
                     fair_yes = 0.01
-                # Fallback: proximity adjustment on 0.72 base, then 2Y delta
-                confidence = max(0.40, min(0.95,
-                    _fomc_proximity_confidence(0.72) + tsy_conf_adj))
+                # Fallback: lower bar — hardcoded rate table is less reliable than
+                # live CME/ZQ data; 0.55 base prevents marginal trades from firing
+                confidence = max(0.40, min(0.80,
+                    _fomc_proximity_confidence(0.55) + tsy_conf_adj))
                 model_src  = f"fred_anchor_{current_rate:.2f}%"
 
             fair_yes = max(0.01, min(0.99, fair_yes))
@@ -1079,7 +1086,7 @@ def _temp_prob_above(forecast_temp: float, threshold: float, days_ahead: int) ->
     Sigma grows with forecast horizon based on NWS MAE verification studies:
       Day 0-1: 2.5°F,  Day 2: 3.5°F,  Day 3: 4.5°F,  Day 4+: 5.5°F
     """
-    sigma = max(2.5, min(5.5, 2.5 + max(0, days_ahead - 1) * 1.0))
+    sigma = max(2.5, min(8.0, 2.5 + max(0, days_ahead - 1) * 0.85))
     z     = (threshold - forecast_temp) / sigma
     return 0.5 * (1.0 - _math.erf(z / _math.sqrt(2)))
 
@@ -1286,10 +1293,11 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
 # ── Economic Model (FRED) ─────────────────────────────────────────────────────
 
 ECONOMIC_SERIES = {
-    "CPIAUCSL":  {"name": "CPI",   "keywords": ["cpi", "inflation", "consumer price"]},
+    "CPIAUCSL_PC1": {"name": "CPI", "keywords": ["cpi", "inflation", "consumer price"]},
     "UNRATE":    {"name": "UNEMP", "keywords": ["unemployment", "jobless"]},
     "PAYEMS":    {"name": "JOBS",  "keywords": ["nonfarm", "payroll", "jobs added"]},
-    "GDP":       {"name": "GDP",   "keywords": ["gdp", "gross domestic"]},
+    # "GDP" disabled — fred_GDP_sigmoid consistently underperformed (-$13 / 30d)
+    # "GDP":       {"name": "GDP",   "keywords": ["gdp", "gross domestic"]},
     "FEDFUNDS":  {"name": "RATE",  "keywords": ["fed funds", "interest rate"]},
 }
 
@@ -1316,7 +1324,7 @@ async def fetch_fred_series(series_id: str, api_key: str, limit: int = 3) -> Opt
             if obs and obs[0].get("date"):
                 obs_date   = _dt.date.fromisoformat(obs[0]["date"])
                 days_stale = (_dt.date.today() - obs_date).days
-                _stale_threshold = 200 if series_id in ("A191RL1Q225SBEA", "GDP") else 65
+                _stale_threshold = 200 if series_id == "A191RL1Q225SBEA" else 65
                 if days_stale > _stale_threshold:
                     log.warning(
                         "FRED %s: most recent observation is %d days old (%s) — "
@@ -1473,7 +1481,7 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
     econ_markets  = [
         m for m in markets
         if any(kw in m.get("title", "").lower() for kw in econ_keywords)
-        and not m.get("ticker", "").startswith("KXGDP")
+        and not m.get("ticker", "").startswith(("KXGDP", "KXFED"))
         and _market_volume(m) >= 50
     ]
     if not econ_markets:
@@ -1530,7 +1538,7 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
     # typical noise level for that indicator — values beyond ±2 scales from
     # the threshold are treated as high-confidence (outcome nearly certain).
     _ECON_SCALES: dict[str, float] = {
-        "CPIAUCSL": 0.30,    # 30 basis-points of CPI change
+        "CPIAUCSL_PC1": 0.30,  # 0.30pp YoY CPI percent-change noise
         "UNRATE":   0.20,    # 20 bp of unemployment
         "PAYEMS":   50.0,    # 50k payroll jobs (series in thousands)
     }
@@ -1587,7 +1595,10 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
                 projected = latest_val
 
             # Extract threshold from title (handles "above 3.5%" or "below 200k")
-            thresh_match = re.search(r"(\d+\.?\d*)\s*[%k]?", market.get("title", ""))
+            thresh_match = re.search(
+                r"(?:above|below|over|under|exceed|than|least|most)\s+(\d+\.?\d*)\s*[%k]?",
+                market.get("title", ""), re.IGNORECASE,
+            )
             if not thresh_match:
                 continue
             threshold = float(thresh_match.group(1))
@@ -1872,22 +1883,19 @@ async def scan_gdp_markets(
         # the YES signal.  A bet that GDP > T% resolves as an immediate loss
         # when the nowcast is well below T.
         #
-        # Rule: skip YES if gdpnow_estimate < (threshold - 0.50)
-        # Examples (GDPNow=1.31%):
-        #   threshold=2.5 → suppress  (1.31 < 2.0  ✓)
-        #   threshold=2.5 w/ GDPNow=2.3 → allow  (2.3 ≥ 2.0  ✗, don't suppress)
-        #   threshold=2.5 w/ GDPNow=2.8 → allow  (2.8 ≥ 2.0  ✗, don't suppress)
-        if side == "yes" and gdp_estimate < (threshold - 0.50):
+        # Rule: suppress near-certainty bets only — widen buffer to 1.5pp
+        # (GDPNow RMSE ≈ 0.9pp; 0.50pp was too tight and suppressed real edge)
+        if side == "yes" and gdp_estimate < (threshold - 1.5):
             log.debug(
                 "GDP YES suppressed: %s  gdpnow=%.2f%%  threshold=%.2f%%  "
-                "(gdpnow < threshold - 0.50pp)",
+                "(gdpnow < threshold - 1.5pp)",
                 ticker, gdp_estimate, threshold,
             )
             continue
-        if side == "no" and gdp_estimate > (threshold + 0.50):
+        if side == "no" and gdp_estimate > (threshold + 1.5):
             log.debug(
                 "GDP NO suppressed: %s  gdpnow=%.2f%%  threshold=%.2f%%  "
-                "(gdpnow > threshold + 0.50pp — NO bet would lose)",
+                "(gdpnow > threshold + 1.5pp — NO bet would lose)",
                 ticker, gdp_estimate, threshold,
             )
             continue
@@ -1977,12 +1985,12 @@ def _parse_espn_win_prob(event: dict) -> Optional[dict]:
                 if c.get("homeAway") == "home":
                     ml = odds[0]["homeTeamOdds"].get("moneyLine")
                     if ml:
-                        prob = 100 / (100 + abs(ml)) if ml < 0 else abs(ml) / (100 + abs(ml))
+                        prob = abs(ml) / (100 + abs(ml)) if ml < 0 else 100 / (100 + abs(ml))
                         probs[team] = prob
                 else:
                     ml = odds[0]["awayTeamOdds"].get("moneyLine")
                     if ml:
-                        prob = 100 / (100 + abs(ml)) if ml < 0 else abs(ml) / (100 + abs(ml))
+                        prob = abs(ml) / (100 + abs(ml)) if ml < 0 else 100 / (100 + abs(ml))
                         probs[team] = prob
 
         return probs if probs else None
@@ -2064,7 +2072,7 @@ async def scan_sports_markets(markets: list[dict], max_contracts: int) -> list[S
                 title             = title,
                 category          = "sports",
                 side              = side,
-                fair_value        = fair_value if side == "yes" else (1 - fair_value),
+                fair_value        = fair_value,   # always P(YES wins)
                 market_price      = price,
                 edge              = round(edge, 4),
                 fee_adjusted_edge = round(fee_edge, 4),

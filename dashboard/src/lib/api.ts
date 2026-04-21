@@ -79,6 +79,10 @@ export const controls = {
   getStatus:   () => api.get('/controls/status'),
   aiSuggest:   (config: Record<string, unknown>, question: string, perf?: Record<string, unknown>) =>
     api.post('/controls/ai-suggest', { config, question, performance: perf ?? {} }),
+  activity:    (limit = 20) => api.get('/controls/activity', { params: { limit } }),
+  halt:        () => api.post('/controls/halt'),
+  resume:      () => api.post('/controls/resume'),
+  haltStatus:  () => api.get('/controls/halt-status'),
 }
 
 export const admin = {

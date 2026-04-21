@@ -9,13 +9,14 @@ Both run under asyncio.gather() — neither blocks the other.
 """
 
 import asyncio
+import json
 import os
 import re as _re
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from ep_config import cfg, NODE_ID, REDIS_URL, EXIT_INTERVAL, log
+from ep_config import cfg, NODE_ID, REDIS_URL, EXIT_INTERVAL, EP_PRICES, log
 from kalshi_bot.auth     import KalshiAuth, NoAuth
 from kalshi_bot.client   import KalshiClient
 from kalshi_bot.executor import Executor
@@ -42,8 +43,7 @@ def _safe_key(ticker: str) -> str:
 # After a stop-loss or trailing-stop exit, the same market is suppressed for
 # a cooldown period.  Cooldown escalates with repeated stops on the same ticker:
 #   1st stop: 30 min   (COOLDOWN_TIER_1)
-#   2nd stop: 2 h      (COOLDOWN_TIER_2)
-#   3rd+ stop: 24 h    (COOLDOWN_TIER_3)
+#   2nd+ stop: 24 h    (COOLDOWN_TIER_3) — skip tier 2 to stop cycling losses
 # Persisted to Redis (ep:cooldown:{ticker}) so restarts don't reset it.
 _exit_cooldown: dict = {}    # ticker → float timestamp (in-memory fast path)
 _COOLDOWN_SECONDS = 1800     # default / tier-1 (30 min)
@@ -242,10 +242,19 @@ async def _process_signal(
     # exposure so a single meeting doesn't dominate the portfolio.
     if sig.meeting and sig.asset_class == "kalshi":
         all_pos      = await positions.get_all()
-        meeting_count = sum(
-            1 for p in all_pos.values()
-            if p.get("meeting") == sig.meeting
-        )
+        # Arb legs from the same arb_id count as 1 (they're a single hedged position).
+        # Standalone (non-arb) positions each count as 1.
+        _meeting_arb_ids: set = set()
+        _meeting_standalone  = 0
+        for p in all_pos.values():
+            if p.get("meeting") != sig.meeting:
+                continue
+            _aid = p.get("arb_id")
+            if _aid:
+                _meeting_arb_ids.add(_aid)
+            else:
+                _meeting_standalone += 1
+        meeting_count = len(_meeting_arb_ids) + _meeting_standalone
         if meeting_count >= cfg.MAX_POSITIONS_PER_MEETING:
             log.debug(
                 "Meeting concentration limit: %s already has %d/%d positions — skipping %s",
@@ -330,6 +339,10 @@ async def _process_signal(
 
         _cat_exp = _ser_exp = 0
         for _t, _p in _all_pos.items():
+            # Arb legs are structurally hedged — exclude from category/series
+            # exposure accumulation so they don't block new directional signals.
+            if _p.get("arb_id"):
+                continue
             _t_ser  = _t.split("-")[0] if "-" in _t else _t
             _t_cat  = _CATEGORY_MAP.get(_t_ser, "other")
             _t_contracts = _p.get("contracts", 1)
@@ -718,6 +731,27 @@ async def _process_signal(
     )
 
 
+async def _cleanup_stale_prices(bus: RedisBus, max_age_s: int = 86400) -> None:
+    """Delete entries from ep:prices that have not been updated within max_age_s seconds."""
+    try:
+        entries = await bus._r.hgetall(EP_PRICES)
+        now_us = time.time() * 1_000_000
+        stale: list[str] = []
+        for ticker, raw in entries.items():
+            try:
+                data = json.loads(raw)
+                ts_us = data.get("ts_us", 0)
+                if (now_us - ts_us) > max_age_s * 1_000_000:
+                    stale.append(ticker)
+            except Exception:
+                pass
+        if stale:
+            await bus._r.hdel(EP_PRICES, *stale)
+            log.debug("cleanup_stale_prices: removed %d stale entries from ep:prices", len(stale))
+    except Exception as exc:
+        log.debug("cleanup_stale_prices: error (non-fatal): %s", exc)
+
+
 async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
     """Publish a HEARTBEAT event to ep:system every `interval` seconds."""
     while True:
@@ -771,6 +805,143 @@ async def _signal_consumer(
             await bus.ack_signal(entry_id)
 
 
+def _kalshi_entry_cents(mp: dict) -> int:
+    """
+    Compute entry_cents (= YES price at entry) from a Kalshi market_position dict.
+
+    entry_cents convention: always the YES price (0-100) regardless of side.
+
+    When total_traded_dollars / position gives a price outside [1,99] — which
+    happens for positions with a complex fill history (partial exits + re-entries) —
+    fall back to market_exposure_dollars as a proxy for current market value,
+    then derive a current-price entry_cents (makes unrealized_pnl ≈ 0 but keeps
+    total_value accurate).
+    """
+    pos_fp     = float(mp.get("position_fp", 0) or 0)
+    contracts  = int(abs(pos_fp))
+    if contracts == 0:
+        return 50
+    side       = "yes" if pos_fp > 0 else "no"
+    traded_usd = float(mp.get("total_traded_dollars", 0) or 0)
+    avg_price  = traded_usd / contracts if traded_usd > 0 else 0.0
+
+    # avg_price is the per-contract price for the side we hold
+    if side == "yes":
+        entry = round(avg_price * 100)
+    else:
+        # avg_price = NO_price paid; YES_price = 1 - NO_price
+        entry = round((1.0 - avg_price) * 100)
+
+    if 1 <= entry <= 99:
+        return entry
+
+    # Fallback: market_exposure_dollars is the maximum payout (contracts × $1),
+    # not the current mark, so it's only reliable for YES positions.
+    exposure_usd = float(mp.get("market_exposure_dollars", 0) or 0)
+    if exposure_usd > 0 and contracts > 0 and side == "yes":
+        cur_price = exposure_usd / contracts
+        entry = round(cur_price * 100)
+        if 1 <= entry <= 99:
+            return entry
+
+    return 50  # last resort
+
+
+async def _sync_positions_with_kalshi(
+    positions: "PositionStore",
+    executor:  "Executor",
+) -> None:
+    """
+    Reconcile ep:positions against the live Kalshi portfolio.
+
+    - Adds any Kalshi positions missing from Redis.
+    - Updates qty, side, or entry_cents when Redis diverges from Kalshi.
+    - Removes (closes) fill_confirmed Redis entries no longer on Kalshi.
+
+    Skips entries with fill_confirmed=False (pending orders).
+    """
+    try:
+        resp = await asyncio.to_thread(executor.client.get, "/portfolio/positions",
+                                       params={"limit": 200})
+    except Exception as exc:
+        log.warning("Position sync: Kalshi API call failed (%s)", exc)
+        return
+
+    kalshi_map: dict[str, dict] = {}
+    for mp in resp.get("market_positions", []):
+        ticker = mp.get("ticker", "")
+        pos_fp = float(mp.get("position_fp", 0) or 0)
+        if ticker and abs(pos_fp) >= 1:
+            kalshi_map[ticker] = mp
+
+    redis_positions = await positions.get_all()
+    added = updated = removed = 0
+
+    # ── Add / update from Kalshi source of truth ─────────────────────────────
+    for ticker, mp in kalshi_map.items():
+        pos_fp    = float(mp["position_fp"])
+        k_side    = "yes" if pos_fp > 0 else "no"
+        k_qty     = int(abs(pos_fp))
+        k_entry   = _kalshi_entry_cents(mp)
+
+        existing = redis_positions.get(ticker, {})
+        r_qty    = int(existing.get("contracts", 0))
+        r_side   = existing.get("side", "")
+        r_entry  = int(existing.get("entry_cents", 0))
+
+        if r_qty > 0 and r_side == k_side and r_qty == k_qty and abs(r_entry - k_entry) <= 2:
+            continue  # already correct
+
+        if r_qty == 0:
+            if existing:
+                # contracts=0 tombstone in Redis — blocked from re-entry, skip.
+                continue
+            # Genuinely missing from Redis — open fresh
+            await positions.open(ticker=ticker, side=k_side, contracts=k_qty,
+                                 entry_cents=k_entry, fair_value=k_entry / 100.0,
+                                 pending=False)
+            await positions.update_fields(ticker, {"fill_confirmed": True, "order_id": ""})
+            added += 1
+        else:
+            # Update diverged fields in-place
+            patch: dict = {"fill_confirmed": True}
+            if r_qty != k_qty:
+                patch["contracts"] = k_qty
+            if r_side != k_side:
+                patch["side"] = k_side
+            if abs(r_entry - k_entry) > 2:
+                patch["entry_cents"] = k_entry
+            await positions.update_fields(ticker, patch)
+            updated += 1
+
+        if executor is not None:
+            executor._positions[ticker] = {
+                "side": k_side, "entry_cents": k_entry,
+                "contracts": k_qty, "fill_confirmed": True,
+            }
+
+    # ── Remove stale confirmed positions no longer on Kalshi ─────────────────
+    for ticker, pos in redis_positions.items():
+        if not pos.get("fill_confirmed", False):
+            continue
+        if int(pos.get("contracts", 0)) == 0:
+            continue
+        if ticker in kalshi_map:
+            continue
+        await positions.close(ticker)
+        if executor is not None:
+            executor._positions.pop(ticker, None)
+        removed += 1
+        log.info("Position sync: removed stale %s (not in Kalshi portfolio)", ticker)
+
+    if added or updated or removed:
+        log.warning("Position sync: +%d added, ~%d updated, -%d removed",
+                    added, updated, removed)
+    else:
+        log.debug("Position sync: ep:positions matches Kalshi (%d positions)",
+                  len(kalshi_map))
+
+
 async def _exit_checker(
     bus:         RedisBus,
     positions:   PositionStore,
@@ -785,9 +956,27 @@ async def _exit_checker(
     Runs independently of _signal_consumer.
     """
     log.info("Exit checker started (interval=%ds)", EXIT_INTERVAL)
+    _last_price_cleanup   = 0.0
+    _last_pos_sync        = 0.0
 
     while True:
         await asyncio.sleep(EXIT_INTERVAL)
+
+        # ── Hourly stale-price cleanup ────────────────────────────────────────
+        _now = time.time()
+        if _now - _last_price_cleanup >= 3600:
+            await _cleanup_stale_prices(bus)
+            _last_price_cleanup = _now
+
+        # ── Every 30 min: sync ep:positions against Kalshi portfolio ─────────
+        # Adds missing filled positions and removes stale entries that Kalshi
+        # no longer holds (resolved markets, externally closed positions).
+        if _now - _last_pos_sync >= 1800:
+            try:
+                await _sync_positions_with_kalshi(positions, executor)
+                _last_pos_sync = time.time()
+            except Exception as _sync_exc:
+                log.warning("Periodic position sync error: %s", _sync_exc)
 
         try:
             # ── Auto-tombstone: consume ep:tombstone:{ticker} keys from Intel ──
@@ -796,11 +985,11 @@ async def _exit_checker(
             try:
                 _tombstone_keys = await bus._r.keys("ep:tombstone:*")
                 for _tk in _tombstone_keys:
-                    _t_ticker = _tk.decode() if isinstance(_tk, bytes) else _tk
-                    _t_ticker = _t_ticker.replace("ep:tombstone:", "")
+                    _raw_tk   = _tk.decode() if isinstance(_tk, bytes) else _tk
+                    _t_ticker = _raw_tk.replace("ep:tombstone:", "")
                     log.info("Auto-tombstone triggered for %s — calling cancel_and_tombstone",
                              _t_ticker)
-                    await bus._r.delete(f"ep:tombstone:{_safe_key(_t_ticker)}")
+                    await bus._r.delete(_raw_tk)   # delete raw key — _safe_key strips dots
                     await cancel_and_tombstone(_t_ticker, executor.client, positions, executor)
             except Exception as _tomb_exc:
                 log.debug("Tombstone consumer error (non-fatal): %s", _tomb_exc)
@@ -986,7 +1175,11 @@ async def _exit_checker(
                     if ticker == "BTC-USD"
                     else raw_price
                 )
-                entry_cents = pos["entry_cents"]
+                entry_cents = pos.get("entry_cents")
+                if entry_cents is None:
+                    log.warning("Missing entry_cents for %s — skipping", ticker)
+                    continue
+                entry_cents = int(entry_cents)
                 side        = pos["side"]
                 contracts   = pos.get("contracts_filled") or pos.get("contracts", 1)
                 if contracts == 0:
@@ -1035,26 +1228,27 @@ async def _exit_checker(
                 exit_reason: Optional[str] = None
 
                 # ── Near-certain hold: suppress pre-expiry exits ──────────────
-                # If the YES price is at or below the threshold (≤8¢ default), the
-                # contract is near-certain to resolve NO — hold to auto-resolution
-                # and collect the full 100¢ payout instead of selling early at a
-                # loss.  Same logic applies in reverse: if YES ≥ (100-threshold),
-                # the contract is near-certain to resolve YES — also hold.
-                # This check only applies to Kalshi; BTC falls through normally.
+                # Only suppress when we're on the WINNING side of a near-certain
+                # outcome — let normal exit logic run when we'd be holding a loser.
+                #   YES holder + near-certain NO (YES ≤ 8¢) → hold for full payout
+                #   NO  holder + near-certain YES (YES ≥ 92¢) → hold for full payout
+                # The inverse cases (wrong-side near-certain) should exit ASAP.
                 _near_certain_skip = False
                 if asset_class == "kalshi":
                     _nc_thresh = KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS
-                    if current_cents <= _nc_thresh:
+                    if current_cents <= _nc_thresh and side == "no":
+                        # Near-certain NO and we hold NO → let it resolve for full $1
                         log.info(
                             "Near-certain NO detected %s: YES price=%d¢ ≤ %d¢"
-                            " — suppressing pre-expiry exit, holding to resolution",
+                            " — holding NO to resolution",
                             ticker, current_cents, _nc_thresh,
                         )
                         _near_certain_skip = True
-                    elif current_cents >= (100 - _nc_thresh):
+                    elif current_cents >= (100 - _nc_thresh) and side in ("yes", "buy"):
+                        # Near-certain YES and we hold YES → let it resolve for full $1
                         log.info(
                             "Near-certain YES detected %s: YES price=%d¢ ≥ %d¢"
-                            " — suppressing pre-expiry exit, holding to resolution",
+                            " — holding YES to resolution",
                             ticker, current_cents, 100 - _nc_thresh,
                         )
                         _near_certain_skip = True
@@ -1072,16 +1266,20 @@ async def _exit_checker(
                             close_dt - datetime.now(timezone.utc)
                         ).total_seconds() / 3600
 
-                        if 0 < hours_remaining < hours_before_close * 2 and tranche_done == 0:
+                        if 0 < hours_remaining < hours_before_close * 2 and tranche_done == 0 and move_cents > 0:
                             if hours_remaining >= hours_before_close and contracts > 1:
                                 # TRANCHE 1 — partial exit (half contracts)
                                 half      = contracts // 2
                                 remaining = contracts - half
-                                executor._exit_position(
-                                    ticker, {**pos, "contracts": half},
-                                    current_cents,
-                                    f"pre_expiry_t1 ({hours_remaining:.1f}h)",
-                                )
+                                try:
+                                    executor._exit_position(
+                                        ticker, {**pos, "contracts": half},
+                                        current_cents,
+                                        f"pre_expiry_t1 ({hours_remaining:.1f}h)",
+                                    )
+                                except Exception as _t1_exc:
+                                    log.warning("T1 _exit_position failed for %s: %s", ticker, _t1_exc)
+                                    continue
                                 await positions.update_fields(ticker, {
                                     "contracts":    remaining,
                                     "tranche_done": 1,
@@ -1107,7 +1305,7 @@ async def _exit_checker(
                                 # Single contract or already past t2 — full exit now
                                 exit_reason = f"pre_expiry ({hours_remaining:.1f}h)"
 
-                        elif 0 < hours_remaining < hours_before_close and tranche_done == 1:
+                        elif 0 < hours_remaining < hours_before_close and tranche_done == 1 and move_cents > 0:
                             # TRANCHE 2 — exit remaining contracts
                             exit_reason = f"pre_expiry_t2 ({hours_remaining:.1f}h)"
 
@@ -1227,9 +1425,11 @@ async def _exit_checker(
                     # Suppress stop-loss within N days of resolution on Kalshi
                     # contracts — prediction markets resolve to 0 or 100¢, so
                     # a correct directional bet should hold through noise.
+                    # Hard cap: never suppress if loss exceeds 2× stop (catastrophic).
                     _near_days = int(os.getenv("KALSHI_NEAR_EXPIRY_NO_STOP_DAYS", "7"))
                     _suppress = False
-                    if close_time_str and asset_class == "kalshi":
+                    _catastrophic = move_cents <= -(stop_loss_cents * 2)
+                    if close_time_str and asset_class == "kalshi" and not _catastrophic:
                         try:
                             _ct = datetime.fromisoformat(
                                 close_time_str.replace("Z", "+00:00")
@@ -1270,12 +1470,10 @@ redis.call('EXPIRE', KEYS[1], ARGV[1])
 return cnt
 """
                             _stop_cnt = int(await bus._r.eval(_atomic_incr_expire, 1, _cnt_key, _STOP_COUNT_TTL))
-                            if _stop_cnt >= 3:
-                                _cd_ttl = _COOLDOWN_TIER_3
-                            elif _stop_cnt >= 2:
-                                _cd_ttl = _COOLDOWN_TIER_2
+                            if _stop_cnt >= 2:
+                                _cd_ttl = _COOLDOWN_TIER_3   # 24h from 2nd stop
                             else:
-                                _cd_ttl = _COOLDOWN_TIER_1
+                                _cd_ttl = _COOLDOWN_TIER_1   # 30 min first stop
                             await bus._r.setex(f"ep:cooldown:{_safe_key(ticker)}", _cd_ttl, "stop_loss")
                         except Exception:
                             _stop_cnt, _cd_ttl = 1, _COOLDOWN_SECONDS
@@ -1339,6 +1537,57 @@ return cnt
                             continue
 
                     await positions.close(ticker)   # only reached on successful exit
+
+                    # ── Arb-group atomicity: when any leg of a butterfly stops out,
+                    # immediately exit all remaining sibling legs sharing the same
+                    # arb_id — leaving them open creates naked unhedged directional risk.
+                    _exit_arb_id = pos.get("arb_id")
+                    if _exit_arb_id:
+                        for _sib_ticker, _sib_pos in list(current_positions.items()):
+                            if _sib_ticker == ticker:
+                                continue
+                            if _sib_pos.get("arb_id") != _exit_arb_id:
+                                continue
+                            _sib_cts = int(
+                                _sib_pos.get("contracts_filled")
+                                or _sib_pos.get("contracts", 0)
+                            )
+                            if _sib_cts <= 0:
+                                await positions.close(_sib_ticker)
+                                continue
+                            _sib_pd    = prices.get(_sib_ticker) or {}
+                            _sib_cents = _sib_pd.get("yes_price") or 50
+                            _sib_rsn   = (
+                                f"arb_group_stop (sibling {ticker} hit {exit_reason})"
+                            )
+                            log.warning(
+                                "[ARB-ATOM] Exiting sibling leg %s  arb_id=%s",
+                                _sib_ticker, _exit_arb_id,
+                            )
+                            _sib_ok = False
+                            try:
+                                executor._exit_position(
+                                    _sib_ticker,
+                                    {**_sib_pos, "contracts": _sib_cts},
+                                    _sib_cents,
+                                    _sib_rsn,
+                                )
+                                _sib_ok = _sib_ticker not in executor._positions
+                            except KeyError:
+                                _sib_ok = True   # already gone from executor state
+                            except Exception as _sib_exc:
+                                log.warning(
+                                    "ARB-ATOM sibling exit failed for %s: %s",
+                                    _sib_ticker, _sib_exc,
+                                )
+                            if _sib_ok:
+                                await positions.close(_sib_ticker)
+                            else:
+                                log.warning(
+                                    "ARB-ATOM: Kalshi rejected exit for %s — "
+                                    "retaining in Redis for retry",
+                                    _sib_ticker,
+                                )
 
                     pnl_cents = move_cents * contracts
                     if risk_engine and asset_class == "btc_spot":
@@ -1473,7 +1722,8 @@ async def _fill_poll_loop(
                         )
 
                     elif fill_count > 0:
-                        # Still resting with partial fills — update count only
+                        # Still resting with partial fills — update count, then
+                        # check if the order has been waiting too long.
                         updates = {"contracts_filled": int(fill_count)}
                         await positions.update_fields(ticker, updates)
                         if executor is not None and ticker in executor._positions:
@@ -1484,6 +1734,44 @@ async def _fill_poll_loop(
                             "PARTIAL FILL: %s  filled=%d/%d  order_id=%.8s",
                             ticker, int(fill_count), int(total_count), order_id,
                         )
+                        # Partial fill timeout: if the order has been resting
+                        # for longer than _RESTING_ORDER_MAX_HOURS, cancel the
+                        # remainder and confirm whatever was actually filled.
+                        _pf_entered = pos.get("entered_at", "")
+                        if _pf_entered:
+                            try:
+                                _pf_dt  = datetime.fromisoformat(
+                                    _pf_entered.replace("Z", "+00:00")
+                                )
+                                _pf_age = (
+                                    datetime.now(timezone.utc) - _pf_dt
+                                ).total_seconds() / 3600
+                                if _pf_age > _RESTING_ORDER_MAX_HOURS:
+                                    log.warning(
+                                        "PARTIAL FILL TIMEOUT: %s  age=%.1fh  "
+                                        "filled=%d/%d — canceling remainder",
+                                        ticker, _pf_age, int(fill_count), int(total_count),
+                                    )
+                                    try:
+                                        await asyncio.to_thread(
+                                            client._request, "DELETE",
+                                            f"/portfolio/orders/{order_id}",
+                                        )
+                                    except Exception as _pf_del:
+                                        log.debug(
+                                            "Partial fill cancel failed for %s: %s",
+                                            ticker, _pf_del,
+                                        )
+                                    _pf_updates = {
+                                        "fill_confirmed":   True,
+                                        "contracts":        int(fill_count),
+                                        "contracts_filled": int(fill_count),
+                                    }
+                                    await positions.update_fields(ticker, _pf_updates)
+                                    if executor is not None and ticker in executor._positions:
+                                        executor._positions[ticker].update(_pf_updates)
+                            except (ValueError, TypeError):
+                                pass
 
                     elif status == "canceled":
                         log.warning(
@@ -1810,7 +2098,6 @@ async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> No
     Publish exec-node performance summary to Redis ep:performance every hour.
     Intel node reads this key to display real trade stats from the exec node's CSV.
     """
-    import json
     from ep_resolution_db import get_performance_summary
     log.info("Performance publisher started (interval=%ds)", interval)
     while True:
@@ -1960,6 +2247,9 @@ async def exec_main() -> None:
     # Must run after the Redis cleanup above so tombstones are respected.
     if not cfg.PAPER_TRADE:
         await _reconcile_orphan_orders(positions, client, executor)
+        # Full position sync: fixes qty/side/entry_cents divergence that
+        # can accumulate between reconcile runs.
+        await _sync_positions_with_kalshi(positions, executor)
     else:
         log.info("Paper trade mode — skipping orphan order reconciliation.")
 
@@ -1993,3 +2283,23 @@ async def exec_main() -> None:
         await bus.publish_system_event("EXEC_STOP")
         await bus.close()
         log.info("Exec node shutdown complete.")
+
+
+if __name__ == "__main__":
+    import signal as _signal
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(exec_main())
+
+        def _handle_sigterm():
+            log.info("SIGTERM received — initiating graceful shutdown")
+            task.cancel()
+
+        loop.add_signal_handler(_signal.SIGTERM, _handle_sigterm)
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())

@@ -2,9 +2,14 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   TrendingUp, TrendingDown, BarChart2, Clock,
-  Percent, Award, AlertTriangle, Inbox,
+  Percent, Award, AlertTriangle, Inbox, Flame,
 } from 'lucide-react'
-import { api } from '../lib/api'
+import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid,
+  Tooltip, ResponsiveContainer, ReferenceLine,
+  BarChart, Bar, Cell, LabelList,
+} from 'recharts'
+import { api, controls } from '../lib/api'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -21,6 +26,12 @@ interface PerformanceSummary {
   worst_trade:        { ticker: string; pnl_cents: number; strategy: string } | null
   avg_hold_time_hours: number
   sharpe_daily:       number | null
+  streak_current:     number
+  streak_best:        number
+  avg_win_cents:      number
+  avg_loss_cents:     number
+  expectancy_cents:   number
+  pnl_distribution:   Array<{ bucket: string; count: number; pnl_cents: number }>
 }
 
 type Period = 7 | 30 | 90
@@ -230,7 +241,7 @@ function PeriodSelector({ value, onChange }: { value: Period; onChange: (p: Peri
         <button
           key={p}
           onClick={() => onChange(p)}
-          className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all duration-150 ${
+          className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all duration-150 min-w-[48px] ${
             value === p
               ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-sm'
               : 'text-slate-400 hover:text-white'
@@ -252,6 +263,21 @@ export default function PerformancePage() {
     queryKey: ['performance', days],
     queryFn:  () => api.get('/performance', { params: { days } }).then(r => r.data),
     staleTime: 60_000,
+    refetchInterval: 30_000,
+  })
+
+  const { data: equityData } = useQuery<Array<{ date: string; cumulative_pnl_cents: number }>>({
+    queryKey: ['equity-curve', days],
+    queryFn: () => api.get('/performance/equity-curve', { params: { days } }).then(r => r.data),
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  })
+
+  const { data: botStatus } = useQuery<{ session_pnl?: number; mode?: string }>({
+    queryKey: ['bot-status'],
+    queryFn:  () => controls.getStatus().then(r => r.data),
+    staleTime: 15_000,
+    refetchInterval: 15_000,
   })
 
   const isEmpty = !isLoading && !isError && data?.total_trades === 0
@@ -275,6 +301,23 @@ export default function PerformancePage() {
         </div>
         <PeriodSelector value={days} onChange={setDays} />
       </div>
+
+      {/* ── Session P&L Banner ────────────────────────────────────────────── */}
+      {botStatus?.session_pnl != null && (
+        <div className={`rounded-xl border px-4 py-3 flex items-center justify-between ${
+          botStatus.session_pnl >= 0
+            ? 'bg-emerald-500/8 border-emerald-500/20'
+            : 'bg-rose-500/8 border-rose-500/20'
+        }`}>
+          <div className="flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full animate-pulse ${botStatus.session_pnl >= 0 ? 'bg-emerald-400' : 'bg-rose-400'}`} />
+            <span className="text-xs font-medium text-slate-400">Today's Session P&L</span>
+          </div>
+          <span className={`text-sm font-bold tabular-nums ${botStatus.session_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {botStatus.session_pnl >= 0 ? '+' : ''}${(botStatus.session_pnl / 100).toFixed(2)}
+          </span>
+        </div>
+      )}
 
       {/* ── Stat Cards ────────────────────────────────────────────────────── */}
       {isLoading ? (
@@ -335,7 +378,54 @@ export default function PerformancePage() {
           />
 
           <StatCard
-            label="Sharpe Ratio"
+            label="Expectancy"
+            accent={data.expectancy_cents > 0 ? '#34d399' : '#f87171'}
+            icon={data.expectancy_cents > 0
+              ? <TrendingUp size={18} className="text-emerald-400" />
+              : <TrendingDown size={18} className="text-rose-400" />}
+            value={
+              <span className={pnlClass(data.expectancy_cents)}>
+                {pnlText(data.expectancy_cents)}
+              </span>
+            }
+            sub="Per trade EV"
+          />
+        </div>
+      ) : null}
+
+      {/* ── Secondary Stats Row ───────────────────────────────────────────── */}
+      {data && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <StatCard
+            label="Avg Win"
+            accent="#34d399"
+            value={<span className="text-emerald-400">{data.avg_win_cents > 0 ? pnlText(data.avg_win_cents) : '—'}</span>}
+            sub="Per winning trade"
+          />
+          <StatCard
+            label="Avg Loss"
+            accent="#f87171"
+            value={<span className="text-rose-400">{data.avg_loss_cents < 0 ? pnlText(data.avg_loss_cents) : '—'}</span>}
+            sub="Per losing trade"
+          />
+          <StatCard
+            label="Win Streak"
+            accent="#fbbf24"
+            icon={<Flame size={18} className="text-amber-400" />}
+            value={
+              <span className="text-white">
+                {data.streak_current > 0
+                  ? <span className="text-emerald-400">{data.streak_current}W</span>
+                  : data.streak_current < 0
+                    ? <span className="text-rose-400">{Math.abs(data.streak_current)}L</span>
+                    : <span className="text-slate-400">—</span>
+                }
+              </span>
+            }
+            sub={`Best: ${data.streak_best}W streak`}
+          />
+          <StatCard
+            label="Sharpe"
             accent={data.sharpe_daily != null ? (data.sharpe_daily >= 1 ? '#34d399' : data.sharpe_daily >= 0 ? '#fbbf24' : '#f87171') : '#94a3b8'}
             icon={<Percent size={18} className="text-slate-400" />}
             value={
@@ -347,7 +437,7 @@ export default function PerformancePage() {
             }
           />
         </div>
-      ) : null}
+      )}
 
       {/* ── Error ─────────────────────────────────────────────────────────── */}
       {isError && (
@@ -364,6 +454,53 @@ export default function PerformancePage() {
         <div className="card py-16 flex flex-col items-center gap-3 text-slate-500">
           <Inbox size={36} strokeWidth={1.25} />
           <p className="text-sm">No completed trades in the last {days} days</p>
+        </div>
+      )}
+
+      {/* ── P&L Distribution ─────────────────────────────────────────────── */}
+      {data && data.pnl_distribution && data.pnl_distribution.some(b => b.count > 0) && (
+        <div className="rounded-xl border border-border bg-surface-1 p-5"
+          style={{ borderTopColor: '#6366f1', borderTopWidth: 3, boxShadow: '0 4px 24px rgba(99,102,241,0.08)' }}>
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-300">P&L Distribution</h2>
+              <p className="text-xs text-slate-500 mt-0.5">Trade outcomes by size · {days}d window</p>
+            </div>
+            <span className="text-xs text-slate-500">{data.total_trades} trades</span>
+          </div>
+          <ResponsiveContainer width="100%" height={160}>
+            <BarChart data={data.pnl_distribution} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+              <CartesianGrid vertical={false} stroke="#1e2d4d" />
+              <XAxis dataKey="bucket" tick={{ fill: '#64748b', fontSize: 10 }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fill: '#64748b', fontSize: 11 }} axisLine={false} tickLine={false} allowDecimals={false} width={28} />
+              <Tooltip
+                content={({ active, payload }) => {
+                  if (!active || !payload?.length) return null
+                  const d = payload[0].payload
+                  return (
+                    <div className="bg-surface-1 border border-border rounded-lg px-3 py-2 text-xs shadow-lg">
+                      <p className="text-slate-300 font-medium mb-0.5">{d.bucket}</p>
+                      <p className="text-slate-400">{d.count} trades</p>
+                      <p className={d.pnl_cents >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                        {d.pnl_cents >= 0 ? '+' : ''}${(d.pnl_cents / 100).toFixed(2)} total
+                      </p>
+                    </div>
+                  )
+                }}
+                cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+              />
+              <Bar dataKey="count" radius={[4, 4, 0, 0]}>
+                {data.pnl_distribution.map((entry, i) => (
+                  <Cell
+                    key={i}
+                    fill={entry.bucket.startsWith('<') || entry.bucket.startsWith('-') ? '#f87171' : '#34d399'}
+                    fillOpacity={0.85}
+                  />
+                ))}
+                <LabelList dataKey="count" position="top" style={{ fill: '#64748b', fontSize: 10 }} />
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
         </div>
       )}
 
@@ -385,31 +522,59 @@ export default function PerformancePage() {
           {isLoading ? (
             <StrategySkeleton />
           ) : data && sortedStrategies.length > 0 ? (
-            <div className="overflow-x-auto -mx-5 px-5">
-              <table className="w-full text-sm min-w-[480px]">
-                <thead>
-                  <tr className="border-b border-border text-left">
-                    {['Strategy', 'Trades', 'Win Rate', 'P&L'].map(col => (
-                      <th key={col} className="pb-2.5 pr-6 text-xs font-medium text-slate-500 whitespace-nowrap last:pr-0">
-                        {col}
-                      </th>
+            <>
+              {/* Mobile strategy cards */}
+              <div className="md:hidden space-y-2">
+                {sortedStrategies.map(([name, stats]) => {
+                  const wr    = stats.trades > 0 ? (stats.wins / stats.trades * 100).toFixed(0) : '0'
+                  const isPos = stats.pnl_cents >= 0
+                  return (
+                    <div key={name} className="rounded-xl border border-border bg-surface-2/60 p-3">
+                      <div className="flex items-start justify-between gap-2 mb-2">
+                        <span className="font-mono text-sm text-slate-200 truncate">{name}</span>
+                        <span className={`text-sm font-bold tabular-nums shrink-0 ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {pnlText(stats.pnl_cents)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3 text-xs text-slate-500">
+                        <span>{stats.trades} trades</span>
+                        <span>·</span>
+                        <span className={parseInt(wr) >= 55 ? 'text-emerald-400' : parseInt(wr) >= 45 ? 'text-amber-400' : 'text-rose-400'}>
+                          {wr}% win rate
+                        </span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Desktop table */}
+              <div className="hidden md:block overflow-x-auto -mx-5 px-5">
+                <table className="w-full text-sm min-w-[480px]">
+                  <thead>
+                    <tr className="border-b border-border text-left">
+                      {['Strategy', 'Trades', 'Win Rate', 'P&L'].map(col => (
+                        <th key={col} className="pb-2.5 pr-6 text-xs font-medium text-slate-500 whitespace-nowrap last:pr-0">
+                          {col}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border/50">
+                    {sortedStrategies.map(([name, stats]) => (
+                      <StrategyRow
+                        key={name}
+                        name={name}
+                        trades={stats.trades}
+                        wins={stats.wins}
+                        pnl_cents={stats.pnl_cents}
+                        maxAbsPnl={maxAbsPnl}
+                      />
                     ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border/50">
-                  {sortedStrategies.map(([name, stats]) => (
-                    <StrategyRow
-                      key={name}
-                      name={name}
-                      trades={stats.trades}
-                      wins={stats.wins}
-                      pnl_cents={stats.pnl_cents}
-                      maxAbsPnl={maxAbsPnl}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </tbody>
+                </table>
+              </div>
+            </>
           ) : (
             !isLoading && (
               <div className="py-8 text-center text-slate-500 text-sm">No strategy data available</div>
@@ -437,6 +602,75 @@ export default function PerformancePage() {
           ) : null}
         </div>
       )}
+
+      {/* ── Equity Curve ──────────────────────────────────────────────────── */}
+      {equityData && equityData.length > 1 && equityData.every(pt => /^\d{4}-\d{2}-\d{2}$/.test(pt.date ?? '')) && (() => {
+        const chartPoints = equityData.map(pt => {
+          const [year, month, day] = pt.date.split('-').map(Number)
+          const d = new Date(year, month - 1, day)
+          const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+          return { label, value: pt.cumulative_pnl_cents }
+        })
+        const lastVal   = equityData[equityData.length - 1].cumulative_pnl_cents
+        const lineColor = lastVal >= 0 ? '#34d399' : '#f87171'
+        const values    = chartPoints.map(p => p.value)
+        const minVal    = Math.min(...values)
+        const maxVal    = Math.max(...values)
+        const padding   = Math.max(Math.abs(maxVal - minVal) * 0.1, 1)
+        const yDomain: [number, number] = [minVal - padding, maxVal + padding]
+
+        return (
+          <div
+            className="rounded-xl border border-border bg-surface-1 p-5"
+            style={{ borderTopColor: '#60a5fa', borderTopWidth: 3, boxShadow: '0 4px 24px rgba(96,165,250,0.08)' }}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-300">Equity Curve</h2>
+                <p className="text-xs text-slate-500 mt-0.5">Cumulative realized P&amp;L · {days}d</p>
+              </div>
+              <span className={`text-sm font-bold tabular-nums ${lastVal >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {lastVal >= 0 ? '+' : '-'}${(Math.abs(lastVal) / 100).toFixed(2)}
+              </span>
+            </div>
+
+            <ResponsiveContainer width="100%" height={140}>
+              <AreaChart data={chartPoints} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="equityGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={lineColor} stopOpacity={0.05} />
+                    <stop offset="100%" stopColor={lineColor} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid vertical={false} stroke="#1e293b" />
+                <XAxis
+                  dataKey="label"
+                  tick={{ fill: '#475569', fontSize: 10 }}
+                  tickLine={false}
+                  axisLine={false}
+                  interval="preserveStartEnd"
+                />
+                <YAxis hide domain={yDomain} />
+                <Tooltip
+                  contentStyle={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: 8, fontSize: 12 }}
+                  labelStyle={{ color: '#94a3b8' }}
+                  formatter={(v) => { const n = Number(v ?? 0); return [(n >= 0 ? '+' : '-') + '$' + (Math.abs(n) / 100).toFixed(2), 'Cum. P&L'] as [string, string]; }}
+                />
+                <ReferenceLine y={0} stroke="#334155" strokeDasharray="3 3" />
+                <Area
+                  type="monotone"
+                  dataKey="value"
+                  stroke={lineColor}
+                  strokeWidth={2}
+                  fill="url(#equityGrad)"
+                  dot={false}
+                  isAnimationActive={false}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        )
+      })()}
     </div>
   )
 }

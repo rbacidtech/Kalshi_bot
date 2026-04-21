@@ -936,6 +936,65 @@ async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
         await _write_pnl_snapshot(bus)
 
 
+async def _exec_watchdog_loop(bus: RedisBus, interval: int = 60) -> None:
+    """Watch for stalled exec node by monitoring ep:executions stream freshness.
+
+    Only fires an alert when Intel is actively sending signals (ep:signals is
+    fresh) but no EXECUTION_REPORT has appeared within EXEC_WATCHDOG_TIMEOUT_S
+    seconds — distinguishing a genuine exec stall from a quiet market period.
+    """
+    timeout_s = int(os.getenv("EXEC_WATCHDOG_TIMEOUT_S", "600"))
+    stale_count = 0
+    last_alert_at = 0.0
+    log.info("Exec watchdog started (timeout=%ds, check_interval=%ds)", timeout_s, interval)
+
+    await asyncio.sleep(120)  # grace period on startup — let exec initialise
+
+    while True:
+        try:
+            now_us = time.time() * 1_000_000
+
+            # Check last execution report
+            exec_entries   = await bus._r.xrevrange("ep:executions", count=1)
+            signal_entries = await bus._r.xrevrange("ep:signals",    count=1)
+
+            last_exec_us   = int(exec_entries[0][1].get("ts_us", 0))   if exec_entries   else 0
+            last_signal_us = int(signal_entries[0][1].get("ts_us", 0)) if signal_entries else 0
+
+            exec_age_s   = (now_us - last_exec_us)   / 1_000_000 if last_exec_us   else float("inf")
+            signal_age_s = (now_us - last_signal_us) / 1_000_000 if last_signal_us else float("inf")
+
+            exec_stale   = exec_age_s   > timeout_s
+            signal_fresh = signal_age_s < timeout_s  # Intel IS sending signals
+
+            if exec_stale and signal_fresh:
+                stale_count += 1
+                log.warning(
+                    "Exec watchdog: last EXECUTION_REPORT %.0fs ago (threshold %ds) — stale_count=%d",
+                    exec_age_s, timeout_s, stale_count,
+                )
+                if stale_count >= 3 and (time.time() - last_alert_at) > 1800:
+                    msg = (
+                        f"\U0001f6a8 EdgePulse EXEC STALL \u2014 no EXECUTION_REPORT in {exec_age_s/60:.0f}m. "
+                        f"Intel is sending signals but Exec appears down."
+                    )
+                    log.critical(msg)
+                    try:
+                        await _telegram.send_alert(msg)
+                    except Exception:
+                        pass
+                    last_alert_at = time.time()
+            else:
+                if stale_count > 0:
+                    log.info("Exec watchdog: exec recovered (exec_age=%.0fs)", exec_age_s)
+                stale_count = 0
+
+        except Exception as exc:
+            log.debug("Exec watchdog error: %s", exc)
+
+        await asyncio.sleep(interval)
+
+
 async def intel_main() -> None:
     setup_logging(cfg.OUTPUT_DIR / "logs")
     cfg.validate()
@@ -977,8 +1036,9 @@ async def intel_main() -> None:
     bus = RedisBus(REDIS_URL, NODE_ID)
     await bus.connect()
     await bus.publish_system_event("INTEL_START", f"mode={mode_label}")
-    heartbeat_task      = asyncio.create_task(_heartbeat_loop(bus))
+    heartbeat_task       = asyncio.create_task(_heartbeat_loop(bus))
     release_monitor_task = asyncio.create_task(_release_monitor_loop(bus))
+    exec_watchdog_task   = asyncio.create_task(_exec_watchdog_loop(bus))
 
     # ── BTC mean-reversion strategy ───────────────────────────────────────────
     # Candle data: uses Polygon if POLYGON_API_KEY is set, otherwise falls back
@@ -2017,9 +2077,30 @@ async def intel_main() -> None:
     finally:
         heartbeat_task.cancel()
         release_monitor_task.cancel()
-        await asyncio.gather(heartbeat_task, release_monitor_task, return_exceptions=True)
+        exec_watchdog_task.cancel()
+        await asyncio.gather(heartbeat_task, release_monitor_task, exec_watchdog_task, return_exceptions=True)
         ws.stop()
         await bus.publish_system_event("INTEL_STOP")
         await bus.close()
         summary.print_summary()
         log.info("Intel node shutdown complete.")
+
+
+if __name__ == "__main__":
+    import signal as _signal
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(intel_main())
+
+        def _handle_sigterm():
+            log.info("SIGTERM received — initiating graceful shutdown")
+            task.cancel()
+
+        loop.add_signal_handler(_signal.SIGTERM, _handle_sigterm)
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())

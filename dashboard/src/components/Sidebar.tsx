@@ -1,6 +1,8 @@
 import { NavLink } from 'react-router-dom'
 import { ChartBar, Key, CreditCard, Shield, SlidersHorizontal, TrendingUp, LogOut, X } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
 import { useAuth } from '../lib/auth'
+import { positions as positionsApi, controls, performance as perfApi } from '../lib/api'
 
 const TIER_BADGE: Record<string, string> = {
   free:          'badge-muted',
@@ -28,6 +30,49 @@ interface SidebarProps {
 
 export default function Sidebar({ onClose }: SidebarProps) {
   const { user, logout } = useAuth()
+
+  // Read from cache — DashboardPage fetches these; no extra network calls
+  const { data: portfolio } = useQuery({
+    queryKey: ['portfolio'],
+    queryFn:  () => positionsApi.portfolio().then(r => r.data),
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  })
+  const { data: botStatus } = useQuery({
+    queryKey: ['bot-status'],
+    queryFn:  () => controls.getStatus().then(r => r.data),
+    staleTime: 15_000,
+    refetchInterval: 15_000,
+    enabled: !!user?.is_admin,
+  })
+  const { data: botCfg } = useQuery({
+    queryKey: ['bot-config'],
+    queryFn:  () => controls.getConfig().then(r => r.data),
+    staleTime: 30_000,
+    enabled: !!user?.is_admin,
+  })
+  const { data: perfData } = useQuery({
+    queryKey: ['performance', 30],
+    queryFn:  () => perfApi.summary(30).then(r => r.data),
+    staleTime: 60_000,
+  })
+
+  // Drawdown alert: session loss > 50% of daily limit
+  const ddLimit    = (botCfg as any)?.daily_drawdown_limit ?? 0.10
+  const sessionPnl = (botStatus as any)?.session_pnl ?? 0
+  const balCents   = (botStatus as any)?.balance_cents ?? 1
+  const ddPct      = Math.abs(Math.min(0, sessionPnl)) / balCents
+  const hasDDAlert = !!user?.is_admin && ddPct > ddLimit * 0.5
+
+  // Aging position alert: any position older than 2× avg hold time
+  const avgHold  = ((perfData as any)?.avg_hold_time_hours ?? 0) * 3_600_000
+  const hasAging = avgHold > 0 && ((portfolio as any)?.positions ?? []).some((p: any) => {
+    if (!p.entered_at) return false
+    return (Date.now() - new Date(p.entered_at).getTime()) > 2 * avgHold
+  })
+
+  const hasAlert   = hasDDAlert || hasAging
+  const alertColor = hasDDAlert ? 'bg-rose-500' : 'bg-amber-400'
 
   const navItems: NavItem[] = [
     { to: '/dashboard',    icon: <ChartBar size={16} />,          label: 'Portfolio'    },
@@ -85,16 +130,22 @@ export default function Sidebar({ onClose }: SidebarProps) {
           <NavLink
             key={to}
             to={to}
-            className={({ isActive }) =>
-              [
-                'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-150',
-                isActive
-                  ? 'bg-gradient-to-r from-blue-600/20 to-indigo-600/10 text-white border-l-2 border-blue-400 pl-[10px] shadow-[inset_0_0_12px_rgba(96,165,250,0.08)]'
-                  : 'text-muted hover:text-slate-200 hover:bg-surface-2 border-l-2 border-transparent pl-[10px]',
-              ].join(' ')
-            }
+            onClick={onClose}
+            className={({ isActive }) => [
+              'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-150',
+              isActive
+                ? 'bg-gradient-to-r from-blue-600/20 to-indigo-600/10 text-white border-l-2 border-blue-400 pl-[10px] shadow-[inset_0_0_12px_rgba(96,165,250,0.08)]'
+                : 'text-muted hover:text-slate-200 hover:bg-surface-2 border-l-2 border-transparent pl-[10px]',
+            ].join(' ')}
           >
-            {icon}
+            <span className="relative shrink-0">
+              {icon}
+              {to === '/dashboard' && hasAlert && (
+                <span className={`absolute -top-1 -right-1 w-2 h-2 rounded-full ${alertColor} ring-2 ring-surface-1`}>
+                  <span className={`absolute inset-0 rounded-full ${alertColor} animate-ping opacity-75`} />
+                </span>
+              )}
+            </span>
             {label}
           </NavLink>
         ))}
