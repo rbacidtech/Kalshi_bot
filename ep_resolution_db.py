@@ -48,18 +48,27 @@ def _parse_ts(ts_str: str) -> Optional[datetime]:
         return None
 
 
-def _load_completed_trades(csv_path: Path, since: datetime) -> List[dict]:
+def _load_completed_trades(
+    csv_path: Path,
+    since: datetime,
+    mode: Optional[str] = None,
+) -> List[dict]:
     """
     Read the trades CSV and return a list of completed-trade dicts, each
     representing a matched entry+exit pair for the same ticker.
 
     Only trades whose *exit* timestamp falls within [since, now] are included.
+    Pass mode="live" or mode="paper" to filter by trade mode.
+
+    Orphan exits (no matching entry, or more exits than entries) are silently
+    skipped — they represent repeated exit-checker firings on a stale position
+    and should not count as real trades.
 
     Returned dict keys:
         ticker, strategy, side, contracts,
         entry_price_cents, exit_price_cents,
         entry_ts, exit_ts,
-        hold_seconds, pnl_cents
+        hold_seconds, pnl_cents, mode
     """
     if not csv_path.exists():
         log.debug("Trades CSV not found at %s — returning empty list.", csv_path)
@@ -91,20 +100,29 @@ def _load_completed_trades(csv_path: Path, since: datetime) -> List[dict]:
     for ticker, exit_rows in exits.items():
         entry_rows = entries.get(ticker, [])
         if not entry_rows:
-            continue   # orphan exit — no paired entry
+            continue   # orphan exit — no paired entry at all
 
         # Sort both lists by timestamp so earliest entry pairs with earliest exit
         entry_rows_sorted = sorted(entry_rows, key=lambda r: r.get("timestamp", ""))
         exit_rows_sorted  = sorted(exit_rows,  key=lambda r: r.get("timestamp", ""))
 
         for i, exit_row in enumerate(exit_rows_sorted):
+            # Strict 1:1 pairing — skip exits that have no matching entry.
+            # Excess exits are orphans from repeated exit-checker firings on a
+            # stale Redis position (e.g. positions.close() failed transiently).
+            if i >= len(entry_rows_sorted):
+                break
+
             exit_ts = _parse_ts(exit_row.get("timestamp", ""))
             if exit_ts is None or exit_ts < since:
                 continue
 
-            # Use the matching entry row (same index if available, else first)
-            entry_row = entry_rows_sorted[i] if i < len(entry_rows_sorted) else entry_rows_sorted[0]
+            entry_row = entry_rows_sorted[i]
             entry_ts  = _parse_ts(entry_row.get("timestamp", ""))
+
+            row_mode = (entry_row.get("mode") or exit_row.get("mode") or "paper").strip().lower()
+            if mode is not None and row_mode != mode.lower():
+                continue
 
             try:
                 entry_price_cents = int(entry_row.get("price_cents", 0) or 0)
@@ -142,6 +160,7 @@ def _load_completed_trades(csv_path: Path, since: datetime) -> List[dict]:
                 "exit_ts":            exit_ts,
                 "hold_seconds":       hold_seconds,
                 "pnl_cents":          pnl_cents,
+                "mode":               row_mode,
             })
 
     return completed
@@ -185,16 +204,18 @@ async def get_performance_summary(days: int = 30) -> dict:
     Return a performance summary dict for the last `days` calendar days.
 
     All monetary values are in **cents** (100 cents = $1.00).
-
-    The function is async for consistency with the rest of the async codebase;
-    the CSV I/O is synchronous and fast enough not to need executor offloading
-    for the file sizes expected in practice.
+    Includes separate paper/live breakdowns so the dashboard can display
+    real P&L independently of paper-simulation history.
     """
     now   = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
 
     csv_path = Path(cfg.TRADES_CSV)
-    trades   = _load_completed_trades(csv_path, since)
+    trades   = _load_completed_trades(csv_path, since)  # all modes
+
+    # Separate live and paper for the mode breakdown
+    live_trades  = [t for t in trades if t.get("mode") == "live"]
+    paper_trades = [t for t in trades if t.get("mode") != "live"]
 
     # -- Aggregate totals ------------------------------------------------------
     total_trades = len(trades)
@@ -274,6 +295,12 @@ async def get_performance_summary(days: int = 30) -> dict:
             "pnl_cents": sum(t["pnl_cents"] for t in bucket_trades),
         })
 
+    # Mode breakdown — live and paper totals separately
+    live_pnl   = sum(t["pnl_cents"] for t in live_trades)
+    live_wins  = sum(1 for t in live_trades if t["pnl_cents"] > 0)
+    paper_pnl  = sum(t["pnl_cents"] for t in paper_trades)
+    paper_wins = sum(1 for t in paper_trades if t["pnl_cents"] > 0)
+
     return {
         "period_days":        days,
         "total_trades":       total_trades,
@@ -287,12 +314,19 @@ async def get_performance_summary(days: int = 30) -> dict:
         "worst_trade":        worst_trade,
         "avg_hold_time_hours": avg_hold_hours,
         "sharpe_daily":       sharpe,
-        "streak_current":    streak_current,
-        "streak_best":       streak_best,
-        "avg_win_cents":     avg_win_cents,
-        "avg_loss_cents":    avg_loss_cents,
-        "expectancy_cents":  expectancy_cents,
-        "pnl_distribution":  pnl_distribution,
+        "streak_current":     streak_current,
+        "streak_best":        streak_best,
+        "avg_win_cents":      avg_win_cents,
+        "avg_loss_cents":     avg_loss_cents,
+        "expectancy_cents":   expectancy_cents,
+        "pnl_distribution":   pnl_distribution,
+        # Mode-separated P&L — use these for real performance assessment
+        "live_trades":        len(live_trades),
+        "live_wins":          live_wins,
+        "live_pnl_cents":     live_pnl,
+        "paper_trades":       len(paper_trades),
+        "paper_wins":         paper_wins,
+        "paper_pnl_cents":    paper_pnl,
     }
 
 

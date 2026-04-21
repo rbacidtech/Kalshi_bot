@@ -1740,6 +1740,13 @@ return cnt
                                         ticker, _pc_exc,
                                     )
 
+                        # For paper mode: mark pending_exit=True before calling
+                        # _exit_position so that if positions.close() fails and
+                        # the position persists in Redis, the next exit-checker
+                        # cycle skips it (prevents repeated CSV exit rows).
+                        if cfg.PAPER_TRADE and not pos.get("pending_exit"):
+                            await positions.update_fields(ticker, {"pending_exit": True})
+
                         _exit_order_id = ""
                         try:
                             # Pass contracts explicitly so _exit_position uses the
