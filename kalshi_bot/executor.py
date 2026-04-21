@@ -232,6 +232,7 @@ class Executor:
         self,
         legs: list,
         contracts_per_leg: int = 1,
+        parent_signal = None,
     ) -> list:
         """
         Place each leg of a structural arb sequentially (flat sizing — no Kelly).
@@ -239,6 +240,8 @@ class Executor:
         Args:
             legs: list of {"ticker": str, "side": str, "price_cents": int} dicts
             contracts_per_leg: contracts to trade on each leg (default 1)
+            parent_signal: the originating Signal — used to write CSV entry rows
+                           so arb legs appear in the trades log (P&L tracking).
 
         Returns:
             list of order_ids (one per leg, in submission order)
@@ -255,6 +258,8 @@ class Executor:
             contracts_per_leg,
             [(lg["ticker"], lg["side"], lg["price_cents"]) for lg in legs],
         )
+
+        mode = "paper" if self.paper else "live"
 
         for i, leg in enumerate(legs):
             ticker      = leg["ticker"]
@@ -289,6 +294,27 @@ class Executor:
                 "[ARB ENTRY] Leg %d/%d OK  %-38s  side=%-3s  price=%d¢  order_id=%s",
                 i + 1, len(legs), ticker[:38], side, price_cents, order_id,
             )
+
+            # Write CSV entry for this leg immediately after placement so the
+            # position is tracked in P&L even if the process crashes later.
+            row = [
+                datetime.datetime.now(timezone.utc).isoformat(),
+                ticker,
+                getattr(parent_signal, "meeting", "") or "",
+                getattr(parent_signal, "outcome", "") or "",
+                side,
+                "entry",
+                contracts_per_leg,
+                price_cents,
+                getattr(parent_signal, "fair_value", 0.5),
+                getattr(parent_signal, "edge", 0.0),
+                getattr(parent_signal, "confidence", 0.0),
+                getattr(parent_signal, "model_source", "arb_leg") or "arb_leg",
+                order_id,
+                mode,
+            ]
+            self._csv_writer.writerow(row)
+            self._csv_fh.flush()
 
         order_ids = [oid for _, _, oid in placed]
         log.info(

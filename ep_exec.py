@@ -562,7 +562,7 @@ async def _process_signal(
         _arb_ok = False
         try:
             _leg_order_ids = executor.execute_arb_legs(
-                sig.arb_legs, contracts_per_leg=1
+                sig.arb_legs, contracts_per_leg=1, parent_signal=sig
             )
             _arb_ok = True
             # Write each arb leg into Redis ep:positions with the shared arb_id.
