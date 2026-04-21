@@ -649,7 +649,6 @@ async def _process_signal(
             except Exception:
                 pass
             try:
-                from ep_telegram import telegram
                 await telegram.send_alert(f"[CRITICAL] {_alert_msg}", level="critical")
             except Exception:
                 pass
@@ -807,15 +806,18 @@ async def _process_signal(
     except Exception:
         pass
 
-    await telegram.send_fill(
-        ticker      = sig.ticker,
-        side        = sig.side,
-        contracts   = contracts,
-        price_cents = int(sig.market_price * 100),
-        mode        = "paper" if cfg.PAPER_TRADE else "live",
-        edge        = sig.edge,
-        strategy    = getattr(sig, "strategy", "") or "",
-    )
+    try:
+        await telegram.send_fill(
+            ticker      = sig.ticker,
+            side        = sig.side,
+            contracts   = contracts,
+            price_cents = int(sig.market_price * 100),
+            mode        = "paper" if cfg.PAPER_TRADE else "live",
+            edge        = sig.edge,
+            strategy    = getattr(sig, "strategy", "") or "",
+        )
+    except Exception:
+        pass
 
     # ── ARB partner leg (atomic second leg for monotonicity arb) ─────────────
     # When sig.arb_partner is set, the signal is a two-leg arb:
