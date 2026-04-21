@@ -26,6 +26,7 @@ from api.routers.microsoft import router as microsoft_router
 from api.routers.positions import router as positions_router
 from api.routers.controls import router as controls_router
 from api.routers.advisor import router as advisor_router
+from api.routers.notifications import router as notifications_router
 from api.routers.performance import router as performance_router
 from api.routers.subscriptions import router as subscriptions_router
 
@@ -80,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(positions_router)
     app.include_router(subscriptions_router)
     app.include_router(controls_router)
+    app.include_router(notifications_router)
     app.include_router(performance_router)
 
     # ── Global exception handlers ─────────────────────────────────────────────

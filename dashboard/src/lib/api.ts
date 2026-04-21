@@ -91,6 +91,11 @@ export const advisor = {
   status: () => api.get('/advisor/status'),
 }
 
+export const notifications = {
+  list: (limit = 50, type?: string, severity?: string) =>
+    api.get('/notifications', { params: { limit, ...(type ? { type } : {}), ...(severity ? { severity } : {}) } }),
+}
+
 export const admin = {
   users:     (page = 1, per_page = 20) => api.get('/admin/users', { params: { page, per_page } }),
   user:      (id: string) => api.get(`/admin/users/${id}`),

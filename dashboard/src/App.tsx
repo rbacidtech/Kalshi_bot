@@ -29,6 +29,7 @@ import AdminPage from './pages/AdminPage'
 import AdvisorPage from './pages/AdvisorPage'
 import ControlsPage from './pages/ControlsPage'
 import PerformancePage from './pages/PerformancePage'
+import NotificationsPage from './pages/NotificationsPage'
 
 const Spinner = () => (
   <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0f1e' }}>
@@ -79,6 +80,7 @@ export default function App() {
           <Route path="/performance"  element={<PerformancePage />} />
           <Route path="/keys"         element={<KeysPage />} />
           <Route path="/subscription" element={<SubscriptionPage />} />
+          <Route path="/notifications" element={<RequireAdmin><NotificationsPage /></RequireAdmin>} />
           <Route path="/advisor"      element={<RequireAdmin><AdvisorPage /></RequireAdmin>} />
           <Route path="/controls"     element={<RequireAdmin><ControlsPage /></RequireAdmin>} />
           <Route path="/admin"        element={<RequireAdmin><AdminPage /></RequireAdmin>} />
