@@ -24,7 +24,7 @@ CREATE INDEX IF NOT EXISTS idx_signals_ticker    ON signals (ticker, emitted_at 
 -- Every execution report (filled or rejected)
 CREATE TABLE IF NOT EXISTS executions (
     exec_id         UUID PRIMARY KEY,
-    signal_id       UUID REFERENCES signals(signal_id),
+    signal_id       UUID,   -- no FK: async batching means execution can land before its signal
     reported_at     TIMESTAMPTZ NOT NULL,
     status          TEXT NOT NULL,
     reject_reason   TEXT,
