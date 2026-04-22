@@ -1,7 +1,8 @@
 [Unit]
 Description=EdgePulse Trading System
 Documentation=https://github.com/rbacidtech/Kalshi_bot
-Wants=edgepulse-intel.service edgepulse-exec.service edgepulse-api.service edgepulse-llm.timer \
+Wants=edgepulse-redis.service \
+      edgepulse-intel.service edgepulse-exec.service edgepulse-api.service edgepulse-llm.timer \
       edgepulse-advisor.service edgepulse-arb.service \
       edgepulse-econ-release.service edgepulse-ob-depth.service
 

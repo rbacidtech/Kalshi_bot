@@ -8,28 +8,26 @@ TS=$(date +%Y%m%d-%H%M%S)
 DEST="$BACKUP_ROOT/$TS"
 
 mkdir -p "$DEST"
-
 echo "[backup] $TS — writing to $DEST"
 
-# ── Postgres ──────────────────────────────────────────────────────────────────
+# ── Postgres (native) ─────────────────────────────────────────────────────────
+PG_PASS=$(grep "^POSTGRES_PASSWORD=" /etc/edgepulse/edgepulse.env | cut -d= -f2)
 echo "[backup] dumping postgres..."
-docker exec \
-    "$(docker-compose -f /root/EdgePulse/infra/docker-compose.yml ps -q postgres)" \
-    pg_dump -U edgepulse -d edgepulse --format=custom \
-    > "$DEST/edgepulse.pgdump"
+PGPASSWORD="$PG_PASS" pg_dump -h 127.0.0.1 -U edgepulse -d edgepulse \
+    --format=custom > "$DEST/edgepulse.pgdump"
 echo "[backup] postgres: $(du -sh "$DEST/edgepulse.pgdump" | cut -f1)"
 
-# ── Redis ─────────────────────────────────────────────────────────────────────
+# ── Redis (native) ────────────────────────────────────────────────────────────
 echo "[backup] snapshotting redis..."
-redis-cli -s /var/run/redis/redis.sock BGSAVE
+redis-cli -s /run/redis/redis.sock BGSAVE
 # Wait for snapshot to complete (max 30s)
+LAST=$(redis-cli -s /run/redis/redis.sock LASTSAVE)
 for i in $(seq 1 30); do
-    last=$(redis-cli -s /var/run/redis/redis.sock LASTSAVE)
     sleep 1
-    now=$(redis-cli -s /var/run/redis/redis.sock LASTSAVE)
-    [ "$now" -gt "$last" ] && break
+    NOW=$(redis-cli -s /run/redis/redis.sock LASTSAVE)
+    [ "$NOW" -gt "$LAST" ] && break
 done
-cp /var/lib/edgepulse/redis/dump.rdb "$DEST/dump.rdb"
+cp /var/lib/redis/dump.rdb "$DEST/dump.rdb"
 echo "[backup] redis: $(du -sh "$DEST/dump.rdb" | cut -f1)"
 
 # ── Prune old backups (keep 7 days) ──────────────────────────────────────────
