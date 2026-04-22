@@ -23,11 +23,17 @@ Usage (Intel node, called once at startup then per-cycle):
         ...main loop body...
 """
 
+import json
+import threading
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 try:
-    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    from prometheus_client import (
+        Counter, Gauge, Histogram,
+        generate_latest, CONTENT_TYPE_LATEST,
+    )
     _HAVE_PROMETHEUS = True
 except ImportError:
     _HAVE_PROMETHEUS = False
@@ -53,6 +59,7 @@ class EdgePulseMetrics:
 
     def __init__(self) -> None:
         self._started = False
+        self._health: dict = {"status": "starting"}
 
         if not _HAVE_PROMETHEUS:
             log.warning("prometheus_client not installed — metrics disabled. "
@@ -105,8 +112,12 @@ class EdgePulseMetrics:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    def set_health(self, checks: dict) -> None:
+        """Update the /health response dict (called from async loop, read by HTTP thread)."""
+        self._health = checks
+
     def start(self, port: int = 9091) -> None:
-        """Start the Prometheus HTTP metrics server (idempotent).
+        """Start the HTTP server serving /metrics and /health (idempotent).
 
         A port conflict (e.g. rapid systemd restart before the OS releases the
         socket) is logged as a warning but does NOT crash the process — metrics
@@ -114,13 +125,43 @@ class EdgePulseMetrics:
         """
         if self._null or self._started:
             return
+
+        metrics_ref = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/health"):
+                    health = metrics_ref._health
+                    body   = json.dumps(health).encode()
+                    ok     = health.get("status") == "ok"
+                    self.send_response(200 if ok else 503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/metrics":
+                    output = generate_latest()
+                    self.send_response(200)
+                    self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+                    self.send_header("Content-Length", str(len(output)))
+                    self.end_headers()
+                    self.wfile.write(output)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, fmt, *args):
+                pass  # suppress per-request access logs
+
         try:
-            start_http_server(port)
+            server = ThreadingHTTPServer(("", port), _Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
             self._started = True
-            log.info("Prometheus metrics server listening on :%d/metrics", port)
+            log.info("Metrics/health server listening on :%d  (/metrics  /health)", port)
         except OSError as exc:
             log.warning(
-                "Prometheus metrics server could not bind to port %d (%s) — "
+                "Metrics server could not bind to port %d (%s) — "
                 "metrics will be unavailable this session but trading continues.",
                 port, exc,
             )

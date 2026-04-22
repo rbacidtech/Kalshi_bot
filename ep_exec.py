@@ -938,6 +938,25 @@ async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
         await asyncio.sleep(interval)
         await bus.publish_system_event("HEARTBEAT")
 
+        # Update /health endpoint state
+        try:
+            from ep_pg_audit import audit as _audit
+            redis_ok = await bus.ping()
+            try:
+                q_size = _audit()._queue.qsize()
+                pg_status = "ok" if q_size < 5_000 else "degraded"
+            except RuntimeError:
+                pg_status = "disabled"
+                q_size = 0
+            metrics.set_health({
+                "status":           "ok" if redis_ok else "fail",
+                "redis":            "ok" if redis_ok else "fail",
+                "postgres":         pg_status,
+                "postgres_queue":   q_size,
+            })
+        except Exception:
+            pass
+
 
 async def _signal_consumer(
     bus:         RedisBus,
@@ -2558,6 +2577,72 @@ async def cancel_and_tombstone(
         return False
 
 
+async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
+    """Check business-logic invariants every 5 min; surface issues via /health."""
+    log.info("Business health check started (interval=%ds)", interval)
+    while True:
+        await asyncio.sleep(interval)
+        issues: list = []
+        try:
+            # Position prices stale?
+            positions = await bus.get_all_positions()
+            now = time.time()
+            for ticker, pos in positions.items():
+                prices = await bus.get_prices([ticker])
+                p = prices.get(ticker)
+                if p is None:
+                    issues.append(f"{ticker}: no price in ep:prices")
+                elif (now - p.get("ts_us", 0) / 1_000_000) > 600:
+                    issues.append(f"{ticker}: price stale >10min")
+
+            # Intel publishing signals?
+            try:
+                last = await bus._r.xrevrange("ep:signals", count=1)
+                if last:
+                    entry_id, fields = last[0]
+                    ts_key = b"payload" if b"payload" in fields else "payload"
+                    import json as _json
+                    sig_payload = _json.loads(fields[ts_key])
+                    age_s = now - sig_payload.get("ts_us", 0) / 1_000_000
+                    if age_s > 300:
+                        issues.append(f"No signals published in {age_s:.0f}s")
+            except Exception:
+                pass
+
+            # Drawdown halt stuck >36h?
+            try:
+                halt = await bus._r.hget("ep:config", "HALT_TRADING")
+                if halt in (b"1", "1"):
+                    halt_info = await bus._r.hgetall("ep:halt")
+                    if halt_info:
+                        ts_key = b"tripped_at_us" if b"tripped_at_us" in halt_info else "tripped_at_us"
+                        tripped_at = int(halt_info.get(ts_key, 0) or 0) / 1_000_000
+                        age_h = (now - tripped_at) / 3600
+                        if age_h > 36:
+                            issues.append(f"Drawdown halt active {age_h:.1f}h (>36h)")
+            except Exception:
+                pass
+
+            # entry_cents invariant (must be 0–100 for Kalshi)
+            for ticker, pos in positions.items():
+                if pos.get("asset_class") == "kalshi":
+                    ec = pos.get("entry_cents", 0)
+                    if not (0 <= ec <= 100):
+                        issues.append(f"{ticker}: INVARIANT FAIL entry_cents={ec}")
+
+            # Merge into /health state without overwriting infra keys
+            existing = metrics._health.copy()
+            existing["business_issues"] = issues
+            existing["business_ok"]     = len(issues) == 0
+            if issues:
+                existing["status"] = "degraded"
+                log.warning("Business health: %s", "; ".join(issues))
+            metrics.set_health(existing)
+
+        except Exception as exc:
+            log.debug("_business_health_loop: %s", exc)
+
+
 async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> None:
     """
     Publish exec-node performance summary to Redis ep:performance every hour.
@@ -2581,9 +2666,46 @@ async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> No
         await asyncio.sleep(interval)
 
 
+async def _wait_for_dependencies() -> None:
+    """Retry Redis and Postgres until reachable before marking the service ready."""
+    import redis.asyncio as _aioredis
+    import asyncpg as _asyncpg
+
+    _r = await _aioredis.from_url(REDIS_URL, socket_connect_timeout=3)
+    try:
+        for attempt in range(30):
+            try:
+                await _r.ping()
+                log.info("Redis ready")
+                break
+            except Exception as exc:
+                log.info("Waiting for Redis (%d/30): %s", attempt + 1, exc)
+                await asyncio.sleep(2)
+        else:
+            raise RuntimeError("Redis unreachable after 60s")
+    finally:
+        await _r.aclose()
+
+    dsn = os.environ.get("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
+    if dsn:
+        for attempt in range(15):
+            try:
+                _pg = await _asyncpg.connect(dsn, timeout=5)
+                await _pg.execute("SELECT 1")
+                await _pg.close()
+                log.info("Postgres ready")
+                break
+            except Exception as exc:
+                log.info("Waiting for Postgres (%d/15): %s", attempt + 1, exc)
+                await asyncio.sleep(2)
+        else:
+            raise RuntimeError("Postgres unreachable after 30s")
+
+
 async def exec_main() -> None:
     setup_logging(cfg.OUTPUT_DIR / "logs")
     cfg.validate()
+    await _wait_for_dependencies()
 
     mode_label = "PAPER" if cfg.PAPER_TRADE else "LIVE"
     log.info("=" * 60)
@@ -2745,6 +2867,7 @@ async def exec_main() -> None:
             poll_resolutions_loop(client, bus, db),
             _fill_poll_loop(positions, client, executor, bus, db),
             _performance_publisher_loop(bus),
+            _business_health_loop(bus),
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         log.info("Exec loop cancelled.")

@@ -29,6 +29,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+try:
+    from ep_pg_audit import init_audit_writer, stop_audit_writer, audit as _audit
+    _AUDIT_AVAILABLE = True
+except ImportError:
+    _AUDIT_AVAILABLE = False
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 try:
     import anthropic
@@ -394,6 +400,16 @@ async def run_once(
     """
     ctx = await _gather_context(r)
 
+    # Snapshot current policy before overwriting it
+    try:
+        raw_before = await r.hgetall(EP_CONFIG)
+        config_before = {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in raw_before.items()
+        }
+    except Exception:
+        config_before = {}
+
     user_content = (
         "Current EdgePulse market state:\n"
         + json.dumps(ctx, indent=2)
@@ -446,6 +462,20 @@ async def run_once(
 
     await _write_policy(r, policy)
 
+    if _AUDIT_AVAILABLE:
+        try:
+            _audit().write("llm_decisions", {
+                "ts_us":              int(time.time() * 1_000_000),
+                "model":              CLAUDE_MODEL,
+                "prompt_tokens":      response.usage.input_tokens,
+                "completion_tokens":  response.usage.output_tokens,
+                "config_before":      config_before,
+                "config_after":       policy,
+                "reasoning":          policy.get("notes", ""),
+            })
+        except Exception:
+            pass
+
     # Print summary
     usage       = response.usage
     cache_read  = getattr(usage, "cache_read_input_tokens",     0) or 0
@@ -487,6 +517,9 @@ async def main(loop: bool) -> None:
         flush=True,
     )
 
+    if _AUDIT_AVAILABLE:
+        await init_audit_writer()
+
     try:
         if loop:
             while True:
@@ -505,6 +538,8 @@ async def main(loop: bool) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("[llm_agent] Shutdown.", flush=True)
     finally:
+        if _AUDIT_AVAILABLE:
+            await stop_audit_writer()
         await r.aclose()
 
 

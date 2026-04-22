@@ -985,6 +985,20 @@ async def _write_pnl_snapshot(bus: "RedisBus") -> None:
             realized_pnl_cents=realized_pnl_cents,
             position_count=position_count or None,
         )
+
+        if balance_cents is not None:
+            try:
+                import time as _time
+                audit().write("balance_snapshots", {
+                    "ts_us":          int(_time.time() * 1_000_000),
+                    "asset_class":    "kalshi",
+                    "balance_cents":  balance_cents,
+                    "open_pos_count": position_count,
+                    "exposure_cents": deployed_cents,
+                    "daily_pnl_cents": realized_pnl_cents,
+                })
+            except Exception:
+                pass
     except Exception as exc:
         log.debug("_write_pnl_snapshot: %s", exc)
 
@@ -994,11 +1008,35 @@ async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
     from ep_health import get_health_summary
     from ep_pnl_snapshots import ensure_table
     await ensure_table()
+    _last_cycle_ts: float = time.monotonic()
     while True:
         await asyncio.sleep(interval)
         await bus.publish_system_event("HEARTBEAT")
         await bus.publish_health(get_health_summary())
         await _write_pnl_snapshot(bus)
+
+        # Update /health endpoint state
+        try:
+            from ep_pg_audit import audit as _audit
+            redis_ok = await bus.ping()
+            try:
+                q_size = _audit()._queue.qsize()
+                pg_status = "ok" if q_size < 5_000 else "degraded"
+            except RuntimeError:
+                pg_status = "disabled"
+                q_size = 0
+            last_cycle_s = time.monotonic() - _last_cycle_ts
+            _last_cycle_ts = time.monotonic()
+            metrics.set_health({
+                "status":           "ok" if (redis_ok and last_cycle_s < 300) else "fail",
+                "redis":            "ok" if redis_ok else "fail",
+                "postgres":         pg_status,
+                "postgres_queue":   q_size,
+                "last_cycle_s":     round(last_cycle_s, 1),
+                "cycle_fresh":      last_cycle_s < 300,
+            })
+        except Exception:
+            pass
 
 
 async def _exec_watchdog_loop(bus: RedisBus, interval: int = 60) -> None:
@@ -1078,9 +1116,46 @@ async def _exec_watchdog_loop(bus: RedisBus, interval: int = 60) -> None:
         await asyncio.sleep(interval)
 
 
+async def _wait_for_dependencies() -> None:
+    """Retry Redis and Postgres until reachable before marking the service ready."""
+    import redis.asyncio as _aioredis
+    import asyncpg as _asyncpg
+
+    _r = await _aioredis.from_url(REDIS_URL, socket_connect_timeout=3)
+    try:
+        for attempt in range(30):
+            try:
+                await _r.ping()
+                log.info("Redis ready")
+                break
+            except Exception as exc:
+                log.info("Waiting for Redis (%d/30): %s", attempt + 1, exc)
+                await asyncio.sleep(2)
+        else:
+            raise RuntimeError("Redis unreachable after 60s")
+    finally:
+        await _r.aclose()
+
+    dsn = _os.environ.get("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
+    if dsn:
+        for attempt in range(15):
+            try:
+                _pg = await _asyncpg.connect(dsn, timeout=5)
+                await _pg.execute("SELECT 1")
+                await _pg.close()
+                log.info("Postgres ready")
+                break
+            except Exception as exc:
+                log.info("Waiting for Postgres (%d/15): %s", attempt + 1, exc)
+                await asyncio.sleep(2)
+        else:
+            raise RuntimeError("Postgres unreachable after 30s")
+
+
 async def intel_main() -> None:
     setup_logging(cfg.OUTPUT_DIR / "logs")
     cfg.validate()
+    await _wait_for_dependencies()
 
     mode_label = "PAPER" if cfg.PAPER_TRADE else "LIVE"
     log.info("=" * 60)
