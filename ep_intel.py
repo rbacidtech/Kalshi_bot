@@ -838,18 +838,19 @@ async def _enrich_orderbook_imbalance(
             kept.append(sig)   # no data — pass through unchanged
             continue
 
-        book       = ob.get("orderbook", {})
-        yes_levels = book.get("yes", [])   # YES bids: [[price, qty], ...]
-        no_levels  = book.get("no",  [])   # NO  bids: [[price, qty], ...]
+        # API returns orderbook_fp (fixed-point decimals) or legacy orderbook (ints).
+        book_fp    = ob.get("orderbook_fp") or ob.get("orderbook") or {}
+        yes_levels = book_fp.get("yes_dollars") or book_fp.get("yes") or []
+        no_levels  = book_fp.get("no_dollars")  or book_fp.get("no")  or []
 
-        yes_depth = sum(int(row[1]) for row in yes_levels[:5]) if yes_levels else 0
-        no_depth  = sum(int(row[1]) for row in no_levels[:5])  if no_levels  else 0
-
-        sig.book_depth = yes_depth + no_depth
+        yes_depth = int(sum(float(row[1]) for row in yes_levels[:5])) if yes_levels else 0
+        no_depth  = int(sum(float(row[1]) for row in no_levels[:5]))  if no_levels  else 0
 
         if yes_depth == 0 and no_depth == 0:
-            kept.append(sig)   # empty book — pass through unchanged
+            kept.append(sig)   # empty book — leave book_depth=None so exec skips gate
             continue
+
+        sig.book_depth = yes_depth + no_depth
 
         imbalance = (
             yes_depth / max(no_depth,  1) if sig.side == "yes"

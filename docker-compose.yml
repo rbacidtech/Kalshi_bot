@@ -5,7 +5,7 @@
 #   prometheus — scrapes EdgePulse bot metrics on :9091
 #   grafana    — dashboards at http://<DO-IP>:3000  (admin / changeme)
 #
-# Start:  docker compose up -d
+# Start:  docker compose up -d   (requires .env with REDIS_PASSWORD, GRAFANA_ADMIN_PASSWORD)
 # Stop:   docker compose down
 # Logs:   docker compose logs -f
 
@@ -28,14 +28,14 @@ services:
         --appendfsync everysec
         --maxmemory 1gb
         --maxmemory-policy volatile-lru
-        --requirepass 0yy_PSMK4ZuOm6rOl5edyUiZ-7uyHz7Ok7jxh4PJmzM
+        --requirepass ${REDIS_PASSWORD}
         --rename-command FLUSHALL ""
         --rename-command FLUSHDB ""
         --activedefrag yes
         --active-defrag-ignore-bytes 10mb
         --active-defrag-threshold-lower 10
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "0yy_PSMK4ZuOm6rOl5edyUiZ-7uyHz7Ok7jxh4PJmzM", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout:  5s
       retries:  5
@@ -81,7 +81,7 @@ services:
       - "3000:3000"   # public — protect with DO firewall to your IP only
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=Ep2026!xK9mP
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_ROOT_URL=http://localhost:3000
     volumes:

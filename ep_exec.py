@@ -90,23 +90,26 @@ _EXIT_TIF_STEP_MINUTES = int(os.getenv("EXIT_TIF_STEP_MINUTES", "30"))
 _EXIT_TIF_WIDEN_CENTS  = int(os.getenv("EXIT_TIF_WIDEN_CENTS",  "2"))
 _EXIT_TIF_MAX_STEPS    = int(os.getenv("EXIT_TIF_MAX_STEPS",    "3"))
 
-# ── Per-category exposure limits ──────────────────────────────────────────────
-# Group Kalshi series into macro buckets so a single correlated theme
-# (e.g., three FOMC rate targets) can't dominate the portfolio.
-_CATEGORY_MAP: dict = {
-    "KXFED":  "rates",     "KXCPI": "inflation", "KXPCE": "inflation",
-    "KXNFP":  "labor",     "KXGDP": "growth",    "KXBTC": "crypto",
-    "KXETH":  "crypto",    "INX":   "equity",     "NASDAQ": "equity",
-}
-_MAX_CATEGORY_PCT = 0.60   # 60 % of balance per macro category
-_MAX_SERIES_PCT   = 0.60   # 60 % per series (e.g., all KXFED markets)
-_MAX_MARKET_PCT   = 0.15   # 15 % per single market
+# ── Directional exposure limits ───────────────────────────────────────────────
+# Cap total YES exposure and total NO exposure independently.
+# Balance itself constrains total deployment; no cross-market category limits.
+_MAX_LONG_PCT   = float(os.getenv("MAX_LONG_PCT",  "0.70"))  # max % of balance in YES positions
+_MAX_SHORT_PCT  = float(os.getenv("MAX_SHORT_PCT", "0.70"))  # max % of balance in NO positions
+_MAX_MARKET_PCT = float(os.getenv("MAX_MARKET_PCT","0.15"))  # max % of balance in any single market
 
 # ── Long-game capital cap ─────────────────────────────────────────────────────
 # Positions settling > LONG_GAME_HORIZON_DAYS out are "long-game" bets.
 # Cap them at 30% of balance so 70% stays available for active/daily trading.
 _LONG_GAME_HORIZON_DAYS = int(os.getenv("LONG_GAME_HORIZON_DAYS", "90"))
 _LONG_GAME_MAX_PCT      = float(os.getenv("LONG_GAME_MAX_PCT", "0.30"))
+
+# ── Book-depth gate ───────────────────────────────────────────────────────────
+# Minimum combined top-5 order-book depth (contracts) required to enter.
+# Far-dated markets have thin books by nature; this gate stops the bot from
+# accumulating illiquid positions that are hard to exit.
+# Long-game (>90d) threshold is higher because those markets are hardest to exit.
+_MIN_BOOK_DEPTH          = int(os.getenv("MIN_BOOK_DEPTH", "50"))
+_MIN_BOOK_DEPTH_LONG     = int(os.getenv("MIN_BOOK_DEPTH_LONG", "200"))
 
 
 def _tiered_take_profit(base_tp: int, hours_remaining: float) -> int:
@@ -404,65 +407,60 @@ async def _process_signal(
         _entry_failed_cooldown[sig.ticker] = time.time() - (_ENTRY_FAILED_COOLDOWN_S - _ENTRY_FAILED_COOLDOWN_SHORT)
         return _rejected("RISK_GATE_SIZE")
 
-    # ── Per-category / per-series exposure limits ─────────────────────────────
+    # ── Book-depth gate ───────────────────────────────────────────────────────
+    if sig.asset_class == "kalshi" and sig.book_depth is not None:
+        _is_long = False
+        if sig.close_time:
+            try:
+                _ct_bd = datetime.fromisoformat(sig.close_time.replace("Z", "+00:00"))
+                _is_long = (_ct_bd - datetime.now(timezone.utc)).days > _LONG_GAME_HORIZON_DAYS
+            except Exception:
+                pass
+        _min_depth = _MIN_BOOK_DEPTH_LONG if _is_long else _MIN_BOOK_DEPTH
+        if sig.book_depth < _min_depth:
+            log.info(
+                "Book-depth gate: %s  depth=%d < min=%d (%s)  — skipping",
+                sig.ticker, sig.book_depth, _min_depth,
+                "long-game" if _is_long else "standard",
+            )
+            return _rejected("RISK_GATE_BOOK_DEPTH")
+
+    # ── Directional exposure limits ───────────────────────────────────────────
     # Runs after Kelly sizing so sig_cost uses the actual contract count.
     # Only applies to Kalshi — BTC sizing is governed by btc_risk.
     if sig.asset_class == "kalshi":
-        _all_pos    = await positions.get_all()
-        _series_pfx = sig.ticker.split("-")[0] if "-" in sig.ticker else sig.ticker
-        _category   = _CATEGORY_MAP.get(_series_pfx, "other")
-        if sig.side == "no":
-            _sig_cost = (100 - int(sig.market_price * 100)) * contracts
-        else:
-            _sig_cost = int(sig.market_price * 100) * contracts
+        _all_pos  = await positions.get_all()
+        _sig_cost = ((100 - int(sig.market_price * 100)) if sig.side == "no"
+                     else int(sig.market_price * 100)) * contracts
 
-        _cat_exp = _ser_exp = 0
-        for _t, _p in _all_pos.items():
-            # Arb legs are structurally hedged — exclude from category/series
-            # exposure accumulation so they don't block new directional signals.
+        _long_exp = _short_exp = 0
+        for _p in _all_pos.values():
             if _p.get("arb_id"):
                 continue
-            _t_ser  = _t.split("-")[0] if "-" in _t else _t
-            _t_cat  = _CATEGORY_MAP.get(_t_ser, "other")
-            _t_contracts = _p.get("contracts", 1)
-            _t_entry     = _p.get("entry_cents", 0)
+            _t_c = _p.get("contracts_filled") or _p.get("contracts", 1)
+            _t_e = _p.get("entry_cents", 0)
             if _p.get("side") == "no":
-                _t_cost = (100 - _t_entry) * _t_contracts
+                _short_exp += (100 - _t_e) * _t_c
             else:
-                _t_cost = _t_entry * _t_contracts
-            if _t_cat == _category:
-                _cat_exp += _t_cost
-            if _t_ser == _series_pfx:
-                _ser_exp += _t_cost
+                _long_exp += _t_e * _t_c
 
-        if _cat_exp + _sig_cost > balance_cents * _MAX_CATEGORY_PCT:
-            _cat_remaining = int(balance_cents * _MAX_CATEGORY_PCT) - _cat_exp
+        _side_exp = _long_exp if sig.side == "yes" else _short_exp
+        _side_cap = balance_cents * (_MAX_LONG_PCT if sig.side == "yes" else _MAX_SHORT_PCT)
+        _cap_name = "LONG_LIMIT" if sig.side == "yes" else "SHORT_LIMIT"
+
+        if _side_exp + _sig_cost > _side_cap:
+            _remaining = max(0, int(_side_cap - _side_exp))
             _unit_cost = _sig_cost // contracts if contracts > 0 else _sig_cost
-            _cat_max = max(0, _cat_remaining // _unit_cost) if (_unit_cost > 0 and _cat_remaining > 0) else 0
-            if _cat_max <= 0:
-                log.info("Category limit hit (%s, no capacity) — skipping %s",
-                         _category, sig.ticker)
-                return _rejected(f"CATEGORY_LIMIT:{_category}")
-            if _cat_max < contracts:
-                log.info("Category limit: reducing %s contracts %d→%d to fit cap",
-                         sig.ticker, contracts, _cat_max)
-                contracts  = _cat_max
-                _sig_cost  = _unit_cost * contracts
+            _cap_max   = max(0, _remaining // _unit_cost) if _unit_cost > 0 else 0
+            if _cap_max <= 0:
+                log.info("%s full (%.0f¢/%.0f¢) — skipping %s",
+                         _cap_name, _side_exp, _side_cap, sig.ticker)
+                return _rejected(_cap_name)
+            log.info("%s: trimming %s %d→%d contracts",
+                     _cap_name, sig.ticker, contracts, _cap_max)
+            contracts  = _cap_max
+            _sig_cost  = _unit_cost * contracts
 
-        if sig.category != "arb":
-            if _ser_exp + _sig_cost > balance_cents * _MAX_SERIES_PCT:
-                _ser_remaining = int(balance_cents * _MAX_SERIES_PCT) - _ser_exp
-                _unit_cost = _sig_cost // contracts if contracts > 0 else _sig_cost
-                _ser_max = max(0, _ser_remaining // _unit_cost) if (_unit_cost > 0 and _ser_remaining > 0) else 0
-                if _ser_max <= 0:
-                    log.info("Series limit hit (%s, no capacity) — skipping %s",
-                             _series_pfx, sig.ticker)
-                    return _rejected(f"SERIES_LIMIT:{_series_pfx}")
-                if _ser_max < contracts:
-                    log.info("Series limit: reducing %s contracts %d→%d to fit cap",
-                             sig.ticker, contracts, _ser_max)
-                    contracts = _ser_max
-                    _sig_cost = _unit_cost * contracts
         if _sig_cost > balance_cents * _MAX_MARKET_PCT:
             log.info("Market limit hit (%.0f¢ > %.0f¢) — skipping %s",
                      _sig_cost, balance_cents * _MAX_MARKET_PCT, sig.ticker)
@@ -477,7 +475,7 @@ async def _process_signal(
             _days_out = (_ct - datetime.now(timezone.utc)).total_seconds() / 86400
             if _days_out > _LONG_GAME_HORIZON_DAYS:
                 _lg_deployed = 0
-                _lg_all = _all_pos if "_all_pos" in dir() else await positions.get_all()
+                _lg_all = _all_pos
                 for _lp in _lg_all.values():
                     _lp_ct = _lp.get("close_time", "")
                     if not _lp_ct:
