@@ -33,7 +33,14 @@ from ep_metrics import metrics
 from ep_telegram import telegram
 from ep_resolution_db import ResolutionDB, poll_resolutions_loop
 from kalshi_bot.executor import ArbRollbackFailed
-from ep_pg_audit import init_audit_writer, stop_audit_writer
+from ep_pg_audit import init_audit_writer, stop_audit_writer, audit as _audit_writer
+try:
+    from ep_kelly_calib import get_calibrated_kelly, kelly_calib_loop
+    _KELLY_CALIB_AVAILABLE = True
+except ImportError:
+    _KELLY_CALIB_AVAILABLE = False
+    def get_calibrated_kelly(_edge): return None
+    async def kelly_calib_loop(_bus, **_kw): pass
 
 
 def _safe_key(ticker: str) -> str:
@@ -293,7 +300,9 @@ async def _process_signal(
     # KXFED tickers for the same meeting date are positively correlated:
     # T2.75/T3.00/T3.25 YES all win/lose together if the Fed holds. Cap per-meeting
     # exposure so a single meeting doesn't dominate the portfolio.
-    if sig.meeting and sig.asset_class == "kalshi":
+    # arb_partner signals are exempt: they're the second leg of an already-committed
+    # two-leg trade. Blocking them would leave the first leg unhedged.
+    if sig.meeting and sig.asset_class == "kalshi" and not getattr(sig, "arb_partner", None):
         all_pos      = await positions.get_all()
         # Arb legs from the same arb_id count as 1 (they're a single hedged position).
         # Standalone (non-arb) positions each count as 1.
@@ -385,11 +394,16 @@ async def _process_signal(
             log.debug("vol_multiplier lookup error: %s", _ve)
 
     # ── Kelly sizing ──────────────────────────────────────────────────────────
-    # Apply llm_kelly_fraction if the LLM has set one. asyncio is cooperative —
-    # no await occurs between the override and restore, so this is race-free.
+    # Priority: llm_kelly (operator override) > empirical calibration > configured default.
+    # asyncio is cooperative — no await between override and restore, so this is race-free.
     orig_kelly = risk_engine._kalshi.cfg.kelly_fraction
     if llm_kelly:
         risk_engine._kalshi.cfg.kelly_fraction = max(0.05, min(0.50, float(llm_kelly)))
+    elif sig.asset_class == "kalshi":
+        _empirical = get_calibrated_kelly(sig.edge)
+        if _empirical is not None:
+            risk_engine._kalshi.cfg.kelly_fraction = _empirical
+            log.debug("Kelly calib applied: edge=%.3f bucket_kelly=%.4f", sig.edge, _empirical)
     contracts = risk_engine.size(sig, balance_cents, vol_multiplier=_vol_multiplier)
     risk_engine._kalshi.cfg.kelly_fraction = orig_kelly   # always restore
 
@@ -542,6 +556,18 @@ async def _process_signal(
         pending      = True,
     )
 
+    # Store GDPNow at entry for KXGDP positions so we can log it at exit time
+    # and calibrate the 0.75pp cut-loss threshold empirically.
+    if sig.ticker.startswith("KXGDP-"):
+        try:
+            _gdpnow_raw = await bus._r.hget("ep:macro", "gdpnow")
+            if _gdpnow_raw:
+                await positions.update_fields(sig.ticker, {
+                    "gdpnow_at_entry": float(_gdpnow_raw)
+                })
+        except Exception:
+            pass
+
     # ── Execute (route by asset class) ───────────────────────────────────────
     if sig.asset_class == "btc_spot":
         size_str    = f"{contracts * BTC_UNIT:.8f}"
@@ -622,9 +648,11 @@ async def _process_signal(
                         pending      = False,
                     )
                     await positions.update_fields(_ot, {
-                        "order_id":       _ooid,
-                        "fill_confirmed": True,   # we know it filled (cancel returned error)
-                        "arb_unrecovered": True,
+                        "order_id":            _ooid,
+                        "fill_confirmed":       True,   # we know it filled (cancel returned error)
+                        "arb_unrecovered":      True,
+                        "immediate_exit":       True,
+                        "immediate_exit_reason": "arb_partial_fill",
                     })
                     log.error("Orphaned leg written to Redis: %s %s order_id=%s", _ot, _os, _ooid)
                 except Exception as _we:
@@ -993,7 +1021,22 @@ async def _signal_consumer(
         # _held prevents duplicate entry within a single atomic operation only.
         executor.reset_cycle()
         try:
+            # Measure time signal spent waiting in Redis stream before we read it
+            _stream_lag_s = (int(time.time() * 1_000_000) - sig.ts_us) / 1_000_000
+            metrics.record_stream_lag(sig.asset_class, max(0.0, _stream_lag_s))
+
+            _proc_start = time.monotonic()
             report = await _process_signal(sig, bus, positions, risk_engine, executor, coinbase)
+            metrics.record_risk_processing(
+                sig.asset_class, time.monotonic() - _proc_start
+            )
+
+            # Store exec_id on the position so position_history can link back to executions
+            if report.status == "filled" and report.ticker:
+                try:
+                    await positions.update_fields(report.ticker, {"exec_id": report.exec_id})
+                except Exception:
+                    pass
             await bus.publish_execution(report)
         except Exception:
             log.exception("Unhandled error processing %s", sig.ticker)
@@ -1397,6 +1440,7 @@ async def _exit_checker(
 
                 if stale_price:
                     log.debug("No fresh price for %s — skipping exit check.", ticker)
+                    metrics.record_stale_price_skip(ticker)
                     continue
 
                 # BTC prices in Redis are raw USD; normalise to cents-per-BTC_UNIT
@@ -1472,6 +1516,12 @@ async def _exit_checker(
                     await positions.update_fields(ticker, {"high_water_pnl": hwm_pnl})
 
                 exit_reason: Optional[str] = None
+
+                # ── Immediate exit flag (arb partial fills, emergency) ────────
+                # When an arb leg opened but its partner failed, or an operator
+                # sets immediate_exit=True, bypass all P&L thresholds and exit now.
+                if pos.get("immediate_exit"):
+                    exit_reason = pos.get("immediate_exit_reason", "immediate_exit")
 
                 # ── Near-certain hold: suppress pre-expiry exits ──────────────
                 # Only suppress when we're on the WINNING side of a near-certain
@@ -1708,6 +1758,22 @@ async def _exit_checker(
                 if exit_reason:
                     log.info("Exit triggered: %s  reason=%s  pnl=%+d¢",
                              ticker, exit_reason, move_cents * contracts)
+                    if "cut_loss_intel" in exit_reason and ticker.startswith("KXGDP-"):
+                        try:
+                            _gdp_entry  = pos.get("gdpnow_at_entry")
+                            _gdp_exit_r = await bus._r.hget("ep:macro", "gdpnow")
+                            _gdp_exit   = float(_gdp_exit_r) if _gdp_exit_r else None
+                            log.info(
+                                "KXGDP exit: %-36s  gdpnow_entry=%.2f%%  gdpnow_exit=%.2f%%  "
+                                "delta=%.2f%%  pnl=%+d¢",
+                                ticker,
+                                _gdp_entry or 0,
+                                _gdp_exit  or 0,
+                                (_gdp_exit or 0) - (_gdp_entry or 0),
+                                move_cents * contracts,
+                            )
+                        except Exception:
+                            pass
 
                     # Set stop-loss cooldown BEFORE any awaits.
                     # _signal_consumer runs in the same event loop; if we set the
@@ -1948,13 +2014,32 @@ return cnt
                             model_source = pos.get("model_source", ""),
                         )
 
+                    # Write to Postgres position_history for Kelly calibration
+                    _exec_id = pos.get("exec_id", "")
+                    if _exec_id:
+                        try:
+                            _audit_writer().write("position_history", {
+                                "entry_exec_id":     _exec_id,
+                                "ticker":            ticker,
+                                "side":              side,
+                                "contracts":         contracts,
+                                "entry_cents":       entry_cents,
+                                "exit_cents":        current_cents,
+                                "realized_pnl_cents": pnl_cents,
+                                "exit_reason":       exit_reason,
+                                "entered_at":        pos.get("entered_at"),
+                                "exited_at":         datetime.now(timezone.utc).isoformat(),
+                            })
+                        except Exception:
+                            pass
+
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Exit checker error.")
 
 
-_FILL_POLL_INTERVAL = 90   # seconds between Kalshi order-status sweeps
+_FILL_POLL_INTERVAL = 10   # seconds between Kalshi order-status sweeps (was 90 — sub-10s fills matter)
 
 
 async def _fill_poll_loop(
@@ -2036,6 +2121,24 @@ async def _fill_poll_loop(
                             except Exception as _lf_db_exc:
                                 log.warning("fill_poll DB record failed %s: %s",
                                             ticker, _lf_db_exc)
+
+                        _lf_exec_id = pos.get("exec_id", "")
+                        if _lf_exec_id:
+                            try:
+                                _audit_writer().write("position_history", {
+                                    "entry_exec_id":      _lf_exec_id,
+                                    "ticker":             ticker,
+                                    "side":               _lf_side,
+                                    "contracts":          _lf_contracts,
+                                    "entry_cents":        _lf_entry,
+                                    "exit_cents":         _lf_cents,
+                                    "realized_pnl_cents": _lf_pnl,
+                                    "exit_reason":        _lf_reason,
+                                    "entered_at":         pos.get("entered_at"),
+                                    "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                })
+                            except Exception:
+                                pass
 
                         if bus is not None:
                             try:
@@ -2445,25 +2548,14 @@ async def _reconcile_orphan_orders(
         if existing is not None:
             continue   # already tracked (resting or filled)
 
-        # Estimate entry price from total_traded_dollars / contracts
-        traded_usd = float(mp.get("total_traded_dollars", "0") or "0")
-        if contracts > 0 and traded_usd > 0:
-            entry_price = traded_usd / contracts   # average fill price per contract
-        else:
-            entry_price = 0.5
-
-        # entry_cents convention: always YES price
-        if side == "no":
-            entry_cents = 100 - int(entry_price * 100)
-        else:
-            entry_cents = int(entry_price * 100)
+        entry_cents = _kalshi_entry_cents(mp)
 
         await positions.open(
             ticker      = ticker,
             side        = side,
             contracts   = contracts,
             entry_cents = entry_cents,
-            fair_value  = float(entry_price),
+            fair_value  = entry_cents / 100.0,
             pending     = False,
         )
         # Mark as fill_confirmed so exit_checker monitors it immediately
@@ -2476,7 +2568,7 @@ async def _reconcile_orphan_orders(
                 "side":           side,
                 "entry_cents":    entry_cents,
                 "contracts":      contracts,
-                "fair_value":     float(entry_price),
+                "fair_value":     entry_cents / 100.0,
                 "meeting":        "",
                 "outcome":        "",
                 "entered_at":     datetime.now(timezone.utc).isoformat(),
@@ -2877,6 +2969,7 @@ async def exec_main() -> None:
             _fill_poll_loop(positions, client, executor, bus, db),
             _performance_publisher_loop(bus),
             _business_health_loop(bus),
+            kelly_calib_loop(bus),
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         log.info("Exec loop cancelled.")
