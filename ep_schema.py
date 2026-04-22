@@ -67,7 +67,7 @@ class SignalMessage:
 
     # ── Market microstructure ─────────────────────────────────────────────────
     spread_cents: Optional[int] = None
-    book_depth:   int           = 0
+    book_depth:   Optional[int] = None
 
     # ── FOMC-specific (null for non-FOMC) ─────────────────────────────────────
     meeting:      Optional[str] = None   # "2025-05"

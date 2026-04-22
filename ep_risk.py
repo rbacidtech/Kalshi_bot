@@ -129,7 +129,7 @@ class UnifiedRiskEngine:
         Three gates for BTC entries:
           1. units > 0
           2. Session BTC loss < 5% of balance (daily loss cap)
-          3. (open_exposure + new order cost) < 30% of balance
+          3. (open_exposure + new order cost) < 80% of balance
         """
         self._reset_daily_if_needed()
 
@@ -149,7 +149,7 @@ class UnifiedRiskEngine:
                 )
                 return False, "RISK_GATE_DRAWDOWN"
 
-        # 30% total BTC exposure cap (units = BTC_UNIT increments, not whole BTC)
+        # 80% total BTC exposure cap (units = BTC_UNIT increments, not whole BTC)
         order_cost = int(sig.market_price * units * BTC_UNIT * 100)
         if balance_cents > 0 and (open_exposure + order_cost) / balance_cents > _BTC_EXPOSURE_CAP:
             return False, "RISK_GATE_EXPOSURE"
