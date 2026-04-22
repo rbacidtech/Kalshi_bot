@@ -1,0 +1,17 @@
+[Unit]
+Description=EdgePulse Redis (IPC bus)
+After=network.target
+Before=edgepulse-intel.service edgepulse-exec.service
+
+[Service]
+Type=forking
+User=root
+ExecStartPre=/bin/mkdir -p /run/redis
+ExecStartPre=/bin/chmod 777 /run/redis
+ExecStart=/usr/bin/redis-server /etc/redis/redis.conf
+PIDFile=/run/redis/redis-server.pid
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target edgepulse.target
