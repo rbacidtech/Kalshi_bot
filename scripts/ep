@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# ep — EdgePulse operator CLI
+# Install: ln -sf /root/EdgePulse/scripts/ep /usr/local/bin/ep
+
+set -euo pipefail
+
+REDIS_SOCK="/run/redis/redis.sock"
+SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api edgepulse-redis
+          edgepulse-advisor edgepulse-arb edgepulse-econ-release edgepulse-ob-depth)
+INTEL_PORT=9091
+EXEC_PORT=9092
+
+_redis() { redis-cli -s "$REDIS_SOCK" "$@"; }
+
+_require_service() {
+    local svc="$1"
+    [[ "$svc" == edgepulse-* ]] || svc="edgepulse-${svc}"
+    echo "$svc"
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+
+# ── Service state ──────────────────────────────────────────────────────────────
+status)
+    echo "── Services ─────────────────────────────────────────"
+    for svc in "${SERVICES[@]}"; do
+        state=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+        printf "  %-36s %s\n" "$svc" "$state"
+    done
+    echo ""
+    echo "── Health ───────────────────────────────────────────"
+    for port in $INTEL_PORT $EXEC_PORT; do
+        label="intel:$port"
+        [[ $port == $EXEC_PORT ]] && label="exec:$port"
+        result=$(curl -sf --max-time 3 "http://127.0.0.1:${port}/health" 2>/dev/null) || result='{"status":"unreachable"}'
+        echo "  $label → $result"
+    done
+    echo ""
+    echo "── Redis keys ───────────────────────────────────────"
+    pos_count=$(_redis hlen ep:positions 2>/dev/null || echo "?")
+    halt=$(_redis hget ep:config HALT_TRADING 2>/dev/null || echo "?")
+    sig_len=$(_redis xlen ep:signals 2>/dev/null || echo "?")
+    echo "  positions=$pos_count  HALT_TRADING=${halt:-0}  ep:signals_len=$sig_len"
+    ;;
+
+restart)
+    svc=$(_require_service "${1:-exec}")
+    echo "Restarting $svc..."
+    systemctl restart "$svc"
+    sleep 3
+    systemctl is-active "$svc"
+    ;;
+
+# ── Trading controls ──────────────────────────────────────────────────────────
+halt)
+    echo "Setting HALT_TRADING=1 in ep:config..."
+    _redis hset ep:config HALT_TRADING 1 llm_halt_trading 1
+    echo "Done. Verify: ep config | grep HALT"
+    ;;
+
+resume)
+    echo "Clearing HALT_TRADING in ep:config..."
+    _redis hset ep:config HALT_TRADING 0 llm_halt_trading 0
+    echo "Done."
+    ;;
+
+config)
+    echo "── ep:config ─────────────────────────────────────────"
+    _redis hgetall ep:config | paste - - | sort
+    ;;
+
+set)
+    # ep set KEY VALUE
+    key="${1:?'Usage: ep set KEY VALUE'}"
+    val="${2:?'Usage: ep set KEY VALUE'}"
+    _redis hset ep:config "$key" "$val"
+    echo "ep:config[$key] = $val"
+    ;;
+
+# ── Position inspection ───────────────────────────────────────────────────────
+positions)
+    echo "── ep:positions ──────────────────────────────────────"
+    _redis hgetall ep:positions | paste - - | while IFS=$'\t' read -r ticker raw; do
+        pnl=$(echo "$raw" | python3 -c \
+            "import json,sys; d=json.load(sys.stdin); print(f\"{d.get('unrealized_pnl_cents','?')}¢\")" 2>/dev/null || echo "?")
+        printf "  %-40s  pnl=%s\n" "$ticker" "$pnl"
+    done
+    ;;
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs)
+    svc="${1:-exec}"
+    [[ "$svc" == edgepulse-* ]] || svc="edgepulse-${svc}"
+    n="${2:-100}"
+    journalctl -u "$svc" -n "$n" --no-pager
+    ;;
+
+follow)
+    svc="${1:-exec}"
+    [[ "$svc" == edgepulse-* ]] || svc="edgepulse-${svc}"
+    journalctl -u "$svc" -f
+    ;;
+
+# ── Health probe ──────────────────────────────────────────────────────────────
+health)
+    for port in $INTEL_PORT $EXEC_PORT; do
+        label="intel"; [[ $port == $EXEC_PORT ]] && label="exec"
+        echo "── $label (:$port) ──"
+        curl -sf --max-time 5 "http://127.0.0.1:${port}/health" \
+            | python3 -m json.tool 2>/dev/null \
+            || echo "  unreachable"
+    done
+    ;;
+
+# ── Incident notes ────────────────────────────────────────────────────────────
+incident)
+    date=$(date +%Y-%m-%d)
+    dir="/root/EdgePulse/docs/incidents"
+    mkdir -p "$dir"
+    file="$dir/${date}.md"
+    if [[ ! -f "$file" ]]; then
+        cat > "$file" <<EOF
+# Incident $date
+
+## Summary
+
+
+## Timeline
+
+
+## Root cause
+
+
+## Fix
+
+
+## Prevention
+
+EOF
+    fi
+    "${EDITOR:-nano}" "$file"
+    ;;
+
+# ── Balance ───────────────────────────────────────────────────────────────────
+balance)
+    echo "── ep:balance ────────────────────────────────────────"
+    _redis hgetall ep:balance | paste - - | while IFS=$'\t' read -r node raw; do
+        bal=$(echo "$raw" | python3 -c \
+            "import json,sys; d=json.load(sys.stdin); \
+             b=d.get('balance_cents',0); print(f'\${b/100:.2f}')" 2>/dev/null || echo "?")
+        printf "  %-30s  %s\n" "$node" "$bal"
+    done
+    ;;
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+help|--help|-h)
+    cat <<'HELP'
+Usage: ep <command> [args]
+
+Service control:
+  ep status                  Show all service states + health + Redis summary
+  ep restart [service]       Restart a service (default: exec)
+  ep logs [service] [n]      Show last n journal lines (default: exec, 100)
+  ep follow [service]        Tail journal live
+
+Trading controls:
+  ep halt                    Set HALT_TRADING=1 (stops new entries)
+  ep resume                  Clear HALT_TRADING
+  ep config                  Dump ep:config hash
+  ep set KEY VALUE           Set a key in ep:config
+
+Inspection:
+  ep positions               List open positions with unrealized P&L
+  ep balance                 Show balance from ep:balance
+  ep health                  Curl /health from both nodes
+
+Incidents:
+  ep incident                Open/create today's incident note
+HELP
+    ;;
+
+*)
+    echo "Unknown command: $cmd  (try: ep help)" >&2
+    exit 1
+    ;;
+esac

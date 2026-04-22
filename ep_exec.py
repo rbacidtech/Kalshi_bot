@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from ep_config import cfg, NODE_ID, REDIS_URL, EXIT_INTERVAL, EP_PRICES, log
+from ep_config import cfg, NODE_ID, REDIS_URL, EXIT_INTERVAL, EP_PRICES, log, sd_notify
 from kalshi_bot.auth     import KalshiAuth, NoAuth
 from kalshi_bot.client   import KalshiClient
 from kalshi_bot.executor import Executor
@@ -943,6 +943,7 @@ async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
     """Publish a HEARTBEAT event to ep:system every `interval` seconds."""
     while True:
         await asyncio.sleep(interval)
+        sd_notify("WATCHDOG=1")
         await bus.publish_system_event("HEARTBEAT")
 
         # Update /health endpoint state
@@ -2736,6 +2737,7 @@ async def exec_main() -> None:
     await bus.connect()
     await init_audit_writer()
     await bus.publish_system_event("EXEC_START", f"mode={mode_label}")
+    sd_notify("READY=1")
 
     # ── Shared state ──────────────────────────────────────────────────────────
     positions   = PositionStore(bus)

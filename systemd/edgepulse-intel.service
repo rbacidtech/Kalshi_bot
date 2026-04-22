@@ -5,7 +5,8 @@ After=docker.service network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 WorkingDirectory=/root/EdgePulse
 EnvironmentFile=/etc/edgepulse/edgepulse.env

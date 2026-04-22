@@ -21,7 +21,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from ep_config import cfg, NODE_ID, REDIS_URL, EP_PRICES, log
+from ep_config import cfg, NODE_ID, REDIS_URL, EP_PRICES, log, sd_notify
 from kalshi_bot.auth      import KalshiAuth, NoAuth
 from kalshi_bot.client    import KalshiClient
 from kalshi_bot.state     import BotState
@@ -1011,6 +1011,7 @@ async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
     _last_cycle_ts: float = time.monotonic()
     while True:
         await asyncio.sleep(interval)
+        sd_notify("WATCHDOG=1")
         await bus.publish_system_event("HEARTBEAT")
         await bus.publish_health(get_health_summary())
         await _write_pnl_snapshot(bus)
@@ -1195,6 +1196,7 @@ async def intel_main() -> None:
     await bus.connect()
     await init_audit_writer()
     await bus.publish_system_event("INTEL_START", f"mode={mode_label}")
+    sd_notify("READY=1")
     heartbeat_task       = asyncio.create_task(_heartbeat_loop(bus))
     release_monitor_task = asyncio.create_task(_release_monitor_loop(bus))
     exec_watchdog_task   = asyncio.create_task(_exec_watchdog_loop(bus))

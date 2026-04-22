@@ -56,6 +56,21 @@ else:
     log = logging.getLogger("edgepulse")
 
 
+def sd_notify(state: str) -> None:
+    """Send a state notification to systemd (no-op if not running under systemd)."""
+    sock_path = os.environ.get("NOTIFY_SOCKET", "")
+    if not sock_path:
+        return
+    import socket as _socket
+    addr = ("\0" + sock_path[1:]) if sock_path.startswith("@") else sock_path
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM) as _s:
+            _s.connect(addr)
+            _s.sendall(state.encode())
+    except Exception:
+        pass
+
+
 def validate() -> None:
     """Check critical config at startup; warn on misconfiguration."""
     import logging as _logging
