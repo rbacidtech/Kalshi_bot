@@ -13,6 +13,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+try:
+    import structlog as _structlog
+    _HAVE_STRUCTLOG = True
+except ImportError:
+    _HAVE_STRUCTLOG = False
+
 load_dotenv()
 
 # ── sys.path bootstrap ────────────────────────────────────────────────────────
@@ -44,7 +50,10 @@ EP_HEALTH     = "ep:health"       # HASH    node_id → health JSON  (Intel writ
 EXEC_GROUP    = "exec-consumers"   # consumer group on ep:signals
 INTEL_GROUP   = "intel-consumers"  # consumer group on ep:executions
 
-log = logging.getLogger("edgepulse")
+if _HAVE_STRUCTLOG:
+    log = _structlog.stdlib.get_logger("edgepulse")
+else:
+    log = logging.getLogger("edgepulse")
 
 
 def validate() -> None:

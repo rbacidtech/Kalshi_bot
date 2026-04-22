@@ -27,21 +27,22 @@ from collections import defaultdict
 
 def setup_logging(log_dir: Path = Path("output/logs"), level: int = logging.INFO) -> None:
     """
-    Configure logging with:
-      - Console handler: human-readable with colors (INFO+)
-      - JSON file handler: machine-readable, rotated daily (DEBUG+)
+    Configure logging:
+      - Console: human-readable plain text (journalctl-friendly)
+      - JSON file: structlog-rendered JSON Lines, rotated daily, 7-day retention
 
-    Call once at startup before any other log calls.
+    Structlog is optional — falls back to the plain _JsonFormatter if not installed.
+    With structlog, both positional (%s) and keyword-argument log calls are supported:
+        log.info("text %s", arg)                     # backwards-compatible
+        log.info("signal_published", ticker=t, edge=e)  # structured fields
     """
     log_dir.mkdir(parents=True, exist_ok=True)
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-
-    # Remove any existing handlers (prevents duplicate output on re-import)
     root.handlers.clear()
 
-    # Console: clean human-readable output
+    # ── Console: plain text ───────────────────────────────────────────────────
     console = logging.StreamHandler()
     console.setLevel(level)
     console.setFormatter(logging.Formatter(
@@ -50,22 +51,53 @@ def setup_logging(log_dir: Path = Path("output/logs"), level: int = logging.INFO
     ))
     root.addHandler(console)
 
-    # JSON file: structured, rotated at midnight, keep 7 days
-    # (30 days accumulated ~7 GB during active paper testing; 7 is enough for
-    # post-trade audit and avoids filling the VPS disk in live mode)
+    # ── JSON file ─────────────────────────────────────────────────────────────
     json_path = log_dir / "kalshi_bot.jsonl"
     file_handler = logging.handlers.TimedRotatingFileHandler(
         json_path, when="midnight", backupCount=7, encoding="utf-8"
     )
     file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(_JsonFormatter())
+
+    try:
+        import structlog
+        from structlog.stdlib import ProcessorFormatter
+
+        _pre_chain = [
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+        ]
+
+        structlog.configure(
+            processors=[
+                structlog.contextvars.merge_contextvars,
+                *_pre_chain,
+                structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+            ],
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            wrapper_class=structlog.stdlib.BoundLogger,
+            cache_logger_on_first_use=True,
+        )
+
+        file_handler.setFormatter(ProcessorFormatter(
+            foreign_pre_chain=_pre_chain,
+            processors=[
+                ProcessorFormatter.remove_processors_meta,
+                structlog.processors.JSONRenderer(),
+            ],
+        ))
+    except ImportError:
+        file_handler.setFormatter(_JsonFormatter())
+
     root.addHandler(file_handler)
 
-    # Tighten log file permissions to 640 (owner rw, group r, others none)
     try:
         os.chmod(file_handler.baseFilename, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
     except OSError:
-        pass  # File may not exist yet on first run; rotation will handle it
+        pass
 
     logging.getLogger("kalshi_bot").info(
         "Logging initialised — JSON log at %s", json_path
@@ -73,14 +105,14 @@ def setup_logging(log_dir: Path = Path("output/logs"), level: int = logging.INFO
 
 
 class _JsonFormatter(logging.Formatter):
-    """Formats log records as single-line JSON (JSON Lines format)."""
+    """Fallback JSON formatter when structlog is not installed."""
 
     def format(self, record: logging.LogRecord) -> str:
         doc = {
             "ts":      datetime.datetime.utcfromtimestamp(record.created).isoformat(),
             "level":   record.levelname,
             "logger":  record.name,
-            "message": record.getMessage(),
+            "event":   record.getMessage(),
         }
         if record.exc_info:
             doc["exception"] = self.formatException(record.exc_info)

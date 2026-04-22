@@ -28,3 +28,4 @@ twilio>=8.0.0
 anthropic>=0.40.0           # LLM policy agent (llm_agent.py)
 prometheus-client>=0.20.0   # Metrics server (ep_metrics.py)
 asyncpg>=0.29.0             # Postgres audit writer (ep_pg_audit.py)
+structlog>=24.0.0           # Structured JSON logging
