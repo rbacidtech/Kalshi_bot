@@ -477,12 +477,12 @@ class ResolutionDB:
         try:
             self._conn.execute(
                 """INSERT INTO trade_outcomes
-                   (ticker, series, side, contracts, entry_cents, exit_cents,
-                    pnl_cents, correct, recorded_at, model_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (ticker, series, side, contracts, entry_cents, exit_cents,
-                 pnl_cents, 1 if correct else 0, datetime.now(_tz.utc).isoformat(),
-                 model_source),
+                   (ticker, series_ticker, series, side, contracts, entry_cents,
+                    exit_cents, pnl_cents, correct, recorded_at, model_source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ticker, series, series, side, contracts, entry_cents,
+                 exit_cents, pnl_cents, 1 if correct else 0,
+                 datetime.now(_tz.utc).isoformat(), model_source),
             )
             self._conn.commit()
         except Exception as exc:
