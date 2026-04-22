@@ -7,6 +7,7 @@ All I/O is non-blocking — never yields the event loop to a blocking call.
 import asyncio
 import json
 import time
+from dataclasses import asdict
 from typing import Dict, List, Optional
 
 import redis.asyncio as aioredis
@@ -17,6 +18,7 @@ from ep_config import (
     EXEC_GROUP, INTEL_GROUP, STREAM_BLOCK, log,
 )
 from ep_schema import ExecutionReport, PriceSnapshot, SignalMessage
+from ep_pg_audit import audit
 
 
 class RedisBus:
@@ -83,6 +85,10 @@ class RedisBus:
     async def publish_signal(self, sig: SignalMessage) -> str:
         sig.source_node = self.node_id
         eid = await self._r.xadd(EP_SIGNALS, sig.to_redis(), maxlen=10_000, approximate=True)
+        try:
+            audit().write("signals", asdict(sig))
+        except Exception:
+            log.debug("audit skipped for signal %s", sig.signal_id)
         return eid.decode() if isinstance(eid, bytes) else eid
 
     async def consume_signals(self, consumer_name: str):
@@ -193,6 +199,10 @@ class RedisBus:
         report.source_node = self.node_id
         eid = await self._r.xadd(EP_EXECUTIONS, report.to_redis(),
                                   maxlen=5_000, approximate=True)
+        try:
+            audit().write("executions", asdict(report))
+        except Exception:
+            log.debug("audit skipped for exec %s", report.exec_id)
         return eid.decode() if isinstance(eid, bytes) else eid
 
     async def consume_executions(self, consumer_name: str) -> List[ExecutionReport]:

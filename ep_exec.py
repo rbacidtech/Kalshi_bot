@@ -33,6 +33,7 @@ from ep_metrics import metrics
 from ep_telegram import telegram
 from ep_resolution_db import ResolutionDB, poll_resolutions_loop
 from kalshi_bot.executor import ArbRollbackFailed
+from ep_pg_audit import init_audit_writer, stop_audit_writer
 
 
 def _safe_key(ticker: str) -> str:
@@ -2604,6 +2605,7 @@ async def exec_main() -> None:
     # ── Redis ─────────────────────────────────────────────────────────────────
     bus = RedisBus(REDIS_URL, NODE_ID)
     await bus.connect()
+    await init_audit_writer()
     await bus.publish_system_event("EXEC_START", f"mode={mode_label}")
 
     # ── Shared state ──────────────────────────────────────────────────────────
@@ -2749,6 +2751,7 @@ async def exec_main() -> None:
     finally:
         await bus.publish_system_event("EXEC_STOP")
         await bus.close()
+        await stop_audit_writer()
         log.info("Exec node shutdown complete.")
 
 

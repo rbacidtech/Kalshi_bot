@@ -38,6 +38,7 @@ from ep_polymarket import polymarket
 from kalshi_bot.models.fomc import inject_kalshi_prices as _fomc_inject_prices
 from ep_health import health as _src_health
 from ep_coinbase import CoinbaseTradeClient
+from ep_pg_audit import init_audit_writer, stop_audit_writer
 from ep_telegram import telegram as _telegram
 from ep_resolution_db import get_performance_summary
 from ep_fed_sentiment import get_fed_sentiment
@@ -1117,6 +1118,7 @@ async def intel_main() -> None:
     # ── Redis ─────────────────────────────────────────────────────────────────
     bus = RedisBus(REDIS_URL, NODE_ID)
     await bus.connect()
+    await init_audit_writer()
     await bus.publish_system_event("INTEL_START", f"mode={mode_label}")
     heartbeat_task       = asyncio.create_task(_heartbeat_loop(bus))
     release_monitor_task = asyncio.create_task(_release_monitor_loop(bus))
@@ -2413,6 +2415,7 @@ async def intel_main() -> None:
         ws.stop()
         await bus.publish_system_event("INTEL_STOP")
         await bus.close()
+        await stop_audit_writer()
         summary.print_summary()
         log.info("Intel node shutdown complete.")
 
