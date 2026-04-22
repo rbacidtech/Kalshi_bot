@@ -1,0 +1,26 @@
+[Unit]
+Description=EdgePulse LLM Policy Agent (one-shot, triggered by timer)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/EdgePulse/.venv/bin/python3 -u llm_agent.py
+
+# No Restart= — timer handles re-runs; a failed run just logs and waits for next tick
+TimeoutStartSec=120
+
+MemoryMax=512M
+CPUQuota=50%
+Nice=10
+
+StandardOutput=append:/var/log/edgepulse/llm.log
+StandardError=append:/var/log/edgepulse/llm.log
+SyslogIdentifier=ep-llm
+
+NoNewPrivileges=yes

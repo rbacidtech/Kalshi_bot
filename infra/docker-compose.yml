@@ -1,0 +1,93 @@
+# EdgePulse monitoring stack — QuantVPS Pro+ single box (Chicago)
+#
+# Services:
+#   redis      — IPC bus via Unix socket (/var/run/redis/redis.sock)
+#   postgres   — API user/key DB on 127.0.0.1:5432
+#   prometheus — scrapes intel (:9091) + exec (:9092) metrics
+#   grafana    — dashboards via SSH tunnel (ssh -L 3000:localhost:3000 ...)
+#
+# Start:  docker compose -f infra/docker-compose.yml up -d
+# Stop:   docker compose -f infra/docker-compose.yml down
+# Logs:   docker compose -f infra/docker-compose.yml logs -f
+
+version: "3.9"
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    # No TCP port — Unix socket only, accessed via /var/run/redis/redis.sock on host
+    volumes:
+      - /var/run/redis:/run/redis          # socket dir: host ↔ container
+      - /var/lib/edgepulse/redis:/data     # RDB + AOF persistence
+    command: >
+      redis-server
+        --save 60 1
+        --save 300 10
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 2gb
+        --maxmemory-policy volatile-lru
+        --unixsocket /run/redis/redis.sock
+        --unixsocketperm 777
+        --rename-command FLUSHALL ""
+        --rename-command FLUSHDB ""
+        --activedefrag yes
+        --active-defrag-ignore-bytes 10mb
+        --active-defrag-threshold-lower 10
+    healthcheck:
+      test: ["CMD", "redis-cli", "-s", "/run/redis/redis.sock", "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB:       edgepulse
+      POSTGRES_USER:     edgepulse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
+    volumes:
+      - /var/lib/edgepulse/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edgepulse -d edgepulse"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /var/lib/edgepulse/prometheus:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "127.0.0.1:3000:3000"    # SSH tunnel only: ssh -L 3000:localhost:3000 root@<IP>
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-changeme}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    volumes:
+      - /var/lib/edgepulse/grafana:/var/lib/grafana
+      - ./grafana-provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus

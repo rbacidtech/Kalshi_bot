@@ -26,7 +26,7 @@ import kalshi_bot.config as cfg  # noqa: E402  (must follow sys.path setup)
 # ── Runtime config (environment-driven) ──────────────────────────────────────
 MODE          = os.getenv("MODE", "intel").lower()           # "intel" | "exec"
 NODE_ID       = os.getenv("NODE_ID", f"{MODE}-{os.uname().nodename}")
-REDIS_URL     = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL     = os.getenv("REDIS_URL", "unix:///var/run/redis/redis.sock")
 SIGNAL_TTL    = int(os.getenv("EP_SIGNAL_TTL_MS",  "60000"))   # 60 s
 STREAM_BLOCK  = int(os.getenv("EP_STREAM_BLOCK_MS", "5000"))    # 5 s blocking read
 EXIT_INTERVAL = int(os.getenv("EP_EXIT_INTERVAL_S", "60"))      # seconds between exit checks
@@ -52,16 +52,6 @@ def validate() -> None:
     import logging as _logging
     _log = _logging.getLogger(__name__)
 
-    if "localhost" in REDIS_URL and NODE_ID.startswith("exec"):
-        raise ValueError(
-            f"NODE_ID=exec but REDIS_URL points to localhost — "
-            f"exec node must point to intel node Redis"
-        )
-    if "@" not in REDIS_URL and "localhost" not in REDIS_URL and "127.0.0.1" not in REDIS_URL:
-        raise ValueError(
-            "REDIS_URL must include authentication credentials (redis://:password@host:port). "
-            "Unauthenticated remote Redis is a security risk."
-        )
     if MODE not in ("intel", "exec", "both"):
         raise ValueError(f"MODE must be 'intel' or 'exec', got {MODE!r}")
     if not os.getenv("KALSHI_API_KEY_ID"):

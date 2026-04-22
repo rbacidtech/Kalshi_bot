@@ -1,0 +1,12 @@
+[Unit]
+Description=EdgePulse LLM Policy Agent — 4-hour cadence
+PartOf=edgepulse.target
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*:0/240
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=edgepulse.target

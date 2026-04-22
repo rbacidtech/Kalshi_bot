@@ -1,0 +1,37 @@
+# Prometheus scrape config — QuantVPS Pro+ single-box EdgePulse
+# Reload: curl -X POST http://localhost:9090/-/reload
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    env:  "production"
+    host: "qvps-chi"
+
+scrape_configs:
+
+  # Intel service (signal generation) — same host, port 9091
+  - job_name: "edgepulse-intel"
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          node: "intel-qvps-chi"
+    metrics_path: /metrics
+    scrape_interval: 15s
+
+  # Exec service (order execution) — same host, port 9092
+  - job_name: "edgepulse-exec"
+    static_configs:
+      - targets: ["host.docker.internal:9092"]
+        labels:
+          node: "exec-qvps-chi"
+    metrics_path: /metrics
+    scrape_interval: 15s
+
+  # Redis exporter (optional — uncomment after: docker run -d -p 9121:9121 \
+  #   -e REDIS_ADDR=unix:///var/run/redis/redis.sock \
+  #   -v /var/run/redis:/var/run/redis oliver006/redis_exporter)
+  # - job_name: "redis"
+  #   static_configs:
+  #     - targets: ["host.docker.internal:9121"]
+  #   scrape_interval: 30s

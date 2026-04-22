@@ -1,0 +1,53 @@
+[Unit]
+Description=EdgePulse FastAPI Backend
+PartOf=edgepulse.target
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+
+# Wait for Redis and Postgres before starting (max 60s each)
+ExecStartPre=/bin/bash -c \
+    'for i in $(seq 1 30); do \
+         redis-cli -s /var/run/redis/redis.sock ping 2>/dev/null | grep -q PONG && exit 0; \
+         sleep 2; \
+     done; echo "Redis not ready after 60s"; exit 1'
+ExecStartPre=/bin/bash -c \
+    'for i in $(seq 1 30); do \
+         pg_isready -h 127.0.0.1 -U edgepulse -d edgepulse 2>/dev/null && exit 0; \
+         sleep 2; \
+     done; echo "Postgres not ready after 60s"; exit 1'
+
+ExecStart=/root/EdgePulse/.venv/bin/uvicorn api.main:app \
+    --host 127.0.0.1 \
+    --port 8502 \
+    --workers 2 \
+    --log-level info \
+    --access-log \
+    --proxy-headers \
+    --forwarded-allow-ips=*
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+MemoryMax=800M
+MemoryHigh=600M
+CPUQuota=100%
+
+StandardOutput=append:/var/log/edgepulse/api.log
+StandardError=append:/var/log/edgepulse/api.log
+SyslogIdentifier=ep-api
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/root/EdgePulse /var/log/edgepulse /tmp
+
+[Install]
+WantedBy=edgepulse.target
