@@ -79,6 +79,18 @@ class EdgePulseMetrics:
             ["asset_class"],
             buckets=[0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 30],
         )
+        self.signal_stream_lag = Histogram(
+            "edgepulse_signal_stream_lag_seconds",
+            "Time signal spends in ep:signals stream before Exec reads it",
+            ["asset_class"],
+            buckets=[0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30],
+        )
+        self.risk_processing_time = Histogram(
+            "edgepulse_risk_processing_seconds",
+            "Time to run _process_signal (risk gates + sizing, excluding exchange)",
+            ["asset_class"],
+            buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2],
+        )
         self.redis_op_latency = Histogram(
             "edgepulse_redis_op_seconds",
             "Redis operation latency",
@@ -294,6 +306,16 @@ class EdgePulseMetrics:
             return
         self.signal_fill_latency.labels(asset_class=asset_class).observe(latency_s)
 
+    def record_stream_lag(self, asset_class: str, lag_s: float) -> None:
+        if self._null:
+            return
+        self.signal_stream_lag.labels(asset_class=asset_class).observe(lag_s)
+
+    def record_risk_processing(self, asset_class: str, elapsed_s: float) -> None:
+        if self._null:
+            return
+        self.risk_processing_time.labels(asset_class=asset_class).observe(elapsed_s)
+
     def record_exchange_latency(
         self, exchange: str, endpoint: str, outcome: str, latency_s: float,
     ) -> None:
@@ -381,6 +403,11 @@ class EdgePulseMetrics:
         self.stream_lag.labels(stream=stream).set(lag_s)
 
     # ── Invariants / risk gates ───────────────────────────────────────────────
+
+    def record_stale_price_skip(self, ticker: str) -> None:
+        if self._null:
+            return
+        self.stale_prices_skipped.labels(ticker=ticker).inc()
 
     def record_invariant_violation(self, invariant: str) -> None:
         if self._null:
