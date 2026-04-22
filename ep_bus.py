@@ -31,7 +31,6 @@ class RedisBus:
             self.url,
             encoding               = "utf-8",
             decode_responses       = False,   # keep raw bytes; decoded in helpers
-            socket_keepalive       = True,
             socket_connect_timeout = 5,
             socket_timeout         = 10,      # per-command read timeout; retry_on_timeout handles retries
             retry_on_timeout       = True,
