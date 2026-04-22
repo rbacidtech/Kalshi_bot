@@ -14,7 +14,7 @@ echo "[backup] $TS — writing to $DEST"
 # ── Postgres ──────────────────────────────────────────────────────────────────
 echo "[backup] dumping postgres..."
 docker exec \
-    "$(docker compose -f /root/EdgePulse/infra/docker-compose.yml ps -q postgres)" \
+    "$(docker-compose -f /root/EdgePulse/infra/docker-compose.yml ps -q postgres)" \
     pg_dump -U edgepulse -d edgepulse --format=custom \
     > "$DEST/edgepulse.pgdump"
 echo "[backup] postgres: $(du -sh "$DEST/edgepulse.pgdump" | cut -f1)"

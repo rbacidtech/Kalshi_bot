@@ -1,0 +1,33 @@
+[Unit]
+Description=EdgePulse Arb — Polymarket/Kalshi CLOB real-time arb
+PartOf=edgepulse.target
+After=docker.service network-online.target edgepulse-exec.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/EdgePulse/.venv/bin/python3 -u ep_arb.py
+
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStopSec=10
+
+MemoryMax=512M
+CPUQuota=100%
+Nice=0
+
+StandardOutput=append:/var/log/edgepulse/arb.log
+StandardError=append:/var/log/edgepulse/arb.log
+SyslogIdentifier=ep-arb
+
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=edgepulse.target

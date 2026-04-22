@@ -1,0 +1,33 @@
+[Unit]
+Description=EdgePulse Econ Release — fast-reaction KXCPI/KXGDP
+PartOf=edgepulse.target
+After=docker.service network-online.target edgepulse-exec.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/EdgePulse/.venv/bin/python3 -u ep_econ_release.py
+
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStopSec=15
+
+MemoryMax=512M
+CPUQuota=100%
+Nice=0
+
+StandardOutput=append:/var/log/edgepulse/econ_release.log
+StandardError=append:/var/log/edgepulse/econ_release.log
+SyslogIdentifier=ep-econ
+
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=edgepulse.target

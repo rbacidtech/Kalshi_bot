@@ -1,0 +1,33 @@
+[Unit]
+Description=EdgePulse Advisor — LLM performance monitor
+PartOf=edgepulse.target
+After=docker.service network-online.target edgepulse-exec.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/EdgePulse/.venv/bin/python3 -u ep_advisor.py --loop
+
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStopSec=15
+
+MemoryMax=512M
+CPUQuota=50%
+Nice=10
+
+StandardOutput=append:/var/log/edgepulse/advisor.log
+StandardError=append:/var/log/edgepulse/advisor.log
+SyslogIdentifier=ep-advisor
+
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=edgepulse.target

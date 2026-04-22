@@ -57,12 +57,16 @@ fi
 
 # ── systemd service files ─────────────────────────────────────────────────────
 echo "[provision] installing systemd units..."
-cp "$REPO_DIR/systemd/edgepulse.target"          "$SYSTEMD_DIR/"
-cp "$REPO_DIR/systemd/edgepulse-intel.service"   "$SYSTEMD_DIR/"
-cp "$REPO_DIR/systemd/edgepulse-exec.service"    "$SYSTEMD_DIR/"
-cp "$REPO_DIR/systemd/edgepulse-api.service"     "$SYSTEMD_DIR/"
-cp "$REPO_DIR/systemd/edgepulse-llm.service"     "$SYSTEMD_DIR/"
-cp "$REPO_DIR/systemd/edgepulse-llm.timer"       "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse.target"               "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-intel.service"        "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-exec.service"         "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-api.service"          "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-llm.service"          "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-llm.timer"            "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-advisor.service"      "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-arb.service"          "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-econ-release.service" "$SYSTEMD_DIR/"
+cp "$REPO_DIR/systemd/edgepulse-ob-depth.service"     "$SYSTEMD_DIR/"
 
 systemctl daemon-reload
 systemctl enable edgepulse.target
@@ -81,7 +85,7 @@ fi
 
 # ── Infra stack ───────────────────────────────────────────────────────────────
 echo "[provision] starting Docker infra stack..."
-docker compose -f "$REPO_DIR/infra/docker-compose.yml" up -d
+docker-compose -f "$REPO_DIR/infra/docker-compose.yml" up -d
 
 echo ""
 echo "[provision] complete."
