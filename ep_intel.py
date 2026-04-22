@@ -2389,9 +2389,16 @@ async def intel_main() -> None:
             reports     = await bus.consume_executions(intel_consumer)
             reject_tally: dict[str, int] = {}
             for r in reports:
-                metrics.execution_received(r.status, r.asset_class)
+                metrics.execution_received(
+                    r.status, r.asset_class,
+                    reason=r.reject_reason or "",
+                )
                 if r.status == "filled":
                     metrics.add_pnl(r.edge_captured)
+                    metrics.record_fill_latency(
+                        r.asset_class,
+                        (int(time.time() * 1_000_000) - r.ts_us) / 1_000_000,
+                    )
                     log.info("Fill confirmed: %s %s ×%d @ %.4f  order=%s",
                              r.ticker, r.side, r.contracts, r.fill_price, r.order_id)
                 elif r.status == "rejected":

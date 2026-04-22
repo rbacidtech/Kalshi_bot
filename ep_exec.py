@@ -203,6 +203,7 @@ async def _process_signal(
     global _kalshi_api_failures, _kalshi_api_failure_ts
 
     def _rejected(reason: str) -> ExecutionReport:
+        metrics.record_risk_gate(reason, "reject")
         return ExecutionReport(
             signal_id     = sig.signal_id,
             ticker        = sig.ticker,
@@ -404,9 +405,10 @@ async def _process_signal(
         contracts = _ABSOLUTE_MAX_CONTRACTS
 
     if contracts <= 0:
-        # Price or edge may shift soon — suppress only 10 min so we don't miss a later entry.
+        metrics.record_risk_gate("kelly", "zero_size")
         _entry_failed_cooldown[sig.ticker] = time.time() - (_ENTRY_FAILED_COOLDOWN_S - _ENTRY_FAILED_COOLDOWN_SHORT)
         return _rejected("RISK_GATE_SIZE")
+    metrics.record_kelly(sig.asset_class, contracts)
 
     # ── Book-depth gate ───────────────────────────────────────────────────────
     if sig.asset_class == "kalshi" and sig.book_depth is not None:
@@ -791,6 +793,11 @@ async def _process_signal(
     fee_cents  = int(cost_cents * cfg.FEE_CENTS / 100) if sig.asset_class == "kalshi" else 0
 
     metrics.signal_published(sig.asset_class, sig.strategy or "unknown", sig.side)
+    metrics.record_fill_latency(
+        sig.asset_class,
+        (int(time.time() * 1_000_000) - sig.ts_us) / 1_000_000,
+    )
+    metrics.record_risk_gate("all_gates", "pass")
     log.info("Executed: %s %s ×%d @ %.4f  cost=$%.2f  signal_id=%.8s",
              sig.ticker, sig.side, contracts, sig.market_price, cost_cents / 100, sig.signal_id)
 
