@@ -2685,9 +2685,16 @@ async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
         issues: list = []
         try:
             # Position prices stale?
+            # Only flag tickers that the ob_depth/price feed actually tracks.
+            # Series markets (NBA, NFL, etc.) have no real-time feed and will
+            # never have an ep:prices entry — skip them silently.
+            _PRICED_PREFIXES = ("KXFED", "KXCPI", "KXGDP", "KXHIGHCHI",
+                                "KXINFLATION", "KXWEATHER", "KXOIL")
             positions = await bus.get_all_positions()
             now = time.time()
             for ticker, pos in positions.items():
+                if not ticker.startswith(_PRICED_PREFIXES):
+                    continue
                 prices = await bus.get_prices([ticker])
                 p = prices.get(ticker)
                 if p is None:
