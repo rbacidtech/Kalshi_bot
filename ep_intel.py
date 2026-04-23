@@ -559,6 +559,16 @@ async def _release_monitor_loop(bus: RedisBus) -> None:
     """
     _last_known: dict = {}   # series_id → latest period string
 
+    # Seed health from existing ep:releases data so sources don't show age=None at startup
+    try:
+        _rel_existing = await bus._r.hgetall("ep:releases")
+        if _rel_existing.get("CPI"):
+            _src_health.mark_ok("bls_cpi")
+        if _rel_existing.get("NFP"):
+            _src_health.mark_ok("bls_nfp")
+    except Exception:
+        pass
+
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
@@ -594,6 +604,7 @@ async def _release_monitor_loop(bus: RedisBus) -> None:
                                 f"{series_type}_period":  new_data["period"],
                                 f"{series_type}_ts":      str(time.time()),
                             })
+                            _src_health.mark_ok(f"bls_{series_type.lower()}")
                             # Signal that a forced cycle is needed
                             await bus._r.set("ep:forced_cycle", "1", ex=300)
                     await asyncio.sleep(30)   # Poll every 30s during window
@@ -677,6 +688,7 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
         ("fred_t10y2y",   results[6]),
         ("fred_t5yifr",   results[7]),
         ("fred_unrate",   results[8]),
+        ("spd",           results[10]),  # credit spread (HYG/LQD)
     ]
     for _sname, _sresult in _fred_sources:
         if isinstance(_sresult, Exception):
@@ -1933,6 +1945,7 @@ async def intel_main() -> None:
                         continue
                     # Keep ep:macro fresh so Exec can read GDPNow at exit time for logging
                     await bus._r.hset("ep:macro", "gdpnow", str(_gdp_now_cached))
+                    _src_health.mark_ok("gdpnow")
                     _at_gap = (_at_strike - _gdp_now_cached) if _at_side == "yes" \
                               else (_gdp_now_cached - _at_strike)
                     if _at_gap <= 0.75:
