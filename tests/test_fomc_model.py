@@ -113,9 +113,9 @@ class TestCumulativeYesProb:
         assert result == pytest.approx(expected, abs=1e-9)
 
     def test_strictly_above_all_model_outcomes_clamps_to_min(self):
-        """Target so high that no model outcome clears it → clamp to 0.01."""
+        """Target so high that no model outcome clears it → clamp to 0.05."""
         result = self._call(10.00)  # Fed rate at 10% — impossible
-        assert result == pytest.approx(0.01)
+        assert result == pytest.approx(0.05)
 
     def test_cumulative_strictly_greater_than_point_for_cuts(self):
         """
@@ -143,8 +143,8 @@ class TestCumulativeYesProb:
         """Sparse probs dict — missing keys contribute 0, no KeyError."""
         sparse = {"HOLD": 0.80, "CUT_25": 0.20}   # no HIKE entries
         result = self._call(3.50, probs=sparse)
-        # HOLD (3.75≥3.50) + CUT_25 (3.50≥3.50) = 1.0, clamped to 0.99
-        expected = min(0.99, sparse["HOLD"] + sparse["CUT_25"])
+        # HOLD (3.75≥3.50) + CUT_25 (3.50≥3.50) = 1.0, clamped to 0.95
+        expected = min(0.95, sparse["HOLD"] + sparse["CUT_25"])
         assert result == pytest.approx(expected, abs=1e-9)
 
     def test_monotone_decreasing_with_rising_target(self):

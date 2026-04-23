@@ -60,10 +60,9 @@ class TestFeeAdjustedEdge:
         assert edge < 0
 
     def test_no_side_positive_edge(self):
-        """fair=0.30 (true prob YES), market_price=0.50 → NO has edge."""
-        # NO edge: fair_value here is prob of YES, market_price=0.50
-        # Buying NO at 0.50 when true prob NO is 0.70 → positive EV
-        edge = _fee_adjusted_edge(0.70, 0.50, "no")
+        """fair=0.30 (true P(YES)), market_price=0.50 → NO has edge."""
+        # fv = P(YES wins) = 0.30 → P(NO wins) = 0.70; buying NO at 0.50 is +EV
+        edge = _fee_adjusted_edge(0.30, 0.50, "no")
         assert edge > 0
 
     def test_yes_formula_correctness(self):
@@ -73,9 +72,12 @@ class TestFeeAdjustedEdge:
         assert _fee_adjusted_edge(fv, mp, "yes") == pytest.approx(expected, abs=1e-9)
 
     def test_no_formula_correctness(self):
-        """Manually verify NO formula: EV = p*price*(1-fee) - (1-p)*(1-price)."""
-        fv, mp = 0.70, 0.50
-        expected = fv * mp * (1 - FEE) - (1 - fv) * (1 - mp)
+        """Manually verify NO formula: EV = (1-p)*price*(1-fee) - p*(1-price).
+
+        fv is P(YES wins); for NO side you win when YES loses (prob 1-fv).
+        """
+        fv, mp = 0.30, 0.50
+        expected = (1 - fv) * mp * (1 - FEE) - fv * (1 - mp)
         assert _fee_adjusted_edge(fv, mp, "no") == pytest.approx(expected, abs=1e-9)
 
     def test_high_price_yes_reduces_edge(self):
@@ -87,20 +89,18 @@ class TestFeeAdjustedEdge:
     def test_symmetry_near_zero(self):
         """At no model edge, both sides should yield negative EV after fees.
 
-        Convention for _fee_adjusted_edge:
-          YES side: fair_value = P(YES wins), market_price = YES price
-          NO  side: fair_value = P(NO wins) = 1 - P(YES), market_price = YES price
+        Convention for _fee_adjusted_edge: fair_value = P(YES wins) for both sides.
 
-        "No model edge" means the side's winning probability == its cost:
-          YES: fair_value (P(YES))  == YES cost == market_price
-          NO:  fair_value (P(NO))   == NO  cost == 1 - market_price
+        "No model edge" means P(YES wins) == YES market price, so:
+          YES: fv == market_price → fair==market → only fees (negative)
+          NO:  fv == market_price → P(NO wins)==1-market_price==NO cost → only fees (negative)
         """
         for price in (0.30, 0.50, 0.70):
             # YES side: fair == market → only fees
             edge_yes = _fee_adjusted_edge(price, price, "yes")
             assert edge_yes < 0, f"Expected negative EV at fair==market price={price} side=yes"
-            # NO side: P(NO wins) = 1 - price == NO cost = 1 - price → only fees
-            edge_no = _fee_adjusted_edge(1 - price, price, "no")
+            # NO side: P(YES wins)==price → P(NO wins)==1-price==NO cost → only fees
+            edge_no = _fee_adjusted_edge(price, price, "no")
             assert edge_no < 0, f"Expected negative EV at fair==market price={price} side=no"
 
 

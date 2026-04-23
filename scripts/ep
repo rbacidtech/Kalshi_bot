@@ -4,13 +4,20 @@
 
 set -euo pipefail
 
-REDIS_SOCK="/run/redis/redis.sock"
-SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api edgepulse-redis
+REDIS_PORT="${REDIS_PORT:-6379}"
+REDIS_PASS="${REDIS_PASSWORD:-}"
+SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api
           edgepulse-advisor edgepulse-arb edgepulse-econ-release edgepulse-ob-depth)
 INTEL_PORT=9091
 EXEC_PORT=9092
 
-_redis() { redis-cli -s "$REDIS_SOCK" "$@"; }
+_redis() {
+    if [[ -n "$REDIS_PASS" ]]; then
+        redis-cli -p "$REDIS_PORT" -a "$REDIS_PASS" "$@" 2>/dev/null
+    else
+        redis-cli -p "$REDIS_PORT" "$@" 2>/dev/null
+    fi
+}
 
 _require_service() {
     local svc="$1"

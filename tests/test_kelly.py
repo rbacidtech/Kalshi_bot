@@ -71,17 +71,20 @@ class TestKellySizing:
         assert contracts == 130
 
     def test_positive_edge_no_side(self):
-        """NO side uses market_price as denominator (win amount = price)."""
+        """NO side: capital outlay = 100 - YES_price cents; YES price = NO win amount."""
         rm = make_risk(kelly_fraction=0.25, fee_cents=7, max_contracts=500,
                        max_market_exposure=1.0)
+        # market_price = 0.30 (YES price); NO contract costs 70¢, wins 30¢
         # net_edge = 0.20 - 0.07 = 0.13
-        # kelly_f  = 0.13 / 0.30  (market_price = 0.30)
+        # kelly_f  = 0.13 / 0.30  (net_edge / YES price, the NO win amount)
         # bet_frac = kelly_f * 0.25 * 1.0
-        # max_kelly = int(100_000 * bet_frac / 30)
-        net_edge = 0.20 - 0.07
-        kelly_f  = net_edge / 0.30
-        bet_frac = kelly_f * 0.25
-        expected = int(100_000 * bet_frac / 30)
+        # no_price_cents = 100 - 30 = 70  (actual capital outlay per NO contract)
+        # max_kelly = int(100_000 * bet_frac / 70) = 154
+        net_edge       = 0.20 - 0.07
+        kelly_f        = net_edge / 0.30
+        bet_frac       = kelly_f * 0.25
+        no_price_cents = 100 - int(0.30 * 100)   # = 70
+        expected       = int(100_000 * bet_frac / no_price_cents)
         contracts = rm.size(
             edge=0.20, market_price=0.30, balance_cents=100_000,
             confidence=1.0, side="no",
