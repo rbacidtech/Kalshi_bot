@@ -1910,24 +1910,28 @@ async def scan_gdp_markets(
         if fee_edge < 0.04:
             continue
 
-        # ── GDP YES signal suppression guard ─────────────────────────────────
-        # If GDPNow is more than 0.50pp below the strike threshold, suppress
-        # the YES signal.  A bet that GDP > T% resolves as an immediate loss
-        # when the nowcast is well below T.
+        # ── GDP directional consistency guard ────────────────────────────────
+        # Only bet in the direction our GDPNow model predicts.
         #
-        # Rule: suppress near-certainty bets only — widen buffer to 1.5pp
-        # (GDPNow RMSE ≈ 0.9pp; 0.50pp was too tight and suppressed real edge)
-        if side == "yes" and gdp_estimate < (threshold - 1.5):
+        # YES guard: suppress YES bets when GDPNow is well below threshold.
+        #   GDPNow RMSE ≈ 0.9pp; suppress when nowcast < threshold - 1.0pp
+        #   (comfortable miss predicted — YES very unlikely).
+        #
+        # NO guard: suppress NO bets when GDPNow is at or above threshold.
+        #   If GDPNow ≥ threshold - 0.5pp, GDP is likely to EXCEED the threshold
+        #   (YES resolves), making a NO bet directionally wrong vs our own model.
+        #   0.5pp buffer covers GDPNow noise near the boundary.
+        if side == "yes" and gdp_estimate < (threshold - 1.0):
             log.debug(
                 "GDP YES suppressed: %s  gdpnow=%.2f%%  threshold=%.2f%%  "
-                "(gdpnow < threshold - 1.5pp)",
+                "(gdpnow < threshold - 1.0pp — YES very unlikely)",
                 ticker, gdp_estimate, threshold,
             )
             continue
-        if side == "no" and gdp_estimate > (threshold + 1.5):
+        if side == "no" and gdp_estimate >= (threshold - 0.5):
             log.debug(
                 "GDP NO suppressed: %s  gdpnow=%.2f%%  threshold=%.2f%%  "
-                "(gdpnow > threshold + 1.5pp — NO bet would lose)",
+                "(gdpnow near or above threshold — NO bet contradicts model direction)",
                 ticker, gdp_estimate, threshold,
             )
             continue
