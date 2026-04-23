@@ -38,7 +38,7 @@ from ep_polymarket import polymarket
 from kalshi_bot.models.fomc import inject_kalshi_prices as _fomc_inject_prices
 from ep_health import health as _src_health
 from ep_coinbase import CoinbaseTradeClient
-from ep_pg_audit import init_audit_writer, stop_audit_writer
+from ep_pg_audit import init_audit_writer, stop_audit_writer, audit as _intel_audit
 from ep_telegram import telegram as _telegram
 from ep_resolution_db import get_performance_summary
 from ep_fed_sentiment import get_fed_sentiment
@@ -713,7 +713,7 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
                 "BAA10Y: %.2f%%  regime=%s  3w_change=%.2f%%",
                 _baa10y_data.get("spread_pct", 0),
                 _baa10y_data.get("regime", "normal"),
-                _baa10y_data.get("change_3w", 0),
+                _baa10y_data.get("change_3w_pct", 0),
             )
     except Exception as _b10y_exc:
         log.debug("BAA10Y Redis read skipped: %s", _b10y_exc)
@@ -723,12 +723,12 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
         _walcl_raw = await bus._r.get("ep:macro:walcl")
         if _walcl_raw:
             _walcl_data = json.loads(_walcl_raw)
-            regime["walcl_trend"]         = _walcl_data.get("trend", "")
-            regime["walcl_4w_change_pct"] = _walcl_data.get("change_4w_pct", 0)
+            regime["walcl_trend"]          = _walcl_data.get("trend", "")
+            regime["walcl_4w_change_bill"] = _walcl_data.get("change_4w_billions", 0)
             log.info(
-                "WALCL: $%.1fT  4wk_chg=%.2f%%  trend=%s",
-                _walcl_data.get("walcl_billion", 0) / 1000,
-                _walcl_data.get("change_4w_pct", 0),
+                "WALCL: $%.1fT  4wk_chg=%+.1fB  trend=%s",
+                _walcl_data.get("latest_billions_usd", 0) / 1000,
+                _walcl_data.get("change_4w_billions", 0),
                 _walcl_data.get("trend", "unknown"),
             )
     except Exception as _walcl_exc:
@@ -1117,6 +1117,82 @@ async def _exec_watchdog_loop(bus: RedisBus, interval: int = 60) -> None:
         await asyncio.sleep(interval)
 
 
+async def _price_gap_fill_loop(
+    bus: RedisBus, client, interval: int = 30
+) -> None:
+    """
+    Every `interval` seconds, ensure every ticker in ep:positions has a fresh
+    price in ep:prices.  Decoupled from the main Intel cycle so stale-price
+    skips in the exit checker can't persist longer than ~30s regardless of
+    cycle timing.
+
+    A position without a fresh price means stop-losses and pre-expiry exits
+    are silently skipped until Intel's next cycle — this task closes that gap.
+    """
+    log.info("Price gap-fill loop started (interval=%ds)", interval)
+    _stale_threshold_us = 60 * 1_000_000   # 60s in microseconds
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            all_pos   = await bus.get_all_positions()
+            if not all_pos:
+                continue
+            now_us    = int(time.time() * 1_000_000)
+            all_prices = await bus._r.hgetall(EP_PRICES)
+
+            stale_tickers = []
+            for ticker in all_pos:
+                raw = all_prices.get(ticker) or all_prices.get(
+                    ticker.encode() if isinstance(ticker, str) else ticker
+                )
+                if raw:
+                    try:
+                        ts_us = json.loads(raw).get("ts_us", 0)
+                        if now_us - ts_us < _stale_threshold_us:
+                            continue  # fresh enough
+                    except Exception:
+                        pass
+                stale_tickers.append(ticker)
+
+            if not stale_tickers:
+                continue
+
+            log.debug("price_gap_fill: %d stale tickers — fetching from REST", len(stale_tickers))
+            _patch: dict = {}
+            for ticker in stale_tickers:
+                try:
+                    resp = await asyncio.to_thread(
+                        client.get, f"/markets/{ticker}"
+                    )
+                    market = (resp or {}).get("market", {}) if isinstance(resp, dict) else {}
+                    _yp_raw = (
+                        market.get("last_price_dollars")
+                        or market.get("yes_bid_dollars")
+                        or market.get("last_price")
+                        or market.get("yes_bid")
+                        or market.get("market_price")
+                    )
+                    if _yp_raw is not None:
+                        _yp = round(float(_yp_raw) * 100)
+                        _patch[ticker] = json.dumps({
+                            "yes_price":  _yp,
+                            "no_price":   100 - _yp,
+                            "spread":     0,
+                            "last_price": _yp,
+                            "ts_us":      int(time.time() * 1_000_000),
+                        })
+                except Exception as exc:
+                    log.debug("price_gap_fill: REST fetch failed for %s: %s", ticker, exc)
+
+            if _patch:
+                await bus._r.hset(EP_PRICES, mapping=_patch)
+                log.info("price_gap_fill: refreshed %d stale prices via REST", len(_patch))
+
+        except Exception as exc:
+            log.debug("price_gap_fill_loop error: %s", exc)
+
+
 async def _wait_for_dependencies() -> None:
     """Retry Redis and Postgres until reachable before marking the service ready."""
     import redis.asyncio as _aioredis
@@ -1200,6 +1276,7 @@ async def intel_main() -> None:
     heartbeat_task       = asyncio.create_task(_heartbeat_loop(bus))
     release_monitor_task = asyncio.create_task(_release_monitor_loop(bus))
     exec_watchdog_task   = asyncio.create_task(_exec_watchdog_loop(bus))
+    price_gap_fill_task  = asyncio.create_task(_price_gap_fill_loop(bus, client))
 
     # ── BTC mean-reversion strategy ───────────────────────────────────────────
     # Candle data: uses Polygon if POLYGON_API_KEY is set, otherwise falls back
@@ -1233,6 +1310,14 @@ async def intel_main() -> None:
     markets_cache:     List[dict]     = []
     fomc_cache:        List[dict]     = []   # KXFED markets — refreshed with markets_cache
     markets_last_scan: float          = 0.0
+
+    # Per-scanner consecutive zero-signal cycle counter.
+    # Logs a warning when a scanner has been silent for _ZERO_SIG_WARN cycles.
+    _zero_sig_counts: dict[str, int] = {
+        "fomc": 0, "weather": 0, "economic": 0, "sports": 0,
+        "crypto_price": 0, "gdp": 0, "arb": 0,
+    }
+    _ZERO_SIG_WARN = 20  # ~40 min at 120s/cycle
 
     # Baseline BTC z-threshold from env (before LLM/vol overrides are applied)
     _btc_z_base: float = btc_strategy.z_thresh if btc_strategy else 1.5
@@ -1299,6 +1384,7 @@ async def intel_main() -> None:
                 if _gdp_obs:
                     _gdp_now_val = float(_gdp_obs[0]["value"])
                     log.info("Startup GDP risk check: GDPNow = %.2f%%", _gdp_now_val)
+                    await bus._r.hset("ep:macro", "gdpnow", str(_gdp_now_val))
 
             if _gdp_now_val is not None:
                 _open_positions = await bus.get_all_positions()
@@ -1728,6 +1814,65 @@ async def intel_main() -> None:
                         len(_gap_patch),
                     )
 
+            # ── Market snapshot (backtest dataset) ───────────────────────────
+            # Record every market Intel sees this cycle.  bid/ask/mid from the
+            # WebSocket snapshot where available (real-time); REST market_cache
+            # for volume/OI/close_time (refreshed every 20 min — acceptable staleness).
+            # Signal overlay is null for the ~99% of markets with no edge this cycle.
+            try:
+                _snap_ts_us   = int(time.time() * 1_000_000)
+                _sig_by_tick  = {s.ticker: s for s in signals}
+                _ws_snap      = snapshot.prices   # dict[ticker, {yes_price, no_price, spread, ...}]
+                _snap_writer  = _intel_audit()
+
+                for _sm in markets_cache:
+                    _st = _sm.get("ticker")
+                    if not _st:
+                        continue
+
+                    # REST bid/ask (20-min cadence)
+                    _rb = _sm.get("yes_bid_dollars")
+                    _ra = _sm.get("yes_ask_dollars")
+                    _yes_bid = round(float(_rb) * 100) if _rb else None
+                    _yes_ask = round(float(_ra) * 100) if _ra else None
+
+                    # WS mid + spread override (per-cycle, real-time)
+                    _ws = _ws_snap.get(_st)
+                    _ws = _ws if isinstance(_ws, dict) else None
+                    if _ws and _ws.get("yes_price") is not None:
+                        _yes_price = int(_ws["yes_price"])
+                        _spread    = int(_ws["spread"]) if _ws.get("spread") is not None else (
+                            (_yes_ask - _yes_bid) if (_yes_bid and _yes_ask) else None
+                        )
+                    elif _yes_bid is not None and _yes_ask is not None:
+                        _yes_price = (_yes_bid + _yes_ask) // 2
+                        _spread    = _yes_ask - _yes_bid
+                    else:
+                        _mp = (_sm.get("last_price_dollars") or _sm.get("market_price"))
+                        _yes_price = round(float(_mp) * 100) if _mp else None
+                        _spread    = None
+
+                    _sig = _sig_by_tick.get(_st)
+                    _snap_writer.write("market_snapshots", {
+                        "ts_us":         _snap_ts_us,
+                        "ticker":        _st,
+                        "series_ticker": _sm.get("series_ticker") or (_st.split("-")[0] if "-" in _st else _st),
+                        "yes_bid":       _yes_bid,
+                        "yes_ask":       _yes_ask,
+                        "yes_price":     _yes_price,
+                        "spread":        _spread,
+                        "volume":        int(float(_sm.get("volume", 0) or 0)),
+                        "open_interest": int(float(_sm.get("open_interest", 0) or 0)),
+                        "close_time":    _sm.get("close_time"),
+                        "signal_edge":   round(_sig.edge, 4) if _sig else None,
+                        "signal_side":   _sig.side if _sig else None,
+                        "signal_fv":     round(_sig.fair_value, 4) if _sig else None,
+                        "signal_conf":   round(_sig.confidence, 4) if _sig else None,
+                    })
+                log.debug("market_snapshots: queued %d rows (ts=%d)", len(markets_cache), _snap_ts_us)
+            except Exception:
+                log.debug("market_snapshot write failed", exc_info=True)
+
             # ── Dedup: skip tickers already held in Redis positions ───────────
             # For arb signals both legs must be held to consider the pair complete.
             # If only the primary is held (partner failed), re-publish so Exec can
@@ -1768,6 +1913,8 @@ async def intel_main() -> None:
                                     _gdp_now_cached = float(_g_obs[0]["value"])
                     if _gdp_now_cached is None:
                         continue
+                    # Keep ep:macro fresh so Exec can read GDPNow at exit time for logging
+                    await bus._r.hset("ep:macro", "gdpnow", str(_gdp_now_cached))
                     _at_gap = (_at_strike - _gdp_now_cached) if _at_side == "yes" \
                               else (_gdp_now_cached - _at_strike)
                     if _at_gap <= 0.75:
@@ -2366,6 +2513,24 @@ async def intel_main() -> None:
                     published, len(signals), already_held,
                 )
 
+            # Zero-signal watchdog: warn when a scanner has been consistently silent.
+            # Helps detect dead/misconfigured scanners early without constant log spam.
+            _sig_cats = {s.category for s in signals}
+            for _cat, _cnt in list(_zero_sig_counts.items()):
+                if _cat in _sig_cats:
+                    _zero_sig_counts[_cat] = 0
+                else:
+                    _zero_sig_counts[_cat] += 1
+                    if _zero_sig_counts[_cat] == _ZERO_SIG_WARN:
+                        log.warning(
+                            "SCANNER SILENT: '%s' has produced 0 signals for %d consecutive "
+                            "cycles (~%d min) — scanner may be disabled, misconfigured, or "
+                            "market has no edge. Check ENABLE_%s env var.",
+                            _cat, _ZERO_SIG_WARN, _ZERO_SIG_WARN * 2,
+                            _cat.upper().replace("_", "_"),
+                        )
+                        _zero_sig_counts[_cat] = 0  # reset so warning fires again after another N cycles
+
             # ── Fix 4: exec peer liveness check ──────────────────────────────
             # The exec node publishes HEARTBEAT to ep:system every 60s.
             # Alert if no heartbeat has been seen in the last 120s (2× interval).
@@ -2495,7 +2660,11 @@ async def intel_main() -> None:
         heartbeat_task.cancel()
         release_monitor_task.cancel()
         exec_watchdog_task.cancel()
-        await asyncio.gather(heartbeat_task, release_monitor_task, exec_watchdog_task, return_exceptions=True)
+        price_gap_fill_task.cancel()
+        await asyncio.gather(
+            heartbeat_task, release_monitor_task, exec_watchdog_task,
+            price_gap_fill_task, return_exceptions=True,
+        )
         ws.stop()
         await bus.publish_system_event("INTEL_STOP")
         await bus.close()

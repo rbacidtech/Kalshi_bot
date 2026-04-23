@@ -332,11 +332,24 @@ async def get_activity(
     events = []
     for entry_id, fields in entries:
         ts_iso = _ts_us_to_iso(fields.get("ts_us")) if fields.get("ts_us") else None
+        # System events are stored as {"payload": json.dumps({event_type, node, detail, ts_us})}
+        raw = fields.get("payload") or fields.get(b"payload")
+        event_type = node = detail = ""
+        if raw:
+            try:
+                ev = json.loads(raw)
+                event_type = ev.get("event_type", "")
+                node       = ev.get("node", "")
+                detail     = ev.get("detail", "")
+                if not ts_iso:
+                    ts_iso = _ts_us_to_iso(ev.get("ts_us"))
+            except Exception:
+                pass
         events.append({
             "id":         str(entry_id),
-            "event_type": fields.get("event_type", ""),
-            "node":       fields.get("node", ""),
-            "detail":     fields.get("detail", ""),
+            "event_type": event_type,
+            "node":       node,
+            "detail":     detail,
             "ts":         ts_iso,
         })
     return {"events": events}

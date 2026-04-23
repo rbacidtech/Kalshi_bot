@@ -108,6 +108,10 @@ class PgAuditWriter:
             await self._insert_balance_snapshots(rows)
         elif table == "llm_decisions":
             await self._insert_llm_decisions(rows)
+        elif table == "position_history":
+            await self._insert_position_history(rows)
+        elif table == "market_snapshots":
+            await self._insert_market_snapshots(rows)
         else:
             log.debug("pg_audit: unknown table %r — dropping %d rows", table, len(rows))
 
@@ -221,6 +225,107 @@ class PgAuditWriter:
                 VALUES ($1,$2,$3,$4,$5,$6,$7)
                 """,
                 records,
+            )
+
+
+    async def _insert_position_history(self, rows: List[Dict]) -> None:
+        records = []
+        for r in rows:
+            entered_at = r.get("entered_at")
+            exited_at  = r.get("exited_at")
+            try:
+                if entered_at and not hasattr(entered_at, "tzinfo"):
+                    entered_at = datetime.fromisoformat(entered_at.replace("Z", "+00:00"))
+                if exited_at and not hasattr(exited_at, "tzinfo"):
+                    exited_at = datetime.fromisoformat(exited_at.replace("Z", "+00:00"))
+            except Exception:
+                exited_at = datetime.now(timezone.utc)
+            records.append((
+                r.get("entry_exec_id"),
+                r.get("ticker", ""),
+                r.get("side", ""),
+                r.get("contracts", 0),
+                r.get("entry_cents", 0),
+                r.get("exit_cents", 0),
+                r.get("realized_pnl_cents", 0),
+                r.get("exit_reason"),
+                entered_at,
+                exited_at or datetime.now(timezone.utc),
+            ))
+        async with self._pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO position_history
+                    (entry_exec_id, ticker, side, contracts, entry_cents, exit_cents,
+                     realized_pnl_cents, exit_reason, entered_at, exited_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                ON CONFLICT DO NOTHING
+                """,
+                records,
+            )
+
+
+    async def _insert_market_snapshots(self, rows: List[Dict]) -> None:
+        """Bulk-insert market snapshot rows using asyncpg COPY — ~10× faster than INSERT."""
+        records = []
+        for r in rows:
+            close_time = r.get("close_time")
+            if isinstance(close_time, str):
+                try:
+                    close_time = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                except Exception:
+                    close_time = None
+            # SMALLINT overflow guard: yes_price/bid/ask/spread are 0-100 but coerce defensively
+            def _si(v) -> Optional[int]:
+                if v is None:
+                    return None
+                try:
+                    iv = int(v)
+                    return max(-32768, min(32767, iv))
+                except Exception:
+                    return None
+            def _int(v) -> Optional[int]:
+                if v is None:
+                    return None
+                try:
+                    return int(v)
+                except Exception:
+                    return None
+            def _dec(v) -> Optional[float]:
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+            records.append((
+                int(r["ts_us"]),
+                r["ticker"],
+                r.get("series_ticker"),
+                _si(r.get("yes_bid")),
+                _si(r.get("yes_ask")),
+                _si(r.get("yes_price")),
+                _si(r.get("spread")),
+                _int(r.get("volume")),
+                _int(r.get("open_interest")),
+                close_time,
+                _dec(r.get("signal_edge")),
+                r.get("signal_side"),
+                _dec(r.get("signal_fv")),
+                _dec(r.get("signal_conf")),
+            ))
+        if not records:
+            return
+        async with self._pool.acquire() as conn:
+            await conn.copy_records_to_table(
+                "market_snapshots",
+                records=records,
+                columns=[
+                    "ts_us", "ticker", "series_ticker",
+                    "yes_bid", "yes_ask", "yes_price", "spread",
+                    "volume", "open_interest", "close_time",
+                    "signal_edge", "signal_side", "signal_fv", "signal_conf",
+                ],
             )
 
 

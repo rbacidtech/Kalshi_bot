@@ -41,6 +41,24 @@ class PositionStore:
             )
             return
 
+        # entry_cents must always be the YES price (0–100 scale), never the NO price.
+        # For a NO position, entry_cents > 70 is suspicious: you'd typically only hold NO
+        # when YES > 70 if you have a very strong contrarian thesis.  More likely the NO
+        # price was passed instead of the YES price, which inverts P&L direction.
+        # Log a visible error but do NOT raise — valid contrarian trades can have YES > 50.
+        if side == "no" and entry_cents > 70:
+            from ep_config import log as _log
+            _log.error(
+                "entry_cents suspicious: NO position on %s has entry_cents=%d > 70. "
+                "Verify YES price was passed (not NO price). P&L direction may be wrong.",
+                ticker, entry_cents,
+            )
+            try:
+                from ep_metrics import metrics as _m
+                _m.record_invariant_violation("entry_cents_no_gt_70")
+            except Exception:
+                pass
+
         pos = {
             "side":              side,
             "contracts":         contracts,
