@@ -2386,6 +2386,23 @@ async def _fill_poll_loop(
                             "ORDER CANCELED on exchange: %s  order_id=%.8s — removing position",
                             ticker, order_id,
                         )
+                        _exec_id = pos.get("exec_id", "")
+                        if _exec_id:
+                            try:
+                                _audit_writer().write("position_history", {
+                                    "entry_exec_id":      _exec_id,
+                                    "ticker":             ticker,
+                                    "side":               pos.get("side", ""),
+                                    "contracts":          pos.get("contracts", 0),
+                                    "entry_cents":        pos.get("entry_cents", 0),
+                                    "exit_cents":         pos.get("entry_cents", 0),
+                                    "realized_pnl_cents": 0,
+                                    "exit_reason":        "cancel_external",
+                                    "entered_at":         pos.get("entered_at"),
+                                    "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                })
+                            except Exception:
+                                pass
                         # Pop from in-memory dict first so exit_checker can't fire
                         # in the window between Redis delete and executor pop.
                         if executor is not None:
@@ -2418,6 +2435,23 @@ async def _fill_poll_loop(
                                             "Resting order DELETE failed for %s: %s",
                                             ticker, _del_exc,
                                         )
+                                    _exec_id = pos.get("exec_id", "")
+                                    if _exec_id:
+                                        try:
+                                            _audit_writer().write("position_history", {
+                                                "entry_exec_id":      _exec_id,
+                                                "ticker":             ticker,
+                                                "side":               pos.get("side", ""),
+                                                "contracts":          pos.get("contracts", 0),
+                                                "entry_cents":        pos.get("entry_cents", 0),
+                                                "exit_cents":         pos.get("entry_cents", 0),
+                                                "realized_pnl_cents": 0,
+                                                "exit_reason":        f"cancel_timeout_{_age_h:.1f}h",
+                                                "entered_at":         pos.get("entered_at"),
+                                                "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                            })
+                                        except Exception:
+                                            pass
                                     if executor is not None:
                                         executor._positions.pop(ticker, None)
                                     await positions.close(ticker)
