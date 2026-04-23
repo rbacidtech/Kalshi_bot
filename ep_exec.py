@@ -588,8 +588,9 @@ async def _process_signal(
         arb_id  = str(_uuid.uuid4())[:8]
         _arb_ok = False
         try:
-            _leg_order_ids = executor.execute_arb_legs(
-                sig.arb_legs, contracts_per_leg=1, parent_signal=sig
+            _leg_order_ids = await asyncio.to_thread(
+                executor.execute_arb_legs,
+                sig.arb_legs, contracts_per_leg=1, parent_signal=sig,
             )
             _arb_ok = True
             # Write each arb leg into Redis ep:positions with the shared arb_id.
@@ -735,7 +736,7 @@ async def _process_signal(
                 return _rejected("EXECUTOR_DEDUP")
         exec_signal           = message_to_kalshi_signal(sig)
         exec_signal.contracts = contracts
-        order_id              = executor.execute(exec_signal)   # str: uuid | "paper" | ""
+        order_id              = await asyncio.to_thread(executor.execute, exec_signal)
         executed              = bool(order_id)
         # ── Circuit breaker accounting ────────────────────────────────────────
         if executed:
