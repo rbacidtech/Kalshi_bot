@@ -666,6 +666,24 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
         for r in results
     ]
 
+    # Update health for each FRED source based on gather results
+    _fred_sources = [
+        ("fred_dfedtaru", results[0]),
+        ("fred_vix",      results[1]),
+        ("fred_dgs10",    results[2]),
+        ("fred_core_cpi", results[3]),
+        ("fred_pce",      results[4]),
+        ("fred_icsa",     results[5]),
+        ("fred_t10y2y",   results[6]),
+        ("fred_t5yifr",   results[7]),
+        ("fred_unrate",   results[8]),
+    ]
+    for _sname, _sresult in _fred_sources:
+        if isinstance(_sresult, Exception):
+            _src_health.mark_fail(_sname, str(_sresult)[:80])
+        elif _sresult is not None:
+            _src_health.mark_ok(_sname)
+
     # DGS2 is fetched by strategy, pull from existing Redis state
     try:
         _dgs2_raw = await bus._r.hget("ep:macro", "dgs2")
@@ -1996,6 +2014,7 @@ async def intel_main() -> None:
             try:
                 _sofr_raw = await bus._r.get("ep:sofr:sr1")
                 if _sofr_raw:
+                    _src_health.mark_ok("cme_sofr_sr1")
                     _sofr_data    = json.loads(_sofr_raw)
                     _sofr_implied = float(_sofr_data.get("implied_rate_pct", 0))
                     _sofr_delta   = _sofr_implied - current_fed_rate
@@ -2207,6 +2226,7 @@ async def intel_main() -> None:
             try:
                 _pi_cache_raw = await bus._r.get("ep:predictit:markets")
                 if _pi_cache_raw:
+                    _src_health.mark_ok("predictit")
                     _pi_markets   = json.loads(_pi_cache_raw).get("markets", [])
                     _pi_price_map: dict = {}
                     for _pim in _pi_markets:
