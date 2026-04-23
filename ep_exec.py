@@ -608,12 +608,29 @@ async def _process_signal(
         # pre-write for sig.ticker is redundant and would conflict with leg writes.
         await positions.close(sig.ticker)
 
+        # ── Per-leg Redis dedup: block if ANY leg already has a resting order ──
+        # The primary dedup (above) only checks sig.ticker.  A different butterfly
+        # bundle may have a different primary ticker but share legs → slips through.
+        # Check every leg: if it has fill_confirmed=False in Redis (resting order),
+        # the leg is already out there and placing again creates a duplicate.
+        _leg_ticker_set = {lg["ticker"] for lg in sig.arb_legs}
+        _all_redis = await positions.get_all()
+        _busy_legs = {
+            t for t in _leg_ticker_set
+            if t in _all_redis and not _all_redis[t].get("fill_confirmed", False)
+        }
+        if _busy_legs:
+            log.debug(
+                "ARB_LEG_RESTING: skipping bundle — leg(s) %s have resting orders  signal_id=%.8s",
+                _busy_legs, sig.signal_id,
+            )
+            return _rejected("ARB_LEG_RESTING")
+
         # ── Race guard: claim all leg tickers atomically before placing ───────
         # Two concurrent bundles with overlapping legs both pass the Redis dedup
         # check before either writes back → duplicate orders.  This set is checked
         # and updated without an intervening await (asyncio is single-threaded),
         # so the check+claim is race-free within a single exec process.
-        _leg_ticker_set = {lg["ticker"] for lg in sig.arb_legs}
         if _leg_ticker_set & _arb_legs_in_progress:
             log.debug(
                 "ARB_LEG_CLAIMED: skipping bundle — leg(s) %s already in-flight  signal_id=%.8s",
