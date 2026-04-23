@@ -2026,18 +2026,6 @@ return cnt
                         pnl_cents     = pnl_cents,
                         mode          = "paper" if cfg.PAPER_TRADE else "live",
                     )
-                    if db is not None:
-                        db.record_trade_outcome(
-                            ticker       = ticker,
-                            series       = ticker.split("-")[0] if "-" in ticker else ticker,
-                            side         = side,
-                            contracts    = contracts,
-                            entry_cents  = entry_cents,
-                            exit_cents   = current_cents,
-                            pnl_cents    = pnl_cents,
-                            correct      = pnl_cents > 0,
-                            model_source = pos.get("model_source", ""),
-                        )
 
                     # Write to Postgres position_history for Kelly calibration
                     _exec_id = pos.get("exec_id", "")
@@ -2130,22 +2118,6 @@ async def _fill_poll_loop(
                                      else _lf_entry - _lf_cents)
                         _lf_pnl   = _lf_move * _lf_contracts
 
-                        if db is not None:
-                            try:
-                                db.record_trade_outcome(
-                                    ticker       = ticker,
-                                    series       = ticker.split("-")[0] if "-" in ticker else ticker,
-                                    side         = _lf_side,
-                                    contracts    = _lf_contracts,
-                                    entry_cents  = _lf_entry,
-                                    exit_cents   = _lf_cents,
-                                    pnl_cents    = _lf_pnl,
-                                    correct      = _lf_pnl > 0,
-                                    model_source = pos.get("model_source", ""),
-                                )
-                            except Exception as _lf_db_exc:
-                                log.warning("fill_poll DB record failed %s: %s",
-                                            ticker, _lf_db_exc)
 
                         _lf_exec_id = pos.get("exec_id", "")
                         if _lf_exec_id:
