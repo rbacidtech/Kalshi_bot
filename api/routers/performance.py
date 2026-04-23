@@ -30,15 +30,17 @@ async def get_performance(
     raw: Optional[str] = None
     if r:
         try:
-            raw = await r.get("ep:performance")
+            # Prefer period-specific key; fall back to the 30d default
+            if days in (7, 30, 90):
+                raw = await r.get(f"ep:performance:{days}")
+            if not raw:
+                raw = await r.get("ep:performance")
         except Exception:
             pass
 
     if raw:
         try:
             data = json.loads(raw)
-            # Override period_days with requested value for display purposes
-            data["period_days"] = days
             return data
         except Exception:
             pass

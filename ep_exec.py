@@ -2860,14 +2860,20 @@ async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> No
     log.info("Performance publisher started (interval=%ds)", interval)
     while True:
         try:
-            perf = await get_performance_summary(days=30)
-            if perf["total_trades"] > 0:
-                await bus._r.set("ep:performance", json.dumps(perf), ex=90000)
+            for d in (7, 30, 90):
+                perf = await get_performance_summary(days=d)
+                if perf["total_trades"] > 0:
+                    await bus._r.set(f"ep:performance:{d}", json.dumps(perf), ex=90000)
+            # Keep ep:performance as the 30d default for backward compat
+            perf30 = await bus._r.get("ep:performance:30")
+            if perf30:
+                await bus._r.set("ep:performance", perf30, ex=90000)
+                p = json.loads(perf30)
                 log.info(
                     "Performance (30d): win_rate=%.1f%% pnl=%+.2f$ trades=%d",
-                    perf["win_rate"] * 100,
-                    perf["total_pnl_cents"] / 100,
-                    perf["total_trades"],
+                    p["win_rate"] * 100,
+                    p["total_pnl_cents"] / 100,
+                    p["total_trades"],
                 )
         except Exception as exc:
             log.debug("Performance publisher error (non-fatal): %s", exc)
