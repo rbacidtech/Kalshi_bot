@@ -1261,6 +1261,10 @@ async def _sync_positions_with_kalshi(
         await positions.close(ticker)
         if executor is not None:
             executor._positions.pop(ticker, None)
+        # Prevent immediate re-entry: a resting order may still be live on Kalshi
+        # for this ticker (orphan reconciliation hasn't run since last sync).
+        # Without this cooldown the bot re-enters on the very next scan cycle.
+        _entry_failed_cooldown[ticker] = time.time()
         removed += 1
         log.info("Position sync: removed stale %s (not in Kalshi portfolio)", ticker)
 
@@ -3097,14 +3101,17 @@ async def exec_main() -> None:
                 )
             log.info("Startup: synced %d disk positions → Redis", len(executor._positions))
 
-    # ── Orphan order reconciliation ───────────────────────────────────────────
-    # Restore any Kalshi resting orders that have no matching Redis entry.
-    # Must run after the Redis cleanup above so tombstones are respected.
+    # ── Orphan order reconciliation + position sync ───────────────────────────
+    # Order matters:
+    # 1. Position sync first: removes fill_confirmed=True ghost entries.
+    # 2. Orphan reconciliation second: restores any resting orders whose Redis
+    #    entries were just cleared by sync (fill_confirmed ghost for a resolved
+    #    position whose resting entry order was still live on Kalshi).
+    # Running orphan reconciliation first then sync would leave a window where
+    # restored orphans get stripped right back out by sync.
     if not cfg.PAPER_TRADE:
-        await _reconcile_orphan_orders(positions, client, executor)
-        # Full position sync: fixes qty/side/entry_cents divergence that
-        # can accumulate between reconcile runs.
         await _sync_positions_with_kalshi(positions, executor)
+        await _reconcile_orphan_orders(positions, client, executor)
     else:
         log.info("Paper trade mode — skipping orphan order reconciliation.")
 
