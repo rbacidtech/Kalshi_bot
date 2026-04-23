@@ -15,7 +15,7 @@ interface BotConfig {
   enable_sports:        boolean
   enable_crypto_price:  boolean
   enable_gdp:           boolean
-  paper_trade:          boolean
+
   edge_threshold:       number
   max_contracts:        number
   poll_interval:        number
@@ -517,31 +517,6 @@ function StrategiesTab({ cfg, update, isSaving, perf }: {
 
   return (
     <div className="space-y-4">
-      {/* Paper trade banner inside strategies */}
-      <div className={`rounded-xl border p-4 flex items-center justify-between gap-4 ${
-        cfg.paper_trade
-          ? 'bg-amber-500/10 border-amber-500/30'
-          : 'bg-emerald-500/8 border-emerald-500/20'
-      }`}>
-        <div className="flex items-center gap-3">
-          {cfg.paper_trade
-            ? <AlertTriangle size={16} className="text-amber-400 shrink-0" />
-            : <Zap size={16} className="text-emerald-400 shrink-0" />
-          }
-          <div>
-            <p className={`text-sm font-semibold ${cfg.paper_trade ? 'text-amber-300' : 'text-emerald-400'}`}>
-              {cfg.paper_trade ? 'Paper Trading' : 'Live Trading'}
-            </p>
-            <p className="text-xs text-slate-500 mt-0.5">
-              {cfg.paper_trade
-                ? 'Simulate orders — no real money placed'
-                : 'Real orders active — disable after validating signals'}
-            </p>
-          </div>
-        </div>
-        <Toggle checked={cfg.paper_trade} onChange={v => update('paper_trade', v)} disabled={isSaving} />
-      </div>
-
       {/* Active count */}
       <div className="flex items-center justify-between px-1">
         <p className="text-xs text-slate-500 font-medium">Strategy Modules</p>
@@ -550,7 +525,7 @@ function StrategiesTab({ cfg, update, isSaving, perf }: {
 
       <div className="flex items-center gap-2 px-1 py-2 rounded-lg bg-amber-500/8 border border-amber-500/20">
         <AlertTriangle size={13} className="text-amber-400 shrink-0" />
-        <p className="text-xs text-amber-300">Strategy toggles and paper mode require a service restart to take effect.</p>
+        <p className="text-xs text-amber-300">Strategy toggles require a service restart to take effect.</p>
       </div>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -901,7 +876,7 @@ export default function ControlsPage() {
 
   const RESTART_REQUIRED_KEYS: (keyof BotConfig)[] = [
     'enable_fomc', 'enable_weather', 'enable_economic', 'enable_sports',
-    'enable_crypto_price', 'enable_gdp', 'paper_trade',
+    'enable_crypto_price', 'enable_gdp',
     'kelly_fraction', 'max_market_exposure', 'daily_drawdown_limit', 'poll_interval',
   ]
 

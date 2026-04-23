@@ -59,7 +59,6 @@ def _env_defaults() -> dict[str, Any]:
         "enable_sports":       True,
         "enable_crypto_price": True,
         "enable_gdp":          True,
-        "paper_trade":         _bool("KALSHI_PAPER_TRADE", False),
         "edge_threshold":      _float("KALSHI_EDGE_THRESHOLD", 0.10),
         "max_contracts":       _int("KALSHI_MAX_CONTRACTS", 5),
         "poll_interval":       _int("KALSHI_POLL_INTERVAL", 120),
@@ -77,7 +76,6 @@ class BotConfig(BaseModel):
     enable_sports:        bool  = True
     enable_crypto_price:  bool  = True
     enable_gdp:           bool  = True
-    paper_trade:          bool  = False
     edge_threshold:       float = Field(0.10, ge=0.05, le=0.50)
     max_contracts:        int   = Field(5,    ge=1,    le=100)
     poll_interval:        int   = Field(120,  ge=30,   le=3600)
