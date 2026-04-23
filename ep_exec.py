@@ -1587,7 +1587,7 @@ async def _exit_checker(
                             close_dt - datetime.now(timezone.utc)
                         ).total_seconds() / 3600
 
-                        if 0 < hours_remaining < hours_before_close * 2 and tranche_done == 0 and move_cents > 0:
+                        if 0 < hours_remaining < hours_before_close * 2 and tranche_done == 0:
                             if hours_remaining >= hours_before_close and contracts > 1:
                                 # TRANCHE 1 — partial exit (half contracts)
                                 half      = contracts // 2
@@ -1626,7 +1626,7 @@ async def _exit_checker(
                                 # Single contract or already past t2 — full exit now
                                 exit_reason = f"pre_expiry ({hours_remaining:.1f}h)"
 
-                        elif 0 < hours_remaining < hours_before_close and tranche_done == 1 and move_cents > 0:
+                        elif 0 < hours_remaining < hours_before_close and tranche_done == 1:
                             # TRANCHE 2 — exit remaining contracts
                             exit_reason = f"pre_expiry_t2 ({hours_remaining:.1f}h)"
 

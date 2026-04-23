@@ -190,7 +190,7 @@ class Executor:
         if not (0.01 <= market_price <= 0.99):
             log.error("Price %s out of valid range [0.01, 0.99] — refusing order for %s", market_price, signal.ticker)
             return ""
-        price_cents = int(market_price * 100)
+        price_cents = int(market_price * 100) if signal.side == "yes" else int((1.0 - market_price) * 100)
         price_key   = "yes_price" if signal.side == "yes" else "no_price"
         payload = {
             "action":  "buy",
