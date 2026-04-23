@@ -69,6 +69,12 @@ _entry_failed_cooldown: dict = {}   # ticker → float timestamp of failure
 _ENTRY_FAILED_COOLDOWN_S      = 1800  # 30 minutes (executor failures, bad strikes)
 _ENTRY_FAILED_COOLDOWN_SHORT  = 600   # 10 minutes (Kelly=0: price may move soon)
 
+# Tickers currently being placed as arb legs — prevents two concurrent bundles
+# from placing orders on the same ticker when both pass the Redis dedup check
+# before either bundle finishes writing its legs back to Redis.
+# Python asyncio is single-threaded so check+add is atomic (no await between).
+_arb_legs_in_progress: set[str] = set()
+
 # ── Exit-API failure backoff ───────────────────────────────────────────────────
 # When Kalshi rejects an exit order (e.g. HTTP 400 due to illiquid market),
 # back off before retrying so we don't hammer the API every 60 s.
@@ -602,6 +608,20 @@ async def _process_signal(
         # pre-write for sig.ticker is redundant and would conflict with leg writes.
         await positions.close(sig.ticker)
 
+        # ── Race guard: claim all leg tickers atomically before placing ───────
+        # Two concurrent bundles with overlapping legs both pass the Redis dedup
+        # check before either writes back → duplicate orders.  This set is checked
+        # and updated without an intervening await (asyncio is single-threaded),
+        # so the check+claim is race-free within a single exec process.
+        _leg_ticker_set = {lg["ticker"] for lg in sig.arb_legs}
+        if _leg_ticker_set & _arb_legs_in_progress:
+            log.debug(
+                "ARB_LEG_CLAIMED: skipping bundle — leg(s) %s already in-flight  signal_id=%.8s",
+                _leg_ticker_set & _arb_legs_in_progress, sig.signal_id,
+            )
+            return _rejected("ARB_LEG_CLAIMED")
+        _arb_legs_in_progress.update(_leg_ticker_set)
+
         import uuid as _uuid
         arb_id  = str(_uuid.uuid4())[:8]
         _arb_ok = False
@@ -703,6 +723,8 @@ async def _process_signal(
         except RuntimeError as _arb_exc:
             log.warning("Multi-leg arb FAILED (clean rollback): %s  signal_id=%.8s",
                         _arb_exc, sig.signal_id)
+        finally:
+            _arb_legs_in_progress -= _leg_ticker_set
         executed = _arb_ok
     elif sig.asset_class == "kalshi":
         if sig.ticker in executor._positions:
