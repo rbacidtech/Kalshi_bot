@@ -1009,6 +1009,22 @@ async def _heartbeat_loop(bus: RedisBus, interval: int = 60) -> None:
                 "postgres":         pg_status,
                 "postgres_queue":   q_size,
             })
+            _biz_issues = metrics._health.get("business_issues", [])
+            _summary = {
+                "overall": ("critical" if not redis_ok
+                            else "degraded" if _biz_issues
+                            else "healthy"),
+                "sources": {
+                    "redis":    {"status": "ok" if redis_ok else "fail",
+                                 "age_s": 0, "failures": 0, "error": ""},
+                    "postgres": {"status": pg_status,
+                                 "age_s": 0, "failures": 0, "error": ""},
+                    "business": {"status": "ok" if not _biz_issues else "degraded",
+                                 "age_s": 0, "failures": len(_biz_issues),
+                                 "error": "; ".join(_biz_issues[:3]) if _biz_issues else ""},
+                },
+            }
+            await bus.publish_health(_summary)
         except Exception:
             pass
 
