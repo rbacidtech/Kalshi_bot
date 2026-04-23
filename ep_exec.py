@@ -1140,7 +1140,8 @@ async def _sync_positions_with_kalshi(
         r_side   = existing.get("side", "")
         r_entry  = int(existing.get("entry_cents", 0))
 
-        if r_qty > 0 and r_side == k_side and r_qty == k_qty and abs(r_entry - k_entry) <= 2:
+        r_cf     = int(existing.get("contracts_filled", 0))
+        if r_qty > 0 and r_side == k_side and r_qty == k_qty and abs(r_entry - k_entry) <= 2 and r_cf >= k_qty:
             continue  # already correct
 
         if r_qty == 0:
@@ -1158,8 +1159,9 @@ async def _sync_positions_with_kalshi(
             })
             added += 1
         else:
-            # Update diverged fields in-place
-            patch: dict = {"fill_confirmed": True}
+            # Update diverged fields in-place — always sync contracts_filled so
+            # fill_poll (which skips fill_confirmed=True) can't leave it at 0.
+            patch: dict = {"fill_confirmed": True, "contracts_filled": k_qty}
             if r_qty != k_qty:
                 patch["contracts"] = k_qty
             if r_side != k_side:
@@ -2468,6 +2470,28 @@ async def _reconcile_orphan_orders(
             continue   # intentional block — do not restore
         if existing:
             continue   # already in Redis — fill_poll handles it
+
+        # Don't restore resting orders for tickers currently on stop-loss cooldown.
+        # An entry order still resting after a stop exit should be cancelled, not
+        # re-adopted — otherwise it will just hit another stop and escalate the
+        # stop counter on the next cycle.
+        try:
+            _cd_ttl = await bus._r.ttl(f"ep:cooldown:{_safe_key(ticker)}")
+            if _cd_ttl > 0:
+                log.info(
+                    "Orphan recovery skipping %s — stop-loss cooldown active (%ds remaining); "
+                    "cancelling resting order %s",
+                    ticker, _cd_ttl, order_id,
+                )
+                try:
+                    await asyncio.to_thread(
+                        client.delete, f"/portfolio/orders/{order_id}"
+                    )
+                except Exception as _cancel_exc:
+                    log.warning("Could not cancel cooldown-blocked order %s: %s", order_id, _cancel_exc)
+                continue
+        except Exception:
+            pass  # Redis unavailable — proceed with restore
 
         side         = order.get("side", "yes")
         yes_price    = order.get("yes_price_dollars") or order.get("yes_price", 0)
