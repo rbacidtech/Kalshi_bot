@@ -453,7 +453,7 @@ async def _process_signal(
                 pass
         _min_depth = _MIN_BOOK_DEPTH_LONG if _is_long else _MIN_BOOK_DEPTH
         if sig.book_depth < _min_depth:
-            log.info(
+            log.debug(
                 "Book-depth gate: %s  depth=%d < min=%d (%s)  — skipping",
                 sig.ticker, sig.book_depth, _min_depth,
                 "long-game" if _is_long else "standard",

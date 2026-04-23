@@ -580,6 +580,7 @@ class BTCMeanReversionStrategy:
                 edge       = (mid_bb - spot_price) / spot_price
                 conf_adj   = _sentiment_conf_adj("buy")
                 confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj))
+                fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(
                     source_node       = self.source_node,
                     asset_class       = "btc_spot",
@@ -591,7 +592,7 @@ class BTCMeanReversionStrategy:
                     market_price      = spot_price,
                     fair_value        = mid_bb,
                     edge              = edge,
-                    fee_adjusted_edge = max(0.0, edge - COINBASE_TAKER_FEE),
+                    fee_adjusted_edge = fee_adj_edge,
                     confidence        = confidence,
                     suggested_size    = 1,
                     btc_price         = spot_price,
@@ -599,8 +600,9 @@ class BTCMeanReversionStrategy:
                     btc_lookback_m    = self.candle_min * self.candle_cnt,
                     ttl_ms            = self.ttl_ms,
                 )
-                if edge <= 0:
-                    log.warning("BTC buy edge=%.4f is non-positive — skipping (likely data anomaly)", edge)
+                if fee_adj_edge <= 0:
+                    log.warning("BTC buy edge=%.4f below round-trip fee (%.1f%%) — skipping",
+                                edge, 2 * COINBASE_TAKER_FEE * 100)
                 elif edge > 0.15:
                     log.warning("BTC buy edge=%.4f exceeds 15%% — skipping (likely data error)", edge)
                 else:
@@ -630,6 +632,7 @@ class BTCMeanReversionStrategy:
                 edge       = (spot_price - mid_bb) / spot_price
                 conf_adj   = _sentiment_conf_adj("sell")
                 confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj))
+                fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(
                     source_node       = self.source_node,
                     asset_class       = "btc_spot",
@@ -641,7 +644,7 @@ class BTCMeanReversionStrategy:
                     market_price      = spot_price,
                     fair_value        = mid_bb,
                     edge              = edge,
-                    fee_adjusted_edge = max(0.0, edge - COINBASE_TAKER_FEE),
+                    fee_adjusted_edge = fee_adj_edge,
                     confidence        = confidence,
                     suggested_size    = 1,
                     btc_price         = spot_price,
@@ -649,8 +652,9 @@ class BTCMeanReversionStrategy:
                     btc_lookback_m    = self.candle_min * self.candle_cnt,
                     ttl_ms            = self.ttl_ms,
                 )
-                if edge <= 0:
-                    log.warning("BTC sell edge=%.4f is non-positive — skipping (likely data anomaly)", edge)
+                if fee_adj_edge <= 0:
+                    log.warning("BTC sell edge=%.4f below round-trip fee (%.1f%%) — skipping",
+                                edge, 2 * COINBASE_TAKER_FEE * 100)
                 elif edge > 0.15:
                     log.warning("BTC sell edge=%.4f exceeds 15%% — skipping (likely data error)", edge)
                 else:
