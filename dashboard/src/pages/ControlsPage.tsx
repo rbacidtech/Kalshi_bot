@@ -486,12 +486,12 @@ const STRATEGIES: StrategyDef[] = [
 ]
 
 const STRATEGY_PNL_KEYS: Record<string, string[]> = {
-  enable_fomc:         ['fomc_directional', 'fomc_arb', 'fedwatch+zq', 'kalshi_implied'],
-  enable_weather:      ['fomc_weather', 'weather'],
-  enable_economic:     ['fomc_economic', 'economic'],
-  enable_crypto_price: ['btc_mr', 'btc_mean_reversion', 'btc'],
+  enable_fomc:         ['fedwatch', 'fomc', 'kalshi_implied', 'fred_anchor', 'fred_trend', 'monotonicity_arb', 'arb_partner'],
+  enable_weather:      ['noaa', 'open_meteo', 'weather'],
+  enable_economic:     ['fred_cpi', 'cpi_sigmoid', 'fred_nfp', 'nfp', 'economic'],
+  enable_crypto_price: ['btc_mr', 'btc_mean_reversion', 'btc', 'eth'],
   enable_gdp:          ['gdp', 'kxgdp'],
-  enable_sports:       ['sports'],
+  enable_sports:       ['sports', 'nba', 'nfl', 'mlb', 'nhl'],
 }
 
 function stratPnl(key: string, perf: Record<string, any> | undefined): number | null {
