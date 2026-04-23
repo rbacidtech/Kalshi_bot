@@ -13,6 +13,11 @@ from ep_bus import RedisBus
 
 
 class PositionStore:
+    """High-level wrapper around RedisBus position operations.
+
+    Provides open/close/update semantics with guard logic (e.g. never overwrite
+    a confirmed position with a pending pre-write).
+    """
 
     def __init__(self, bus: RedisBus):
         self._bus = bus
@@ -30,6 +35,11 @@ class PositionStore:
         model_source: str = "",
         pending:      bool = False,
     ) -> None:
+        """Open a new position in Redis.
+
+        Guards against overwriting a confirmed (non-pending) position.
+        entry_cents must be the YES price equivalent (0-100), regardless of side.
+        """
         # Guard: never overwrite a confirmed (non-pending) position with a new
         # pending pre-write.  This prevents crash-recovery pre-writes from
         # clobbering live position data that was manually registered or entered
@@ -41,21 +51,21 @@ class PositionStore:
             )
             return
 
-        # entry_cents must always be the YES price (0–100 scale), never the NO price.
-        # For a NO position, entry_cents > 70 is suspicious: you'd typically only hold NO
-        # when YES > 70 if you have a very strong contrarian thesis.  More likely the NO
-        # price was passed instead of the YES price, which inverts P&L direction.
-        # Log a visible error but do NOT raise — valid contrarian trades can have YES > 50.
-        if side == "no" and entry_cents > 70:
+        # entry_cents convention: always the YES price (0-100), never the raw NO price.
+        # A NO position with entry_cents > 95 means YES was at 95¢+ at entry, which
+        # is extremely rare and usually indicates the NO price was stored directly
+        # (e.g. NO@95¢ stored as 95 instead of the correct YES-equivalent of 5).
+        # KXFED / butterfly arb NO entries with YES in the 70-94¢ range are normal.
+        if side == "no" and entry_cents > 95:
             from ep_config import log as _log
             _log.error(
-                "entry_cents suspicious: NO position on %s has entry_cents=%d > 70. "
-                "Verify YES price was passed (not NO price). P&L direction may be wrong.",
+                "entry_cents suspicious: NO position on %s has entry_cents=%d > 95. "
+                "Verify YES equivalent was passed (not NO price). P&L direction may be wrong.",
                 ticker, entry_cents,
             )
             try:
                 from ep_metrics import metrics as _m
-                _m.record_invariant_violation("entry_cents_no_gt_70")
+                _m.record_invariant_violation("entry_cents_no_gt_95")
             except Exception:
                 pass
 
@@ -84,9 +94,11 @@ class PositionStore:
         return pos
 
     async def exists(self, ticker: str) -> bool:
+        """Return True if any position (pending or confirmed) exists for this ticker."""
         return await self._bus.position_exists(ticker)
 
     async def get_all(self) -> Dict[str, dict]:
+        """Return all open positions keyed by ticker."""
         return await self._bus.get_all_positions()
 
     async def update_fields(self, ticker: str, updates: dict) -> None:
@@ -113,6 +125,8 @@ class PositionStore:
         positions = await self._bus.get_all_positions()
         total = 0
         for p in positions.values():
+            if p.get("user_bet"):
+                continue  # personal bets are not bot capital
             entry     = p.get("entry_cents", 50)
             # Use contracts_filled when available (partial-fill window);
             # falls back to contracts (requested size) for pending/unfilled orders.

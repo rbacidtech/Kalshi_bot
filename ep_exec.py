@@ -508,9 +508,13 @@ async def _process_signal(
             return _rejected("MARKET_LIMIT")
 
     # ── Long-game capital cap ─────────────────────────────────────────────────
-    # Positions settling > _LONG_GAME_HORIZON_DAYS out are capped at
+    # Directional positions settling > _LONG_GAME_HORIZON_DAYS out are capped at
     # _LONG_GAME_MAX_PCT of balance so active/daily capital stays available.
-    if sig.asset_class == "kalshi" and sig.close_time:
+    # Exempt: arb signals (fomc_butterfly_arb, monotonicity_arb, calendar_spread_arb)
+    # — their legs are structurally hedged triplets; net risk is bounded by the
+    # spread, not the full entry cost, so they should not consume directional budget.
+    _is_arb_signal = bool(sig.arb_legs) or (sig.model_source or "").lower().endswith("_arb")
+    if sig.asset_class == "kalshi" and sig.close_time and not _is_arb_signal:
         try:
             _ct = datetime.fromisoformat(sig.close_time.replace("Z", "+00:00"))
             _days_out = (_ct - datetime.now(timezone.utc)).total_seconds() / 86400
@@ -518,6 +522,12 @@ async def _process_signal(
                 _lg_deployed = 0
                 _lg_all = _all_pos
                 for _lp in _lg_all.values():
+                    # Arb legs are hedged — exclude from directional cap tally.
+                    if (_lp.get("model_source") or "").lower().endswith("_arb"):
+                        continue
+                    # Personal bets are bot-unmanaged — exclude from cap.
+                    if _lp.get("user_bet"):
+                        continue
                     _lp_ct = _lp.get("close_time", "")
                     if not _lp_ct:
                         continue
@@ -1256,8 +1266,79 @@ async def _sync_positions_with_kalshi(
             continue
         if int(pos.get("contracts", 0)) == 0:
             continue
+        if pos.get("user_bet"):
+            continue  # personal bets are not bot-managed — skip sync
         if ticker in kalshi_map:
             continue
+
+        # Position vanished from Kalshi — almost always means market resolved.
+        # Query the market API to get the binary outcome, then write an exit record
+        # so the CSV and position_history stay accurate (prevents P&L gap).
+        _res_result  = None
+        _exit_cents  = None
+        try:
+            _mr  = await asyncio.to_thread(executor.client.get, f"/markets/{ticker}")
+            _mkt = (_mr or {}).get("market", {})
+            if _mkt.get("status") == "resolved":
+                _res_result = _mkt.get("result", "")   # "yes" or "no"
+                _exit_cents = 100 if _res_result == "yes" else 0
+        except Exception:
+            pass
+
+        if _exit_cents is not None:
+            _res_side    = pos.get("side", "yes")
+            _res_qty     = int(pos.get("contracts_filled") or pos.get("contracts", 1))
+            _res_entry   = int(pos.get("entry_cents", 50))
+            _res_exec_id = pos.get("exec_id", "")
+            _res_pnl     = (
+                (_exit_cents - _res_entry) * _res_qty if _res_side in ("yes", "buy")
+                else (_res_entry - _exit_cents) * _res_qty
+            )
+            # Postgres position_history (deduped by entry_exec_id via ON CONFLICT DO NOTHING)
+            if _res_exec_id:
+                try:
+                    _audit_writer().write("position_history", {
+                        "entry_exec_id":      _res_exec_id,
+                        "ticker":             ticker,
+                        "side":               _res_side,
+                        "contracts":          _res_qty,
+                        "entry_cents":        _res_entry,
+                        "exit_cents":         _exit_cents,
+                        "realized_pnl_cents": _res_pnl,
+                        "exit_reason":        f"market_resolved_{_res_result}",
+                        "entered_at":         pos.get("entered_at"),
+                        "exited_at":          datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception:
+                    pass
+            # CSV (for get_performance_summary / ep_resolution_db)
+            try:
+                from kalshi_bot.strategy import Signal as _KSig
+                _exit_sig = _KSig(
+                    ticker            = ticker,
+                    title             = "",
+                    category          = pos.get("category", "fomc"),
+                    meeting           = pos.get("meeting") or "",
+                    outcome           = pos.get("outcome") or "",
+                    side              = "no" if _res_side == "yes" else "yes",
+                    fair_value        = pos.get("fair_value", 0.5),
+                    market_price      = _exit_cents / 100,
+                    edge              = 0.0,
+                    fee_adjusted_edge = 0.0,
+                    contracts         = _res_qty,
+                    confidence        = 0.0,
+                    model_source      = f"market_resolved_{_res_result}",
+                )
+                executor._log_trade(_exit_sig, "exit",
+                                    f"resolved_{_res_result}",
+                                    "paper" if cfg.PAPER_TRADE else "live")
+            except Exception:
+                pass
+            log.warning(
+                "Position sync: %s resolved_%s → pnl=%+d¢  (logged to CSV/audit)",
+                ticker, _res_result, _res_pnl,
+            )
+
         await positions.close(ticker)
         if executor is not None:
             executor._positions.pop(ticker, None)
@@ -1266,7 +1347,8 @@ async def _sync_positions_with_kalshi(
         # Without this cooldown the bot re-enters on the very next scan cycle.
         _entry_failed_cooldown[ticker] = time.time()
         removed += 1
-        log.info("Position sync: removed stale %s (not in Kalshi portfolio)", ticker)
+        if _res_result is None:
+            log.info("Position sync: removed stale %s (not in Kalshi portfolio)", ticker)
 
     if added or updated or removed:
         log.warning("Position sync: +%d added, ~%d updated, -%d removed",
@@ -1393,6 +1475,10 @@ async def _exit_checker(
             stale_cutoff = int(time.time() * 1_000_000) - 300 * 1_000_000   # 5 min
 
             for ticker, pos in current_positions.items():
+                # ── Skip personal/manual bets — bot does not manage exits ─────
+                if pos.get("user_bet"):
+                    continue
+
                 # ── Skip positions already queued for exit ────────────────────
                 # exit_order_id is being polled in _fill_poll_loop.
                 # Do not trigger a second exit attempt while one is resting.
@@ -1485,11 +1571,19 @@ async def _exit_checker(
                                 or (price_data or {}).get("yes_price")
                             )
                             if not last_cents:
-                                log.warning(
-                                    "Post-resolution cleanup: %s closed %.1fh ago but no price available — skipping",
-                                    ticker, hours_past,
-                                )
-                                continue
+                                # No live price — fall back to ResolutionDB binary outcome
+                                _db_result = db.get_outcome(ticker) if db else None
+                                if _db_result == "yes":
+                                    last_cents = 100
+                                elif _db_result == "no":
+                                    last_cents = 0
+                                else:
+                                    log.warning(
+                                        "Post-resolution cleanup: %s closed %.1fh ago "
+                                        "— no price or resolution record, skipping",
+                                        ticker, hours_past,
+                                    )
+                                    continue
                             log.info(
                                 "Post-resolution cleanup: %s closed %.1fh ago — removing",
                                 ticker, hours_past,
@@ -2228,19 +2322,60 @@ async def _fill_poll_loop(
                                       ticker, _lf_tg_exc)
 
                     elif _e_status == "canceled":
-                        # Externally canceled — accept whatever filled, or just close
-                        executor._positions.pop(ticker, None)
-                        await positions.close(ticker)
-                        log.warning(
-                            "Exit order canceled externally: %s order_id=%.8s "
-                            "fill=%d/%d — closing position",
-                            ticker, exit_oid, int(_e_fill_count), int(_e_total),
-                        )
+                        if _e_fill_count > 0:
+                            # Partially filled then canceled — accept partial fill and close
+                            executor._positions.pop(ticker, None)
+                            await positions.close(ticker)
+                            log.warning(
+                                "Exit order partially filled + canceled: %s order_id=%.8s "
+                                "fill=%d/%d — closing position",
+                                ticker, exit_oid, int(_e_fill_count), int(_e_total),
+                            )
+                        else:
+                            # Canceled with 0 fills — Kalshi rejected the limit price
+                            # (likely stale price too far from market). Keep the position
+                            # and retry next exit_checker cycle with fresh price data.
+                            _cancel_count = int(pos.get("exit_cancel_count", 0)) + 1
+                            await positions.update_fields(ticker, {
+                                "pending_exit":       False,
+                                "exit_order_id":      "",
+                                "exit_cancel_count":  _cancel_count,
+                            })
+                            if executor is not None and ticker in executor._positions:
+                                executor._positions[ticker].pop("pending_exit", None)
+                            log.warning(
+                                "Exit order canceled (0 fills): %s order_id=%.8s "
+                                "— clearing pending_exit for retry #%d",
+                                ticker, exit_oid, _cancel_count,
+                            )
 
                     elif _e_status == "resting":
                         widen_count = int(pos.get("exit_widen_count", 0))
                         placed_at_s = pos.get("exit_order_placed_at", "")
-                        if not placed_at_s or widen_count >= _EXIT_TIF_MAX_STEPS:
+                        if not placed_at_s:
+                            continue
+                        if widen_count >= _EXIT_TIF_MAX_STEPS:
+                            # TIF exhausted — cancel the stale order and let exit_checker
+                            # re-evaluate with fresh price data next cycle.
+                            try:
+                                await asyncio.to_thread(
+                                    client._request, "DELETE",
+                                    f"/portfolio/orders/{exit_oid}",
+                                )
+                            except Exception:
+                                pass
+                            await positions.update_fields(ticker, {
+                                "pending_exit":      False,
+                                "exit_order_id":     "",
+                                "exit_widen_count":  0,
+                            })
+                            if executor is not None and ticker in executor._positions:
+                                executor._positions[ticker].pop("pending_exit", None)
+                            log.warning(
+                                "TIF exhausted: %s  max_steps=%d — "
+                                "resetting for fresh-price retry",
+                                ticker, _EXIT_TIF_MAX_STEPS,
+                            )
                             continue
                         try:
                             _placed_dt = datetime.fromisoformat(
@@ -2960,6 +3095,12 @@ async def _wait_for_dependencies() -> None:
 
 
 async def exec_main() -> None:
+    """Main entry point for the Exec node.
+
+    Initializes Kalshi auth, Redis bus, position store, and executor, then runs the
+    order execution loop: consumes signals from Intel, places orders, polls fills, and
+    manages exits (stop-loss, take-profit, pre-expiry). Does not return (runs until SIGTERM).
+    """
     setup_logging(cfg.OUTPUT_DIR / "logs")
     cfg.validate()
     await _wait_for_dependencies()

@@ -5,8 +5,8 @@ Each fetcher is fully self-contained: one network call, one Redis write, gracefu
 failure (logs WARNING, skips write, keeps stale cache until TTL expires naturally).
 
 Redis keys and TTLs:
-  ep:sofr:sr1             5 min    1-month SOFR futures implied rate (Yahoo Finance)
-  ep:sofr:sr3             5 min    3-month SOFR futures implied rate (Yahoo Finance)
+  ep:sofr:sr1             5 min    1-month SOFR futures implied rate (Yahoo Finance SR1=F — verify still listed)
+  ep:sofr:sr3             5 min    3-month SOFR futures implied rate (Yahoo Finance SR3=F — DELISTED ~2024; returns None)
   ep:treasury_auctions    24 h     Upcoming 10Y/30Y auction within 24 h
   ep:econ_consensus       1 h      CPI/NFP/PCE/GDP consensus forecasts (TradingEconomics)
   ep:deribit:skew         10 min   DVOL + 25d put-call skew (Deribit public API)
@@ -129,7 +129,7 @@ class DataSourceManager:
     # ── Fetchers ──────────────────────────────────────────────────────────────
 
     async def _fetch_sofr_sr1(self) -> Optional[dict]:
-        """1-month SOFR futures (SR1=F via Yahoo Finance).  Implied rate = 100 − price."""
+        """1-month SOFR futures (SR1=F via Yahoo Finance). Implied rate = 100 - price. Returns None on fetch failure."""
         try:
             async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": _UA}) as c:
                 r = await c.get(
@@ -155,7 +155,8 @@ class DataSourceManager:
             return None
 
     async def _fetch_sofr_sr3(self) -> Optional[dict]:
-        """3-month SOFR futures (SR3=F via Yahoo Finance)."""
+        """3-month SOFR futures (SR3=F via Yahoo Finance). NOTE: SR3=F was delisted from Yahoo Finance ~2024;
+        this fetcher always returns None. The slot is kept for forward compatibility if the symbol is relisted."""
         try:
             async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": _UA}) as c:
                 r = await c.get(

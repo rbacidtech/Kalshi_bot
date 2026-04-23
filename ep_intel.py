@@ -1260,6 +1260,12 @@ async def _wait_for_dependencies() -> None:
 
 
 async def intel_main() -> None:
+    """Main entry point for the Intel node.
+
+    Initializes Kalshi auth, Redis bus, and strategy scanner, then runs the
+    signal-generation loop: fetches market data, scores all enabled strategies, and
+    publishes signals to Exec via Redis. Does not return (runs until SIGTERM).
+    """
     setup_logging(cfg.OUTPUT_DIR / "logs")
     cfg.validate()
     await _wait_for_dependencies()

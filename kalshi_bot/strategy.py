@@ -85,6 +85,7 @@ _PRICE_GATE_EXEMPT_SOURCES: frozenset = frozenset({
 # ── Signal dataclass ──────────────────────────────────────────────────────────
 @dataclass
 class Signal:
+    """Standardised trading signal produced by a strategy scanner, ready for execution sizing."""
     ticker:            str
     title:             str
     category:          str          # "fomc", "weather", "economic", "sports", "arb"
@@ -544,18 +545,25 @@ async def scan_fomc_directional(
     min_yes_entry_price:  Optional[float] = None,
 ) -> list[Signal]:
     """
-    Directional FOMC signals using CME FedWatch + ZQ futures + WSJ consensus.
+    Scan KXFED markets for directional edges using the FOMC probability model.
 
-    Primary model: fair_value_with_confidence() from kalshi_bot.models.fomc
-      - FedWatch (60% weight) + ZQ futures (30%) + WSJ (10%)
-      - Confidence reflects source agreement and data freshness
-      - Divergence between sources → automatic confidence reduction
+    Fair value is derived from CME FedWatch + ZQ futures + WSJ consensus (via
+    kalshi_bot.models.fomc); confidence is adjusted by meeting proximity and the
+    2Y Treasury spread.  Falls back to a FRED rate-anchor linear decay when the
+    primary model returns None.
 
-    Fallback (when fomc model returns None): FRED rate-anchor linear decay.
+    Args:
+        markets: Open KXFED market dicts from the Kalshi API.
+        current_rate: Current effective federal-funds rate (decimal, e.g. 3.75).
+        max_contracts: Per-signal contract cap passed through to sizing.
+        treasury_2y: Optional 2Y Treasury yield; used to apply a regime confidence delta.
+        macro_regime: Optional dict from the ep:macro Redis hash for regime context.
+        release_data: Optional dict from the ep:releases Redis hash for scheduled events.
+        min_yes_entry_price: Minimum Kalshi mid price required to enter a YES side;
+            overrides the config default when supplied (e.g. calibrated by ep_advisor).
 
-    Confidence is further adjusted by:
-      - FOMC meeting proximity  (_fomc_proximity_confidence)
-      - 2Y Treasury spread      (bond market's rate path consensus)
+    Returns:
+        List of Signal objects with category="fomc" that clear the minimum edge threshold.
     """
     signals = []
     groups  = _group_fomc_by_meeting(markets)
@@ -2870,7 +2878,31 @@ async def fetch_signals_async(
     min_yes_entry_price: Optional[float] = None,  # calibrated override from ep_advisor
 ) -> list[Signal]:
     """
-    Scan all enabled market categories and return fee-adjusted signals.
+    Main signal-generation entry point — runs all enabled strategy scanners and
+    returns consolidated, fee-adjusted signals ready for execution.
+
+    Scanners run in sequence (FOMC arb, FOMC directional, weather, economic, sports,
+    crypto price, GDP, coherence checks).  Each scanner is gated by its feature flag
+    and any exception is caught individually so a single failure does not abort the run.
+
+    Args:
+        client: Authenticated KalshiClient used to fetch live market data.
+        edge_threshold: Minimum fee-adjusted edge (decimal) required to keep a signal.
+        max_contracts: Per-signal contract cap forwarded to every scanner.
+        min_confidence: Signals below this confidence score are dropped before return.
+        fred_api_key: FRED API key; economic scanner is skipped when empty.
+        current_rate: Current effective federal-funds rate (decimal) for FOMC pricing.
+        treasury_2y: Optional 2Y Treasury yield forwarded to the FOMC directional scanner.
+        enable_fomc / enable_weather / enable_economic / enable_sports /
+        enable_crypto_price / enable_gdp: Feature flags that gate each scanner.
+        markets_cache: Pre-fetched market list; re-fetched from Kalshi when None.
+        btc_spot / eth_spot: Current BTC/ETH spot prices for the crypto scanner.
+        macro_regime: Dict from the ep:macro Redis hash passed to regime-aware scanners.
+        release_data: Dict from the ep:releases Redis hash for scheduled data releases.
+        min_yes_entry_price: Minimum Kalshi mid required for YES-side FOMC entries.
+
+    Returns:
+        List of Signal objects filtered by edge_threshold and min_confidence.
     """
     all_markets = markets_cache if markets_cache else scan_all_markets(client)
     # Targeted KXFED fetch

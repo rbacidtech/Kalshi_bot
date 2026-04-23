@@ -1,50 +1,41 @@
 """
 models/fomc.py — Fed Funds rate probability model.
 
-Primary signal: CME FedWatch (derived from 30-day Fed Funds futures).
-Backup signals: CME ZQ futures direct pricing, WSJ Fed tracker,
-                SOFR SR3 futures (Yahoo Finance, no auth required),
-                FRED 30-day Fed Funds Futures (FF1/FF2/FF3 series).
+Primary signal: CME FedWatch (authenticated OAuth2, derived from 30-day Fed Funds futures).
+Second source:  U.S. Treasury bill term structure (FRED DTB3/DTB6/DTB1YR) — permanently
+                replaced ZQ futures in the secondary slot after CME CDN-blocked ZQ in 2024.
+Supplementary:  WSJ Fed tracker (public page, next meeting only).
 
-Why multiple sources?
-  FedWatch is usually reliable but occasionally lags futures moves by
-  minutes during fast markets. Reading ZQ futures directly lets us
-  catch those gaps. The WSJ tracker is a useful cross-check and provides
-  a human-readable consensus estimate to validate against.
+Active data sources and their status:
+  - CME FedWatch   authenticated OAuth2 API  ACTIVE — primary source, conf 0.90 solo
+  - T-bill term    FRED DTB3/DTB6/DTB1YR     ACTIVE — second source (replaced ZQ), conf 0.72
+  - CME SR1 SOFR   authenticated OAuth2 API  ACTIVE — fallback when FedWatch unavailable
+  - WSJ tracker    public page scrape         ACTIVE — next-meeting cross-check only
+  - FRED FF1/2/3   unauthenticated CSV        ACTIVE — fallback market-implied rates
+  - ZQ futures     CME direct quotes          DEAD  — CDN/WAF blocked since mid-2024
+  - SOFR SR3 (Yahoo) Yahoo Finance SR3=F      DEAD  — delisted from Yahoo Finance ~2024
+  - SOFR SR3 (CME) CME API quotes endpoint   DEAD  — 404 on our api_edgepulse subscription
 
-  When all sources agree → high confidence, full sizing.
-  When sources diverge by > DIVERGENCE_THRESHOLD → reduce position size,
-  log a warning, and wait for convergence before scaling up.
+Multi-source confidence model:
+  FedWatch alone (solo):               conf = 0.82
+  FedWatch + T-bill term structure:    conf = 0.90  <- normal operating mode
+  Proximity boost (within 14 days):    conf up to 0.95 (capped)
+  When sources diverge > DIVERGENCE_THRESHOLD: conf capped at 0.75 (ZQ/futures only;
+    suppressed for T-bill since T-bills measure average rates, not single-meeting probs)
 
 Meeting awareness:
   Kalshi lists separate contracts for each FOMC meeting date.
-  This module maps each meeting date to the correct futures contract
-  (ZQ month code) and fetches probabilities for each independently.
+  This module derives per-meeting probability distributions from each source
+  and fuses them into a single blended estimate with a confidence score.
 
 Staleness detection:
   If FedWatch data is more than 10 minutes old during market hours,
   the confidence score is reduced automatically until fresh data arrives.
 
-Data sources (all free, no API key required):
-  - CME FedWatch: https://www.cmegroup.com          (blocked by WAF since 2024)
-  - CME Futures:  https://www.cmegroup.com (ZQ)     (blocked by WAF since 2024)
-  - WSJ:          https://www.wsj.com/economy/central-banking (public page)
-  - SOFR SR3:     Yahoo Finance — 3-month SOFR futures, no auth required.
-                  Price = 100 − expected 3-month SOFR rate.
-                  Implied FF rate = (100 − price) − 0.05 (−5 bp SOFR/FFR basis).
-  - FRED FF1/FF2/FF3: https://fred.stlouisfed.org/graph/fredgraph.csv
-                      30-day Fed Funds Futures — unauthenticated CSV endpoint,
-                      market-implied rates, replaces hardcoded FRED fallback.
-
-Fallback chain (when CME is blocked):
-  1. CME SR1 SOFR futures    — 1-month SOFR, authenticated CME API
-  2. SOFR SR3 futures        — 3-month SOFR via Yahoo Finance, no auth required
-  3. FRED FF1/FF2/FF3        — market-implied rate expectations (genuine futures data)
-  4. FRED DFEDTARU + heuristic probs — last resort when futures data unavailable
-
-When Kalshi-implied prices are available (confidence 0.92), the external
-sources serve as a cross-check and path probability smoother. The CME block
-does NOT degrade trading confidence as long as Kalshi markets are liquid.
+Fallback chain (when FedWatch is unavailable):
+  1. CME SR1 SOFR futures    — 1-month SOFR, same OAuth2 as FedWatch
+  2. FRED FF1/FF2/FF3        — market-implied 30-day Fed Funds futures (CSV)
+  3. FRED DFEDTARU + heuristic probs — last resort; conf 0.65, no genuine futures data
 """
 
 import re
@@ -743,7 +734,7 @@ async def fetch_fedwatch_all_meetings() -> dict[str, MeetingProbs]:
                 len(sr1_meetings),
             )
             return sr1_meetings
-        log.info("SR1 SOFR unavailable — trying SOFR SR3 futures (Yahoo Finance).")
+        log.info("SR1 SOFR unavailable — trying SOFR SR3 futures (CME API).")
         sr3_meetings = await _fetch_sofr_sr3_meetings()
         if sr3_meetings:
             log.info(
@@ -1027,34 +1018,43 @@ def _fuse_sources(
     fedwatch_source: str = "fedwatch",
     kalshi_market_price: float | None = None,
     model_fair_value:    float | None = None,
+    suppress_divergence_check: bool = False,
 ) -> tuple[dict[str, float], float, list[str], str]:
     """
-    Combine probability estimates from multiple sources.
+    Combine probability estimates from multiple sources into a blended distribution.
 
-    Weighting when all sources present:
+    Weighting when Kalshi-implied prices are present:
       Kalshi-implied: 65% — live market prices on the exchange we trade; highest weight
-      FedWatch:       25% — CME 30-day futures (when available)
-      ZQ futures:     08% — direct settlement price cross-check
+      FedWatch:       25% — CME FedWatch authenticated API
+      second source:  08% — T-bill term structure (FRED DTB3/DTB6/DTB1YR) filling the
+                            slot previously occupied by ZQ futures (CDN-blocked since 2024)
       WSJ:            02% — sanity check only
 
-    When Kalshi-implied is absent (CME-only mode):
-      FedWatch:  60%, ZQ futures: 30%, WSJ: 10%  (legacy weights)
+    Weighting when Kalshi-implied is absent (CME-only mode, normal FOMC operation):
+      FedWatch:       60%
+      second source:  30%  (T-bill term structure, or ZQ if somehow available)
+      WSJ:            10%
+
+    Note on the second-source slot: ZQ 30-day Fed Funds futures were permanently
+    CDN-blocked by CME WAF in mid-2024. The slot is now filled by T-bill term structure
+    data from FRED (DTB3/DTB6/DTB1YR). When T-bill data is in the ZQ slot, the
+    HOLD-probability divergence check is suppressed (suppress_divergence_check=True)
+    because T-bills measure average rates over their life, not single-meeting probabilities.
 
     Args:
-      fedwatch_source:      label for the primary external source slot.  One of:
-        "fedwatch"     — real CME FedWatch JSON (conf 0.90 solo)
-        "fred_futures" — FRED FF1/FF2/FF3 market-implied rates (conf 0.80 solo)
-        "fred_model"   — FRED DFEDTARU + heuristic probs (conf 0.70 solo)
-      kalshi_market_price:  current Kalshi YES mid-price for this contract (0-1),
-                            used for sanity-checking model fair value divergence.
-      model_fair_value:     blended model fair-value for this contract (0-1),
-                            compared against kalshi_market_price to detect large
-                            model vs market divergence when in fallback mode.
+      fedwatch_source:           label for the primary external source slot. One of:
+        "fedwatch"               — real CME FedWatch JSON (conf 0.90 multi-source)
+        "fred_futures"           — FRED FF1/FF2/FF3 market-implied rates (conf 0.80 solo)
+        "fred_model"             — FRED DFEDTARU + heuristic probs (conf 0.65 solo)
+      suppress_divergence_check: skip the HOLD-probability divergence cap when the ZQ
+                                 slot carries T-bill data (set True by the FOMC main loop).
+      kalshi_market_price:       current Kalshi YES mid-price for this contract (0-1).
+      model_fair_value:          blended model fair-value for this contract (0-1).
 
     Returns:
       (blended_probs, confidence_score, source_list, data_quality)
-      data_quality is "fallback_only" when running on FRED static anchor with no
-      genuine forward-looking futures data; "ok" otherwise.
+      data_quality is "fallback_only" when running on FRED static anchor only;
+      "ok" otherwise.
     """
     available = {}
     sources   = []
@@ -1116,9 +1116,9 @@ def _fuse_sources(
     elif len(available) == 1:
         # Solo source confidence by quality tier
         _solo_conf = {
-            "fedwatch":     0.70,  # real CME FedWatch alone (unlikely in practice)
+            "fedwatch":     0.82,  # CME FedWatch alone — permanent state (ZQ CDN-blocked since 2024)
             "sr1_sofr":     0.85,  # CME SR1 SOFR futures — professional FF replacement
-            "sofr_sr3":     0.78,  # SOFR SR3 via Yahoo Finance — no auth, 3-month granularity
+            "sofr_sr3":     0.78,  # SOFR SR3 via CME API — 3-month granularity
             "fred_futures": 0.80,  # FRED FF1/2/3 — genuine market-implied data
             "fred_model":   0.65,  # FRED DFEDTARU + heuristic probs — weakest
         }
@@ -1132,24 +1132,28 @@ def _fuse_sources(
         _base_conf = {
             "fedwatch":     0.90,
             "sr1_sofr":     0.85,  # CME SR1 SOFR futures — professional FF replacement
-            "sofr_sr3":     0.80,  # SOFR SR3 via Yahoo Finance — 3-month granularity
+            "sofr_sr3":     0.80,  # SOFR SR3 via CME API — 3-month granularity
             "fred_futures": 0.82,  # better than solo but below real FedWatch
             "fred_model":   0.72,
         }
         confidence = _base_conf.get(fedwatch_source, 0.90)
-        # Check divergence between FedWatch and ZQ on HOLD probability
-        fw_hold = (fedwatch or {}).get("HOLD", 0)
-        zq_hold = (zq_probs or {}).get("HOLD", 0)
-        if fw_hold and zq_hold:
-            divergence = abs(fw_hold - zq_hold)
-            if divergence > DIVERGENCE_THRESHOLD:
-                confidence = min(confidence, 0.75)
-                log.warning(
-                    "Source divergence: %s HOLD=%.3f vs ZQ HOLD=%.3f "
-                    "(diff=%.3f > threshold=%.3f). Confidence reduced to %.2f.",
-                    fedwatch_source, fw_hold, zq_hold,
-                    divergence, DIVERGENCE_THRESHOLD, confidence,
-                )
+        # Check divergence between FedWatch and ZQ on HOLD probability.
+        # Suppressed when zq_probs slot carries T-bill term structure data —
+        # T-bills measure average rates over their life, not a single-meeting
+        # probability, so their HOLD numbers naturally differ from FedWatch.
+        if not suppress_divergence_check:
+            fw_hold = (fedwatch or {}).get("HOLD", 0)
+            zq_hold = (zq_probs or {}).get("HOLD", 0)
+            if fw_hold and zq_hold:
+                divergence = abs(fw_hold - zq_hold)
+                if divergence > DIVERGENCE_THRESHOLD:
+                    confidence = min(confidence, 0.75)
+                    log.warning(
+                        "Source divergence: %s HOLD=%.3f vs ZQ HOLD=%.3f "
+                        "(diff=%.3f > threshold=%.3f). Confidence reduced to %.2f.",
+                        fedwatch_source, fw_hold, zq_hold,
+                        divergence, DIVERGENCE_THRESHOLD, confidence,
+                    )
 
     return blended, confidence, sources, data_quality
 
@@ -1535,200 +1539,422 @@ async def _fetch_sofr_sr1_meetings() -> "dict[str, MeetingProbs] | None":
         return None
 
 
-# ── Source 3c: SOFR SR3 Futures (Yahoo Finance, no auth required) ────────────
+# ── Source 3c: SOFR SR3 Futures (CME API, same OAuth as FedWatch / SR1) ──────
 
-def _fetch_sofr_implied_rates() -> "dict[str, float] | None":
+async def _fetch_sofr_sr3_meetings() -> "dict[str, MeetingProbs] | None":
     """
-    Fetch SOFR SR3 futures prices from Yahoo Finance (free, no auth required).
+    Derive per-meeting FOMC probability distributions from CME SR3 (3-month SOFR)
+    futures via the CME API (same OAuth2 credentials as FedWatch and SR1).
 
-    SR3 futures (3-month SOFR) trade at 100 minus the expected 3-month SOFR
-    rate.  Implied rate = 100 − price.  We convert to a Fed Funds equivalent
-    by subtracting ~5 bp (SOFR typically runs slightly below FFR).
+    SR3 quarterly contracts (H=Mar, M=Jun, U=Sep, Z=Dec) each capture the
+    expected 3-month SOFR average for that quarter.  Implied FF rate =
+    (100 - price) - 0.05  (SOFR/FFR basis adjustment).
 
-    Contract codes and the FOMC meeting that falls in each quarter:
-      SR3M6  → Jun 2026 meeting (2026-06-17)
-      SR3U6  → Sep 2026 meeting (2026-09-16)
-      SR3Z6  → Dec 2026 meeting (2026-12-16)
-      SR3H7  → Mar 2027 meeting (2027-03-17)
-
-    Returns:
-        dict mapping meeting date string → implied FF rate in percent,
-        e.g. {"2026-06-17": 3.25}.  Returns None on complete failure.
+    Confidence: 0.78  (below SR1 due to 3-month granularity; above FRED EFFR synth)
+    Cache TTL:  300 s
     """
-    # Map SR3 contract code → FOMC meeting date for the same quarter.
-    # Update annually: H=Mar, M=Jun, U=Sep, Z=Dec; trailing digit = year (mod 10).
-    CONTRACT_TO_MEETING: dict[str, str] = {
-        "SR3M6": "2026-06-17",
-        "SR3U6": "2026-09-16",
-        "SR3Z6": "2026-12-16",
-        "SR3H7": "2027-03-17",
+    _TTL_SR3 = 300
+
+    cache_key = "cme:sr3:meetings"
+    cached    = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    _cme_auth_url = os.getenv(
+        "CME_FEDWATCH_AUTH_URL",
+        "https://auth.cmegroup.com/as/token.oauth2",
+    ).strip()
+    _cme_key_name = os.getenv("CME_FEDWATCH_API_KEY_NAME", "").strip()
+    _cme_password = os.getenv("CME_FEDWATCH_API_PASSWORD", "").strip()
+
+    if not (_cme_key_name and _cme_password):
+        log.debug("SR3 unavailable -- CME credentials not configured, skipping")
+        return None
+
+    # SR3 quarterly contract month -> FOMC meeting date for the same quarter.
+    # H=Mar, M=Jun, U=Sep, Z=Dec; update each January for the new year.
+    _SR3_QUARTER_TO_MEETING: dict[tuple[int, int], str] = {
+        (2026, 6):  "2026-06-17",
+        (2026, 9):  "2026-09-16",
+        (2026, 12): "2026-12-16",
+        (2027, 3):  "2027-03-17",
+        (2027, 6):  "2027-06-15",
+        (2027, 9):  "2027-09-21",
+        (2027, 12): "2027-12-14",
     }
 
     try:
-        import requests as _requests
-        results: dict[str, float] = {}
-        for contract, meeting_date in CONTRACT_TO_MEETING.items():
-            ticker = f"{contract}=F"
-            url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-            try:
-                r = _requests.get(
-                    url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=8,
-                )
-            except Exception as req_exc:
-                log.debug("SOFR SR3 %s: request failed: %s", contract, req_exc)
-                continue
-            if r.status_code != 200:
-                log.debug(
-                    "SOFR SR3 %s: Yahoo Finance returned HTTP %d",
-                    contract, r.status_code,
-                )
-                continue
-            try:
-                data  = r.json()
-                price = (
-                    data.get("chart", {})
-                        .get("result", [{}])[0]
-                        .get("meta", {})
-                        .get("regularMarketPrice")
-                )
-            except Exception as parse_exc:
-                log.debug("SOFR SR3 %s: JSON parse error: %s", contract, parse_exc)
-                continue
-
-            if price is None:
-                log.debug("SOFR SR3 %s: regularMarketPrice missing from response", contract)
-                continue
-            if not (90.0 < price < 100.0):
-                log.debug(
-                    "SOFR SR3 %s: price=%.4f outside expected range (90, 100) — skipping",
-                    contract, price,
-                )
-                continue
-
-            # Convert: implied SOFR rate = 100 − price; adjust for SOFR/FFR basis
-            implied_rate = round((100.0 - price) - 0.05, 4)   # −5 bp basis
-            results[meeting_date] = implied_rate
-            log.debug(
-                "SOFR SR3 %s: price=%.4f → implied_ff_rate=%.4f%% (meeting %s)",
-                contract, price, implied_rate, meeting_date,
+        async with httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+        ) as http:
+            # Step 1: OAuth2 client credentials -> CME JWT
+            tok_resp = await http.post(
+                _cme_auth_url,
+                data={
+                    "grant_type":    "client_credentials",
+                    "client_id":     _cme_key_name,
+                    "client_secret": _cme_password,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
+            cme_jwt = tok_resp.json().get("access_token", "")
+            if not cme_jwt:
+                log.debug(
+                    "SR3: CME token step returned %d -- skipping",
+                    tok_resp.status_code,
+                )
+                return None
 
-        return results if results else None
+            # Step 2: Fetch SR3 quotes from CME API
+            sr3_headers = {
+                "Authorization":           f"Bearer {cme_jwt}",
+                "Accept":                  "application/json",
+                "CME-Application-Name":    "EdgePulse",
+                "CME-Application-Version": "1.0",
+                "CME-Request-ID":          f"ep-sr3-{int(time.time())}",
+                "User-Agent":              "EdgePulse/1.0",
+            }
+            sr3_data: dict | None = None
+            for url in [
+                "https://markets.api.cmegroup.com/quotes/futures/SR3",
+                "https://markets.api.cmegroup.com/v1/futures/products/SR3/quotes",
+            ]:
+                try:
+                    r = await http.get(url, headers=sr3_headers)
+                    if r.status_code in (403, 404):
+                        log.debug(
+                            "SR3: %s returned %d -- trying next URL",
+                            url, r.status_code,
+                        )
+                        continue
+                    if r.status_code != 200:
+                        log.debug(
+                            "SR3: %s returned unexpected status %d",
+                            url, r.status_code,
+                        )
+                        continue
+                    raw_json = r.json()
+                    log.debug(
+                        "SR3 response from %s: top-level keys=%s",
+                        url, list(raw_json.keys()) if isinstance(raw_json, dict) else type(raw_json).__name__,
+                    )
+                    sr3_data = raw_json
+                    break
+                except Exception as url_exc:
+                    log.debug("SR3: request to %s failed: %s", url, url_exc)
+
+        if sr3_data is None:
+            log.debug("SR3 unavailable -- skipping")
+            return None
+
+        # Step 3: Parse SR3 quotes -> (contract_month_dt, implied_rate) pairs
+        quotes_list: list = []
+        if isinstance(sr3_data, list):
+            quotes_list = sr3_data
+        elif isinstance(sr3_data, dict):
+            for key in ("quotes", "data", "items", "results"):
+                if isinstance(sr3_data.get(key), list):
+                    quotes_list = sr3_data[key]
+                    break
+
+        if not quotes_list:
+            log.debug("SR3: could not locate quotes list in response -- skipping")
+            return None
+
+        now          = datetime.now(timezone.utc)
+        current_rate = _current_fed_rate
+        result: dict[str, MeetingProbs] = {}
+
+        for q in quotes_list:
+            if not isinstance(q, dict):
+                continue
+
+            # Price field -- try common CME field names
+            price_raw = None
+            for field in ("last", "settle", "close", "lastPrice", "settlementPrice", "price"):
+                val = q.get(field)
+                if val is not None:
+                    try:
+                        price_raw = float(val)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            if price_raw is None or not (80.0 <= price_raw <= 100.0):
+                continue
+
+            # SR3: implied 3-month SOFR average; subtract 5 bp SOFR/FFR basis
+            implied_rate = round((100.0 - price_raw) - 0.05, 4)
+
+            # Contract month -- try common field names
+            expiry_raw = None
+            for field in ("expirationDate", "expiry", "maturityDate",
+                          "contractMonth", "month", "tradeDate", "code"):
+                val = q.get(field)
+                if val is not None:
+                    expiry_raw = str(val)
+                    break
+            if not expiry_raw:
+                continue
+
+            # Parse expiry into a datetime
+            contract_dt: datetime | None = None
+            _date_m = re.match(r"(\d{4})-(\d{2})", expiry_raw)
+            if _date_m:
+                try:
+                    contract_dt = datetime(int(_date_m.group(1)), int(_date_m.group(2)), 1,
+                                           tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            if contract_dt is None:
+                _mc_m = re.search(r"([FGHJKMNQUVXZ])(\d{1,2})$", expiry_raw.upper())
+                if _mc_m:
+                    code_char = _mc_m.group(1)
+                    yr_suffix = int(_mc_m.group(2))
+                    year_full = 2020 + yr_suffix if yr_suffix < 80 else 1900 + yr_suffix
+                    _inv_cme  = {v: k for k, v in _CME_MONTH.items()}
+                    mo_num    = _inv_cme.get(code_char)
+                    if mo_num:
+                        try:
+                            contract_dt = datetime(year_full, mo_num, 1, tzinfo=timezone.utc)
+                        except ValueError:
+                            pass
+            if contract_dt is None:
+                for fmt in ("%b %Y", "%B %Y", "%b%Y", "%B%Y"):
+                    try:
+                        contract_dt = datetime.strptime(expiry_raw[:8], fmt).replace(
+                            tzinfo=timezone.utc
+                        )
+                        break
+                    except ValueError:
+                        continue
+
+            if contract_dt is None:
+                log.debug("SR3: could not parse expiry '%s' -- skipping contract", expiry_raw)
+                continue
+            if contract_dt < now - timedelta(days=32):
+                continue   # skip expired contracts
+
+            # Map contract quarter to FOMC meeting date
+            meeting_date_str = _SR3_QUARTER_TO_MEETING.get(
+                (contract_dt.year, contract_dt.month)
+            )
+            if not meeting_date_str:
+                log.debug(
+                    "SR3: no FOMC meeting mapped for %d-%02d -- skipping",
+                    contract_dt.year, contract_dt.month,
+                )
+                continue
+
+            # Inline: rate change -> probability distribution (like _zq_to_probs)
+            _change_bps = round((implied_rate - current_rate) * 100)
+            _possible   = list(OUTCOME_BPS.keys())
+            _distances  = {k: abs(OUTCOME_BPS[k] - _change_bps) for k in _possible}
+            _min_d      = min(_distances.values())
+            if _min_d == 0:
+                _winner = min(_distances, key=_distances.get)
+                probs = {_winner: 1.0}
+            else:
+                _wts   = {k: 1.0 / max(d, 1) for k, d in _distances.items()}
+                _tot   = sum(_wts.values())
+                probs  = {k: v / _tot for k, v in _wts.items() if v / _tot >= 0.02}
+                _tot2  = sum(probs.values())
+                probs  = {k: v / _tot2 for k, v in probs.items()}
+            if not _validate_probs(probs, "sofr_sr3", f"meeting={meeting_date_str[:7]}"):
+                log.debug("SR3: invalid probs for %s -- skipping", meeting_date_str)
+                continue
+
+            meeting_key = meeting_date_str[:7]  # "YYYY-MM"
+            if meeting_key not in result:
+                result[meeting_key] = MeetingProbs(
+                    probs      = probs,
+                    fetched_at = now,
+                    sources    = ["sofr_sr3"],
+                    confidence = 0.78,
+                )
+                log.debug(
+                    "SR3: meeting %s price=%.4f implied_ff=%.4f%% probs=%s",
+                    meeting_key, price_raw, implied_rate,
+                    {k: f"{v:.2f}" for k, v in sorted(probs.items(), key=lambda x: -x[1])},
+                )
+
+        if not result:
+            log.debug("SR3: no future meeting probs derived -- skipping")
+            return None
+
+        log.info(
+            "SOFR SR3 futures: derived meeting probs for %d months (%s)",
+            len(result), ", ".join(sorted(result)),
+        )
+        _cache.set(cache_key, result, ttl=_TTL_SR3)
+        return result
 
     except Exception as exc:
         log.debug("SOFR SR3 fetch failed: %s", exc)
         return None
 
 
-def _sofr_rate_to_probs(implied_rate: float, current_rate: float) -> dict[str, float]:
+# ── Source 3d: Treasury Bill Term Structure (FRED DTB3/DTB6/DTB1YR) ──────────
+
+async def _fetch_tbill_term_structure_meetings() -> "dict[str, MeetingProbs] | None":
     """
-    Convert a SOFR-implied Fed Funds rate to a probability distribution over
-    OUTCOME_BPS outcomes using the same inverse-distance weighting as _zq_to_probs.
+    Derive per-meeting FOMC probability distributions from the U.S. Treasury
+    bill yield curve (3-month, 6-month, 1-year secondary market rates).
 
-    Args:
-        implied_rate:  SR3-derived expected FF rate in percent (post-basis adjustment)
-        current_rate:  Current effective Fed Funds rate in percent
+    T-bill yields are independently forward-looking: the market prices each
+    bill to reflect the expected average Fed Funds rate over the bill's life.
+    They are sourced from FRED (DTB3, DTB6, DTB1YR) — free, no auth beyond our
+    existing FRED_API_KEY.
 
-    Returns:
-        Normalised probability dict, e.g. {"HOLD": 0.70, "CUT_25": 0.25, "CUT_50": 0.05}
+    Method:
+      1. Fetch the three T-bill yields.
+      2. Adjust for the typical T-bill / EFFR basis spread (~4 bp bill discount).
+      3. Linearly interpolate the implied FF rate at each FOMC meeting horizon.
+      4. Convert to per-meeting probability distributions.
+
+    Confidence: 0.72  (independent instrument, coarser than per-meeting futures;
+                        combined with FedWatch lifts fuse confidence to 0.90)
+    Cache TTL: 900 s  (T-bills update daily; 15-min cache is sufficient)
     """
-    change_bps = round((implied_rate - current_rate) * 100)
-
-    # Identical weighting logic to _zq_to_probs for consistency
-    distances = {k: abs(OUTCOME_BPS[k] - change_bps) for k in OUTCOME_BPS}
-    min_dist  = min(distances.values())
-
-    if min_dist == 0:
-        winner = min(distances, key=distances.get)
-        return {winner: 1.0}
-
-    weights = {k: 1.0 / max(d, 1) for k, d in distances.items()}
-    total   = sum(weights.values())
-    probs   = {k: w / total for k, w in weights.items()}
-
-    # Filter outcomes with < 2% probability
-    probs = {k: v for k, v in probs.items() if v >= 0.02}
-    total = sum(probs.values())
-    if total <= 0:
-        return {"HOLD": 1.0}
-    return {k: v / total for k, v in probs.items()}
-
-
-async def _fetch_sofr_sr3_meetings() -> "dict[str, MeetingProbs] | None":
-    """
-    Derive per-meeting FOMC probability distributions from SOFR SR3 (3-month SOFR)
-    futures fetched from Yahoo Finance (no authentication required).
-
-    This is additive fallback between SR1 SOFR (auth required) and FRED FF futures.
-
-    Confidence: 0.78  (below SR1 due to 3-month granularity; above FRED EFFR synth)
-    Cache TTL:  300 s (same as FedWatch / SR1)
-    """
-    _TTL_SR3 = 300
-
-    cache_key = "sofr:sr3:meetings"
-    cached    = _cache.get(cache_key)
+    _TTL_TBILL   = 900
+    cache_key    = "fred:tbill:meetings"
+    cached       = _cache.get(cache_key)
     if cached is not None:
         return cached
 
-    # Synchronous network call — run in executor so we don't block the event loop
-    loop         = asyncio.get_event_loop()
-    sofr_rates   = await loop.run_in_executor(None, _fetch_sofr_implied_rates)
-
-    if not sofr_rates:
-        log.debug("SOFR SR3: no rates fetched — skipping")
+    fred_key = os.getenv("FRED_API_KEY", "").strip()
+    if not fred_key:
+        log.debug("T-bill source unavailable -- FRED_API_KEY not configured")
         return None
 
-    now          = datetime.now(timezone.utc)
-    today_str    = now.strftime("%Y-%m-%d")
-    current_rate = _current_fed_rate
-    result: dict[str, MeetingProbs] = {}
+    try:
+        loop = asyncio.get_event_loop()
 
-    for meeting_date_str, implied_rate in sofr_rates.items():
-        # Skip meetings that are already past
-        if meeting_date_str < today_str:
-            continue
+        def _fetch_yields() -> "dict[str, float] | None":
+            import requests as _req
+            yields = {}
+            for sid, horizon_months in [("DTB3", 3), ("DTB6", 6), ("DTB1YR", 12)]:
+                url = (
+                    f"https://api.stlouisfed.org/fred/series/observations"
+                    f"?series_id={sid}&api_key={fred_key}&file_type=json"
+                    f"&sort_order=desc&limit=5"
+                )
+                try:
+                    r = _req.get(url, headers={"User-Agent": "EdgePulse/1.0"}, timeout=8)
+                    if r.status_code != 200:
+                        log.debug("T-bill %s: FRED returned %d", sid, r.status_code)
+                        continue
+                    obs = r.json().get("observations", [])
+                    for o in obs:
+                        if o.get("value") not in (".", None, ""):
+                            yields[horizon_months] = float(o["value"])
+                            break
+                except Exception as exc:
+                    log.debug("T-bill %s fetch failed: %s", sid, exc)
+            return yields if len(yields) >= 2 else None
 
-        try:
-            meeting_dt  = datetime.strptime(meeting_date_str, "%Y-%m-%d").replace(
-                tzinfo=timezone.utc
+        raw_yields = await loop.run_in_executor(None, _fetch_yields)
+        if not raw_yields:
+            log.debug("T-bill term structure: fewer than 2 yields fetched -- skipping")
+            return None
+
+        log.debug("T-bill yields fetched: %s", raw_yields)
+
+        # Basis adjustment: T-bills typically trade ~4-5 bp below EFFR due to
+        # safety/liquidity premium. Add basis back to get implied FF rate.
+        _TBILL_BASIS_PCT = 0.04   # 4 bp
+        adj_yields = {m: y + _TBILL_BASIS_PCT for m, y in raw_yields.items()}
+
+        # Anchor at month 0 = current EFFR (from module-level _current_fed_rate)
+        current_rate = _current_fed_rate
+        anchor = {0: current_rate}
+        all_points = {**anchor, **adj_yields}
+        sorted_horizons = sorted(all_points.keys())
+
+        now      = datetime.now(timezone.utc)
+        result: dict[str, MeetingProbs] = {}
+        _cal_src = _FOMC_UPCOMING_LIVE if _FOMC_UPCOMING_LIVE else _FOMC_UPCOMING
+
+        for meeting_date_str in _cal_src:
+            try:
+                meeting_dt = datetime.strptime(meeting_date_str, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                continue
+            if meeting_dt < now:
+                continue
+
+            # Months from today to this meeting
+            months_ahead = (meeting_dt - now).days / 30.44
+
+            # Interpolate implied rate at this horizon using the yield curve points
+            if months_ahead <= sorted_horizons[0]:
+                implied_rate = all_points[sorted_horizons[0]]
+            elif months_ahead >= sorted_horizons[-1]:
+                implied_rate = all_points[sorted_horizons[-1]]
+            else:
+                # Linear interpolation between bracketing points
+                lo, hi = None, None
+                for h in sorted_horizons:
+                    if h <= months_ahead:
+                        lo = h
+                    if h >= months_ahead and hi is None:
+                        hi = h
+                if lo is None or hi is None or lo == hi:
+                    implied_rate = all_points.get(lo or hi, current_rate)
+                else:
+                    frac = (months_ahead - lo) / (hi - lo)
+                    implied_rate = all_points[lo] + frac * (all_points[hi] - all_points[lo])
+
+            # Convert to meeting probability distribution
+            # Inline: rate change -> probability distribution (like _zq_to_probs)
+            _change_bps = round((implied_rate - current_rate) * 100)
+            _possible   = list(OUTCOME_BPS.keys())
+            _distances  = {k: abs(OUTCOME_BPS[k] - _change_bps) for k in _possible}
+            _min_d      = min(_distances.values())
+            if _min_d == 0:
+                _winner = min(_distances, key=_distances.get)
+                probs = {_winner: 1.0}
+            else:
+                _wts   = {k: 1.0 / max(d, 1) for k, d in _distances.items()}
+                _tot   = sum(_wts.values())
+                probs  = {k: v / _tot for k, v in _wts.items() if v / _tot >= 0.02}
+                _tot2  = sum(probs.values())
+                probs  = {k: v / _tot2 for k, v in probs.items()}
+            meeting_key = meeting_dt.strftime("%Y-%m")
+
+            if not _validate_probs(probs, "tbill_term", f"meeting={meeting_key}"):
+                log.debug("T-bill term: invalid probs for %s -- skipping", meeting_key)
+                continue
+
+            result[meeting_key] = MeetingProbs(
+                probs      = probs,
+                fetched_at = now,
+                sources    = ["tbill_term_structure"],
+                confidence = 0.72,
             )
-        except ValueError:
-            log.debug("SOFR SR3: bad meeting date string '%s' — skipping", meeting_date_str)
-            continue
+            log.debug(
+                "T-bill term: meeting %s  months_ahead=%.1f  implied_ff=%.4f%%  probs=%s",
+                meeting_key, months_ahead, implied_rate,
+                {k: f"{v:.2f}" for k, v in sorted(probs.items(), key=lambda x: -x[1])},
+            )
 
-        meeting_key = meeting_dt.strftime("%Y-%m")
-        probs       = _sofr_rate_to_probs(implied_rate, current_rate)
+        if not result:
+            log.debug("T-bill term structure: no future meeting probs derived -- skipping")
+            return None
 
-        if not _validate_probs(probs, "sofr_sr3", f"meeting={meeting_key}"):
-            log.debug("SOFR SR3: invalid probs for %s — skipping", meeting_key)
-            continue
-
-        result[meeting_key] = MeetingProbs(
-            probs      = probs,
-            fetched_at = now,
-            sources    = ["sofr_sr3"],
-            confidence = 0.78,
+        log.info(
+            "T-bill term structure: derived meeting probs for %d months (%s)",
+            len(result), ", ".join(sorted(result)),
         )
-        log.debug(
-            "SOFR SR3: meeting %s implied_ff=%.4f%% probs=%s",
-            meeting_key,
-            implied_rate,
-            {k: f"{v:.2f}" for k, v in sorted(probs.items(), key=lambda x: -x[1])},
-        )
+        _cache.set(cache_key, result, ttl=_TTL_TBILL)
+        return result
 
-    if not result:
-        log.debug("SOFR SR3: no future meeting probs derived — skipping")
+    except Exception as exc:
+        log.debug("T-bill term structure fetch failed: %s", exc)
         return None
-
-    log.info(
-        "SOFR SR3 futures: derived meeting probs for %d months (%s)",
-        len(result), ", ".join(sorted(result)),
-    )
-    _cache.set(cache_key, result, ttl=_TTL_SR3)
-    return result
 
 
 async def _fetch_fred_futures_meetings() -> dict[str, MeetingProbs] | None:
@@ -2366,19 +2592,26 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
         ):
             return _meeting_probs.get(meeting_key)
 
-        # Fetch primary sources concurrently (FedWatch, WSJ, SOFR SR3 cross-validator)
-        fw_task   = fetch_fedwatch_all_meetings()
-        wsj_task  = _fetch_wsj_probs()
-        sr3_task  = _fetch_sofr_sr3_meetings()
+        # Fetch primary sources concurrently (FedWatch, WSJ, SR3, T-bill term structure)
+        fw_task    = fetch_fedwatch_all_meetings()
+        wsj_task   = _fetch_wsj_probs()
+        sr3_task   = _fetch_sofr_sr3_meetings()
+        tbill_task = _fetch_tbill_term_structure_meetings()
 
-        fw_result, wsj_result, sr3_result = await asyncio.gather(
-            fw_task, wsj_task, sr3_task, return_exceptions=True
+        fw_result, wsj_result, sr3_result, tbill_result = await asyncio.gather(
+            fw_task, wsj_task, sr3_task, tbill_task, return_exceptions=True
         )
 
-        fw_meetings  = fw_result  if isinstance(fw_result, dict)  else {}
-        wsj_probs    = wsj_result if isinstance(wsj_result, dict)  else None
-        # SR3 meetings keyed by "YYYY-MM" — used as cross-validator when confidence < 0.80
-        sr3_meetings = sr3_result if isinstance(sr3_result, dict)  else {}
+        fw_meetings    = fw_result    if isinstance(fw_result, dict)    else {}
+        wsj_probs      = wsj_result   if isinstance(wsj_result, dict)   else None
+        # SR3 meetings keyed by "YYYY-MM" -- used as cross-validator when confidence < 0.80
+        sr3_meetings   = sr3_result   if isinstance(sr3_result, dict)   else {}
+        tbill_meetings = tbill_result if isinstance(tbill_result, dict) else {}
+        if tbill_meetings:
+            log.info(
+                "T-bill term structure available for %d meetings (second source)",
+                len(tbill_meetings),
+            )
         if sr3_meetings:
             log.info(
                 "SOFR SR3 implied rates available for %d meetings (cross-validator)",
@@ -2447,11 +2680,30 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
             # External-only blend: Kalshi market price is what we trade against,
             # not a signal. Including it at 65% weight makes fair_value circular
             # (fair ≈ market) and destroys edge. FedWatch+ZQ+WSJ define fair value.
+            # T-bill term structure fills the ZQ slot when ZQ is CDN-blocked.
+            # T-bill yields are independently forward-looking; when available they
+            # trigger multi-source mode (base_conf 0.82 -> 0.90).
+            tbill_mp    = tbill_meetings.get(mk)
+            tbill_probs = tbill_mp.probs if tbill_mp else None
+            # Use T-bill probs in the ZQ slot (ZQ permanently CDN-blocked since 2024)
+            effective_zq = tbill_probs if tbill_probs else zq_probs_dict
+
+            # External-only blend: Kalshi market price is what we trade against,
+            # not a signal. Including it at 65% weight makes fair_value circular
+            # (fair ≈ market) and destroys edge. FedWatch+T-bill+WSJ define fair value.
             blended, confidence, sources, data_quality = _fuse_sources(
-                fw_mp.probs, zq_probs_dict, wsj_for_meeting,
-                kalshi_implied  = None,
-                fedwatch_source = fw_source_label,
+                fw_mp.probs, effective_zq, wsj_for_meeting,
+                kalshi_implied             = None,
+                fedwatch_source            = fw_source_label,
+                suppress_divergence_check  = tbill_probs is not None,
             )
+            if tbill_probs and "zq_futures" in sources:
+                # Rename the source tag from "zq_futures" to "tbill" for clarity
+                sources = [s if s != "zq_futures" else "tbill_term" for s in sources]
+                log.debug(
+                    "T-bill second source active for %s (conf=%.2f)",
+                    mk, confidence,
+                )
             if data_quality == "fallback_only":
                 log.warning(
                     "FOMC meeting %s: running on FRED static anchor only "

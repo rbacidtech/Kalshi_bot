@@ -22,6 +22,11 @@ from ep_pg_audit import audit
 
 
 class RedisBus:
+    """Redis-backed message bus connecting the Intel and Exec nodes.
+
+    Uses Redis Streams for signal (Intel→Exec) and execution report (Exec→Intel)
+    delivery, and a Redis Hash for shared position state.
+    """
 
     def __init__(self, url: str, node_id: str):
         self.url     = url
@@ -29,6 +34,10 @@ class RedisBus:
         self._r: Optional[aioredis.Redis] = None
 
     async def connect(self) -> None:
+        """Connect to Redis and idempotently create consumer groups for all streams.
+
+        Called once at startup before any publish or consume operations.
+        """
         self._r = await aioredis.from_url(
             self.url,
             encoding               = "utf-8",
@@ -83,6 +92,10 @@ class RedisBus:
     # ── Signal stream (Intel → Exec) ──────────────────────────────────────────
 
     async def publish_signal(self, sig: SignalMessage) -> str:
+        """Publish a trading signal to the ep:signals stream (consumed by Exec).
+
+        Returns the Redis stream entry ID assigned to this message.
+        """
         sig.source_node = self.node_id
         eid = await self._r.xadd(EP_SIGNALS, sig.to_redis(), maxlen=10_000, approximate=True)
         try:
@@ -191,11 +204,16 @@ class RedisBus:
                 await asyncio.sleep(2)
 
     async def ack_signal(self, entry_id) -> None:
+        """Acknowledge a signal entry, removing it from the ep:signals pending-entries list."""
         await self._r.xack(EP_SIGNALS, EXEC_GROUP, entry_id)
 
     # ── Execution stream (Exec → Intel) ───────────────────────────────────────
 
     async def publish_execution(self, report: ExecutionReport) -> str:
+        """Publish an execution report to the ep:executions stream (consumed by Intel).
+
+        Used by Intel for dedup and P&L tracking. Returns the stream entry ID.
+        """
         report.source_node = self.node_id
         eid = await self._r.xadd(EP_EXECUTIONS, report.to_redis(),
                                   maxlen=5_000, approximate=True)
@@ -291,15 +309,22 @@ class RedisBus:
     # ── Shared position state (Exec writes, Intel reads for dedup) ────────────
 
     async def set_position(self, ticker: str, pos: dict) -> None:
+        """Write or overwrite a position record in the ep:positions Redis hash, keyed by ticker."""
         await self._r.hset(EP_POSITIONS, ticker, json.dumps(pos))
 
     async def delete_position(self, ticker: str) -> None:
+        """Remove a position from the ep:positions Redis hash (called on close or tombstone)."""
         await self._r.hdel(EP_POSITIONS, ticker)
 
     async def position_exists(self, ticker: str) -> bool:
+        """Return True if a position record exists in ep:positions for this ticker."""
         return bool(await self._r.hexists(EP_POSITIONS, ticker))
 
     async def get_all_positions(self) -> Dict[str, dict]:
+        """Return all open positions as a dict keyed by ticker.
+
+        Used for dedup checks, exposure calculation, and P&L.
+        """
         raw    = await self._r.hgetall(EP_POSITIONS)
         result = {}
         for k, v in raw.items():
@@ -313,10 +338,15 @@ class RedisBus:
     # ── Price state (Intel writes, Exec reads for exits) ──────────────────────
 
     async def publish_prices(self, snapshot: PriceSnapshot) -> None:
+        """Publish a price snapshot to the ep:prices Redis hash (latest mid prices for all tracked tickers)."""
         if snapshot.prices:
             await self._r.hset(EP_PRICES, mapping=snapshot.to_redis_hash())
 
     async def get_prices(self, tickers: List[str] = None) -> Dict[str, dict]:
+        """Fetch latest Kalshi mid prices from the ep:prices Redis hash.
+
+        Optionally filters to a subset of tickers; returns all if tickers is None.
+        """
         if tickers:
             values = await self._r.hmget(EP_PRICES, *tickers)
             raw    = {t.encode(): v for t, v in zip(tickers, values) if v is not None}
