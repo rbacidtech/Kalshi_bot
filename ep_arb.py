@@ -376,7 +376,7 @@ class ArbEngine:
             if pair.divergence_since is None:
                 pair.divergence_since = time.monotonic()
                 self._stats["detected"] += 1
-                log.info(
+                log.debug(
                     "arb: divergence start  %s  poly=%.1f¢  kalshi=%.1f¢  Δ=%.1f¢",
                     ticker, poly_cents, pair.kalshi_mid, diff,
                 )

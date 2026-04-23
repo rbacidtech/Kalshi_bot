@@ -1141,7 +1141,7 @@ async def _sync_positions_with_kalshi(
         r_entry  = int(existing.get("entry_cents", 0))
 
         r_cf     = int(existing.get("contracts_filled", 0))
-        if r_qty > 0 and r_side == k_side and r_qty == k_qty and abs(r_entry - k_entry) <= 2 and r_cf >= k_qty:
+        if r_qty > 0 and r_side == k_side and r_qty == k_qty and abs(r_entry - k_entry) <= 2 and r_cf == k_qty:
             continue  # already correct
 
         if r_qty == 0:
