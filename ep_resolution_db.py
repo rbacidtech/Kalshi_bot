@@ -211,11 +211,13 @@ async def get_performance_summary(days: int = 30) -> dict:
     since = now - timedelta(days=days)
 
     csv_path = Path(cfg.TRADES_CSV)
-    trades   = _load_completed_trades(csv_path, since)  # all modes
+    all_trades   = _load_completed_trades(csv_path, since)
 
-    # Separate live and paper for the mode breakdown
-    live_trades  = [t for t in trades if t.get("mode") == "live"]
-    paper_trades = [t for t in trades if t.get("mode") != "live"]
+    # Top-level metrics use LIVE trades only — paper history contaminates the
+    # win_rate and P&L stats that drive Kelly calibration and the dashboard.
+    live_trades  = [t for t in all_trades if t.get("mode") == "live"]
+    paper_trades = [t for t in all_trades if t.get("mode") != "live"]
+    trades = live_trades   # all downstream aggregation uses live only
 
     # -- Aggregate totals ------------------------------------------------------
     total_trades = len(trades)
