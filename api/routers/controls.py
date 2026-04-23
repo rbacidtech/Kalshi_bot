@@ -247,10 +247,16 @@ async def get_status(
     status: dict[str, Any] = {}
     now = datetime.now(timezone.utc).timestamp()
 
-    # ── Intel node health (ep:health hash) ──────────────────────────────────
-    for node_id, raw in raw_health.items():
+    # ── Node health (ep:health hash) — separate Intel from Exec ─────────────
+    business_issues: list[str] = []
+    exec_health_overall: Optional[str] = None
+    for node_id_raw, raw in raw_health.items():
+        node_id = node_id_raw.decode() if isinstance(node_id_raw, bytes) else node_id_raw
         try:
-            h  = json.loads(raw)
+            h = json.loads(raw)
+        except Exception:
+            continue
+        if node_id.startswith("intel"):
             ws = h.get("sources", {}).get("kalshi_ws", {})
             status = {
                 "node_id":       node_id,
@@ -262,9 +268,16 @@ async def get_status(
                 "uptime_seconds":h.get("uptime_seconds"),
                 "session_pnl":   await _session_pnl_from_db(db),
             }
-        except Exception:
-            pass
-        break  # only first intel entry
+        elif node_id.startswith("exec"):
+            exec_health_overall = h.get("overall", "unknown")
+            biz_error = h.get("sources", {}).get("business", {}).get("error", "")
+            if biz_error:
+                business_issues = [s.strip() for s in biz_error.split(";") if s.strip()]
+
+    # Surface exec business issues; upgrade overall health if needed
+    status["business_issues"] = business_issues
+    if business_issues and status.get("health") not in ("critical",):
+        status["health"] = "degraded"
 
     # ── Per-node heartbeats from ep:system ───────────────────────────────────
     heartbeats = _node_heartbeats_from_stream(sys_entries)

@@ -39,19 +39,20 @@ interface NodeStatus {
 }
 
 interface BotStatus {
-  mode?:            string
-  halt_active?:     boolean
-  cycle_count?:     number
-  last_cycle_at?:   string | null
-  ws_connected?:    boolean
-  balance_cents?:   number
-  session_pnl?:     number
-  last_balance_at?: string | null
-  health?:          string
-  uptime_seconds?:  number
-  node_id?:         string
-  sources?:         Record<string, SourceHealth>
-  nodes?:           Record<string, NodeStatus>
+  mode?:             string
+  halt_active?:      boolean
+  cycle_count?:      number
+  last_cycle_at?:    string | null
+  ws_connected?:     boolean
+  balance_cents?:    number
+  session_pnl?:      number
+  last_balance_at?:  string | null
+  health?:           string
+  uptime_seconds?:   number
+  node_id?:          string
+  sources?:          Record<string, SourceHealth>
+  nodes?:            Record<string, NodeStatus>
+  business_issues?:  string[]
 }
 
 type Tab = 'status' | 'strategies' | 'risk' | 'advisor'
@@ -408,6 +409,21 @@ function StatusTab({ status, onHalt, onResume }: {
               <SourceChip key={name} name={name} src={src} />
             ))}
           </div>
+        </div>
+      )}
+
+      {/* ── Business health warnings ────────────────────────────────────────── */}
+      {status?.business_issues && status.business_issues.length > 0 && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/8 p-4">
+          <p className="text-xs font-semibold text-amber-400 mb-2">Health Warnings</p>
+          <ul className="space-y-1">
+            {status.business_issues.map((issue, i) => (
+              <li key={i} className="flex items-start gap-2 text-xs text-amber-300/80">
+                <span className="mt-0.5 w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+                {issue}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
