@@ -18,6 +18,7 @@ No auth required for price reads.
 import asyncio
 import datetime
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -191,25 +192,17 @@ class PolymarketFeed:
         Uses series prefix to determine search keywords, then picks the
         active market with the highest 24h volume.
 
-        For KXFED threshold tickers (e.g. KXFED-26JUN-T3.75), applies a
-        second filter requiring the Polymarket question to mention the specific
-        rate level (e.g. "3.75").  Without this, all FOMC tickers map to the
-        same highest-volume rate-change question ("Will the Fed raise/cut 25bps?")
-        which is a structurally different question from a rate-level threshold.
+        For any threshold ticker (KXFED-T3.75, KXGDP-T2.5, KXNFP-B69.5, etc.),
+        applies a second filter requiring the Polymarket question to contain the
+        specific numeric strike (e.g. "3.75", "2.5").  Without this, all strike
+        variants map to the same highest-volume Polymarket market, generating
+        spurious divergence signals for structurally different questions.
         """
         series_prefix = sig.ticker.split("-")[0] if "-" in sig.ticker else sig.ticker
         keywords = _SERIES_KEYWORDS.get(series_prefix, [])
         if not keywords:
             log.debug("Polymarket: no keyword mapping for series prefix %r", series_prefix)
             return None
-
-        # Extract rate threshold for KXFED-...-T{rate} tickers
-        rate_threshold: Optional[float] = None
-        if series_prefix == "KXFED" and "-T" in sig.ticker:
-            try:
-                rate_threshold = float(sig.ticker.split("-T")[-1])
-            except (ValueError, IndexError):
-                pass
 
         candidates = []
         for pm in self._poly_markets:
@@ -221,28 +214,37 @@ class PolymarketFeed:
             log.debug("Polymarket: 0 candidates for %s (keywords=%s)", sig.ticker, keywords)
             return None
 
-        # For rate-threshold KXFED tickers, filter to questions that mention the
-        # specific rate level.  This prevents rate-change questions ("Will Fed
-        # raise/cut 25bps?") from matching rate-level questions ("Rate above 3.75%?").
-        if rate_threshold is not None:
-            # Build candidate rate strings, always keeping ≥1 decimal place so
+        # Extract numeric strike for any threshold ticker (T3.75, B69.5, T1.5, T2.0, ...).
+        # Applies to KXFED rate levels, KXGDP percentages, KXNFP figures, etc.
+        # Without this, all strike variants (T1.5, T2.0, T2.5) collapse to the same
+        # highest-volume Polymarket market, generating spurious divergence signals.
+        strike_m = re.search(r'-[TB](\d+\.?\d*)(?:-|$)', sig.ticker)
+        strike_val: Optional[float] = None
+        if strike_m:
+            try:
+                strike_val = float(strike_m.group(1))
+            except ValueError:
+                pass
+
+        if strike_val is not None:
+            # Build candidate strike strings, always keeping ≥1 decimal place so
             # "3.0" never becomes bare "3" (which would match "3.75", "30", etc.).
-            rate_2dec = f"{rate_threshold:.2f}"              # "3.75", "3.00"
-            stripped  = rate_2dec.rstrip("0")                # "3.75", "3."
+            strike_2dec = f"{strike_val:.2f}"              # "2.50", "3.75", "1.50"
+            stripped    = strike_2dec.rstrip("0")          # "2.5",  "3.75", "1.5"
             if stripped.endswith("."):
-                stripped += "0"                              # "3." → "3.0"
-            rate_strs = list(dict.fromkeys([rate_2dec, stripped]))  # dedup, preserve order
-            rate_candidates = [
+                stripped += "0"                            # "3." → "3.0"
+            strike_strs = list(dict.fromkeys([strike_2dec, stripped]))  # dedup, order preserved
+            strike_candidates = [
                 pm for pm in candidates
-                if any(rs in pm.question for rs in rate_strs)
+                if any(ss in pm.question for ss in strike_strs)
             ]
-            if rate_candidates:
-                candidates = rate_candidates
+            if strike_candidates:
+                candidates = strike_candidates
             else:
                 log.debug(
-                    "Polymarket: no rate-specific match for %s (rate=%.2f) — "
+                    "Polymarket: no strike-specific match for %s (strike=%.2f) — "
                     "skipping rather than returning wrong market",
-                    sig.ticker, rate_threshold,
+                    sig.ticker, strike_val,
                 )
                 return None
 
