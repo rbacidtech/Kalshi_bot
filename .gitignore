@@ -12,3 +12,4 @@ output/
 *.jsonl
 .claude/
 infra/.env
+.deployed_sha
