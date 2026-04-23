@@ -347,6 +347,24 @@ async def _process_signal(
             _entry_failed_cooldown[sig.ticker] = time.time()
             return _rejected("BALANCE_UNKNOWN")
         balance_cents = intel_bal.get("balance_cents", 0)
+        # Update drawdown tracking and persist halt to Redis if triggered.
+        risk_engine._kalshi.set_balance(balance_cents)
+        if risk_engine._kalshi._halted:
+            try:
+                already = await bus._r.hget("ep:config", "HALT_TRADING")
+                if already not in (b"1", "1"):
+                    await bus._r.hset("ep:config", "HALT_TRADING", "1")
+                    await bus._r.hset("ep:halt", mapping={
+                        "reason":        "drawdown",
+                        "tripped_at_us": str(int(time.time() * 1_000_000)),
+                    })
+                    log.warning(
+                        "Drawdown halt persisted to Redis (balance=%.2f start=%.2f)",
+                        balance_cents / 100,
+                        (risk_engine._kalshi._start_balance or 0) / 100,
+                    )
+            except Exception as _e:
+                log.warning("Failed to persist drawdown halt to Redis: %s", _e)
 
     # ── LLM policy overrides (written each cycle by llm_agent.py → ep:config) ─
     llm_kelly, llm_scale, llm_btc_on, llm_kal_on = await asyncio.gather(
@@ -2881,6 +2899,18 @@ async def exec_main() -> None:
         fee_cents            = cfg.FEE_CENTS,
     ))
     risk_engine = UnifiedRiskEngine(kalshi_risk)
+
+    # ── Restore drawdown halt across restarts ─────────────────────────────────
+    # If HALT_TRADING=1 is in Redis from a prior drawdown event, pre-arm the
+    # in-memory halt so approve() rejects immediately without waiting for the
+    # first balance read to re-trigger it.
+    try:
+        _halt_val = await bus._r.hget("ep:config", "HALT_TRADING")
+        if _halt_val in (b"1", "1"):
+            kalshi_risk._halted = True
+            log.warning("Startup: drawdown halt flag found in Redis — trading blocked until manually cleared.")
+    except Exception:
+        pass
 
     # ── Prometheus metrics (Exec node scrape target) ──────────────────────────
     exec_metrics_port = int(os.getenv("METRICS_PORT", "9092"))

@@ -153,9 +153,9 @@ class AlertManager:
                     f"Balance: ${balance_cents/100:.2f}\n"
                     f"Session start: ${state.start_balance_cents/100:.2f}\n"
                     f"Drawdown: {drawdown:.1%}\n"
-                    f"Trading has been halted."
+                    f"Monitor positions closely."
                 )
-                self._send("DRAWDOWN LIMIT HIT", msg)
+                self._send("DRAWDOWN ALERT", msg)
 
         elif drawdown >= 0.07:
             rate_key = "drawdown:7pct"
