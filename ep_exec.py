@@ -2821,6 +2821,36 @@ async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
             log.debug("_business_health_loop: %s", exc)
 
 
+async def _midnight_reset_loop(bus: RedisBus, risk_engine: "UnifiedRiskEngine") -> None:
+    """Clear drawdown halt at UTC midnight so each trading day starts fresh."""
+    import datetime as _dt
+    _last_reset_day = _dt.datetime.now(_dt.timezone.utc).date()
+    log.info("Midnight reset loop started (last_reset_day=%s)", _last_reset_day)
+    while True:
+        await asyncio.sleep(60)
+        try:
+            today = _dt.datetime.now(_dt.timezone.utc).date()
+            if today <= _last_reset_day:
+                continue
+            _last_reset_day = today
+            # Only act if halt is actually set
+            halt_val = await bus._r.hget("ep:config", "HALT_TRADING")
+            if halt_val not in (b"1", "1"):
+                continue
+            await bus._r.hdel("ep:config", "HALT_TRADING")
+            await bus._r.delete("ep:halt")
+            risk_engine._kalshi._halted = False
+            log.warning(
+                "Midnight UTC reset: drawdown halt cleared for new trading day %s", today
+            )
+            await bus.publish_system_event(
+                "DRAWDOWN_HALT_RESET",
+                detail=f"midnight_utc new_day={today}",
+            )
+        except Exception as exc:
+            log.debug("_midnight_reset_loop: %s", exc)
+
+
 async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> None:
     """
     Publish exec-node performance summary to Redis ep:performance every hour.
@@ -3059,6 +3089,7 @@ async def exec_main() -> None:
             _fill_poll_loop(positions, client, executor, bus, db),
             _performance_publisher_loop(bus),
             _business_health_loop(bus),
+            _midnight_reset_loop(bus, risk_engine),
             kelly_calib_loop(bus),
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
