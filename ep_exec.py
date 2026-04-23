@@ -1150,7 +1150,11 @@ async def _sync_positions_with_kalshi(
             await positions.open(ticker=ticker, side=k_side, contracts=k_qty,
                                  entry_cents=k_entry, fair_value=k_entry / 100.0,
                                  pending=False)
-            await positions.update_fields(ticker, {"fill_confirmed": True, "order_id": ""})
+            await positions.update_fields(ticker, {
+                "fill_confirmed": True,
+                "order_id":       "",
+                "contracts_filled": k_qty,
+            })
             added += 1
         else:
             # Update diverged fields in-place
@@ -1167,7 +1171,7 @@ async def _sync_positions_with_kalshi(
         if executor is not None:
             executor._positions[ticker] = {
                 "side": k_side, "entry_cents": k_entry,
-                "contracts": k_qty, "fill_confirmed": True,
+                "contracts": k_qty, "contracts_filled": k_qty, "fill_confirmed": True,
             }
 
     # ── Remove stale confirmed positions no longer on Kalshi ─────────────────
@@ -2560,20 +2564,22 @@ async def _reconcile_orphan_orders(
         )
         # Mark as fill_confirmed so exit_checker monitors it immediately
         await positions.update_fields(ticker, {
-            "order_id":       "",   # no order_id for already-filled positions
-            "fill_confirmed": True,
+            "order_id":        "",   # no order_id for already-filled positions
+            "fill_confirmed":  True,
+            "contracts_filled": contracts,
         })
         if executor is not None:
             executor._positions[ticker] = {
-                "side":           side,
-                "entry_cents":    entry_cents,
-                "contracts":      contracts,
-                "fair_value":     entry_cents / 100.0,
-                "meeting":        "",
-                "outcome":        "",
-                "entered_at":     datetime.now(timezone.utc).isoformat(),
-                "order_id":       "",
-                "fill_confirmed": True,
+                "side":             side,
+                "entry_cents":      entry_cents,
+                "contracts":        contracts,
+                "contracts_filled": contracts,
+                "fair_value":       entry_cents / 100.0,
+                "meeting":          "",
+                "outcome":          "",
+                "entered_at":       datetime.now(timezone.utc).isoformat(),
+                "order_id":         "",
+                "fill_confirmed":   True,
             }
         log.warning(
             "ORPHAN FILLED POSITION RESTORED: %s  side=%s  contracts=%d  entry=%d¢  "
