@@ -1,0 +1,34 @@
+[Unit]
+Description=EdgePulse Datasources — SOFR/BAA10Y/BTC/PredictIt/econ feed daemon
+PartOf=edgepulse.target
+After=network-online.target edgepulse-redis.service
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/EdgePulse/.venv/bin/python3 -u ep_datasources.py --loop
+
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=15
+
+MemoryMax=256M
+CPUQuota=20%
+Nice=10
+
+StandardOutput=append:/var/log/edgepulse/datasources.log
+StandardError=append:/var/log/edgepulse/datasources.log
+SyslogIdentifier=ep-datasources
+
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=edgepulse.target
