@@ -2302,9 +2302,9 @@ async def intel_main() -> None:
             except Exception as _exc:
                 log.warning("cross_meeting_coherence scan failed: %s", _exc)
 
-            # ── Improvement 7: Election market ensemble ───────────────────────
+            # ── Election market ensemble + Metaculus probability boost ───────────
             try:
-                from kalshi_bot.strategy import scan_election_markets
+                from kalshi_bot.strategy import scan_election_markets_with_538 as _scan_election
                 _poly_prices_for_election = {
                     slug: float(p.get("probability") or p.get("price") or p.get("yes_price") or 0)
                     for slug, p in (polymarket._cache or {}).items()
@@ -2313,15 +2313,14 @@ async def intel_main() -> None:
                 _pi_prices_for_election: dict = {}
                 try:
                     from ep_predictit import fetch_predictit_fomc as _fetch_pi
-                    import asyncio as _aio
                     _pi_raw = await _fetch_pi()
                     for _pi_key, _pi_outcomes in _pi_raw.items():
                         for _outcome, _price in _pi_outcomes.items():
                             _pi_prices_for_election[_pi_key] = float(_price)
-                            break  # take first outcome price as representative
+                            break
                 except Exception:
                     pass
-                _election_sigs = scan_election_markets(
+                _election_sigs = await _scan_election(
                     markets_cache, _poly_prices_for_election, _pi_prices_for_election
                 )
                 for _es in _election_sigs:
@@ -2329,7 +2328,7 @@ async def intel_main() -> None:
                         await bus.publish_signal(_es)
                         metrics.signal_published(_es.asset_class, _es.strategy, _es.side)
                 if _election_sigs:
-                    log.info("Election ensemble: %d signal(s) published", len(_election_sigs))
+                    log.info("Election+metaculus: %d signal(s) published", len(_election_sigs))
             except Exception as _exc:
                 log.warning("election_ensemble scan failed: %s", _exc)
 

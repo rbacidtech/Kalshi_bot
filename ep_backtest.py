@@ -152,15 +152,30 @@ def _compute_strategy_metrics(trades: list) -> dict:
         total_pnl  = sum(t["pnl_cents"] for t in live_trades)
         avg_edge   = sum(t["edge"] for t in live_trades) / n if n else 0
 
-        # Build daily P&L for Sharpe
-        pnl_list   = [t["pnl_cents"] for t in live_trades]
-        cum_pnl    = []
-        running    = 0.0
+        # Sharpe: use calendar-day bucketing (sqrt(252)) when ≥5 unique trading days
+        # available; fall back to per-trade sqrt(252) otherwise.  Both approaches
+        # use the same annualisation factor — the difference is whether correlated
+        # same-day trades are aggregated before measuring volatility.
+        daily: dict = defaultdict(float)
+        for t in live_trades:
+            try:
+                day_key = t["ts"][:10] if t.get("ts") else "0000-00-00"
+            except Exception:
+                day_key = "0000-00-00"
+            daily[day_key] += t["pnl_cents"]
+
+        daily_pnl = list(daily.values())
+        pnl_list  = [t["pnl_cents"] for t in live_trades]
+        cum_pnl   = []
+        running   = 0.0
         for p in pnl_list:
             running += p
             cum_pnl.append(running)
 
-        sharpe  = _sharpe(pnl_list, annualise_factor=float(n))
+        if len(daily_pnl) >= 5:
+            sharpe = _sharpe(daily_pnl, annualise_factor=252.0)
+        else:
+            sharpe = _sharpe(pnl_list, annualise_factor=252.0)
         max_dd  = _max_drawdown(cum_pnl)
         win_rt  = wins / n if n > 0 else 0
 
@@ -238,12 +253,19 @@ def main():
 
     per_strategy = _compute_strategy_metrics(trades)
 
-    # Overall metrics
-    all_pnl    = [t["pnl_cents"] for t in trades if t["mode"] != "paper"]
-    if not all_pnl:
-        all_pnl = [t["pnl_cents"] for t in trades]
-    cum_all    = []
-    running    = 0.0
+    # Overall metrics — use daily-bucketed P&L for calendar-day Sharpe
+    live_trades_all = [t for t in trades if t["mode"] != "paper"] or trades
+    all_pnl     = [t["pnl_cents"] for t in live_trades_all]
+    daily_all: dict = defaultdict(float)
+    for t in live_trades_all:
+        try:
+            day_key = t["ts"][:10] if t.get("ts") else "0000-00-00"
+        except Exception:
+            day_key = "0000-00-00"
+        daily_all[day_key] += t["pnl_cents"]
+
+    cum_all  = []
+    running  = 0.0
     for p in all_pnl:
         running += p
         cum_all.append(running)
@@ -254,7 +276,10 @@ def main():
         "total_trades":       total_n,
         "total_pnl_cents":    int(sum(all_pnl)),
         "win_rate":           total_w / total_n if total_n else 0,
-        "sharpe":             round(_sharpe(all_pnl, float(max(total_n, 1))), 2),
+        "sharpe":             round(
+            _sharpe(list(daily_all.values()), 252.0) if len(daily_all) >= 5
+            else _sharpe(all_pnl, 252.0), 2
+        ),
         "max_drawdown_cents": int(_max_drawdown(cum_all)),
         "strategies":         per_strategy,
     }
