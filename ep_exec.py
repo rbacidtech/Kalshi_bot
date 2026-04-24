@@ -106,6 +106,12 @@ _EXIT_TIF_STEP_MINUTES = int(os.getenv("EXIT_TIF_STEP_MINUTES", "30"))
 _EXIT_TIF_WIDEN_CENTS  = int(os.getenv("EXIT_TIF_WIDEN_CENTS",  "2"))
 _EXIT_TIF_MAX_STEPS    = int(os.getenv("EXIT_TIF_MAX_STEPS",    "3"))
 
+# After TIF exhaustion or N consecutive 0-fill cancels, wait this long
+# before allowing exit_checker to place a new limit. Prevents 60s churn
+# when the last resting price is far from current market mid.
+_EXIT_RETRY_BACKOFF_S    = int(os.getenv("EXIT_RETRY_BACKOFF_S",   "600"))
+_EXIT_CANCEL_RETRY_CAP   = int(os.getenv("EXIT_CANCEL_RETRY_CAP",  "5"))
+
 # ── Directional exposure limits ───────────────────────────────────────────────
 # Cap total YES exposure and total NO exposure independently.
 # Balance itself constrains total deployment; no cross-market category limits.
@@ -1710,6 +1716,19 @@ async def _exit_checker(
                     metrics.record_stale_price_skip(ticker)
                     continue
 
+                # ── Exit retry cooldown ──────────────────────────────────────
+                # Set by fill_poll after TIF exhaustion or repeated 0-fill
+                # Kalshi cancels. Prevents a limit far from market from being
+                # re-submitted every 60s. Placed AFTER resolution-driven and
+                # post-close cleanup so those authoritative exits still run.
+                _retry_after = pos.get("exit_retry_after_ts")
+                if _retry_after:
+                    try:
+                        if time.time() < float(_retry_after):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+
                 # BTC prices in Redis are raw USD; normalise to cents-per-BTC_UNIT
                 # so move_cents and entry_cents are in the same units.
                 raw_price = price_data.get("last_price") or price_data.get("yes_price")
@@ -2194,6 +2213,8 @@ return cnt
                                 "exit_offer_cents":     _offer,
                                 "exit_reason":          exit_reason,
                                 "exit_widen_count":     0,
+                                "exit_cancel_count":    0,
+                                "exit_retry_after_ts":  0,
                             })
                             log.info(
                                 "Exit order resting: %s  offer=%d¢  order_id=%.8s",
@@ -2277,6 +2298,8 @@ return cnt
                                         "exit_offer_cents":     _sib_offer,
                                         "exit_reason":          _sib_rsn,
                                         "exit_widen_count":     0,
+                                        "exit_cancel_count":    0,
+                                        "exit_retry_after_ts":  0,
                                     })
                             else:
                                 log.warning(
@@ -2468,11 +2491,23 @@ async def _fill_poll_loop(
                             # (likely stale price too far from market). Keep the position
                             # and retry next exit_checker cycle with fresh price data.
                             _cancel_count = int(pos.get("exit_cancel_count", 0)) + 1
-                            await positions.update_fields(ticker, {
+                            _updates = {
                                 "pending_exit":       False,
                                 "exit_order_id":      "",
                                 "exit_cancel_count":  _cancel_count,
-                            })
+                            }
+                            # After 5 consecutive 0-fill cancels, back off for 10 min
+                            # so the exit_checker doesn't respawn the same bad limit
+                            # every 60s. Exit retry cooldown is respected in
+                            # exit_checker after resolution-driven exits.
+                            if _cancel_count >= _EXIT_CANCEL_RETRY_CAP:
+                                _updates["exit_retry_after_ts"] = time.time() + _EXIT_RETRY_BACKOFF_S
+                                log.warning(
+                                    "Exit cancel cap reached: %s  %d cancels — "
+                                    "backing off %ds before retry",
+                                    ticker, _cancel_count, _EXIT_RETRY_BACKOFF_S,
+                                )
+                            await positions.update_fields(ticker, _updates)
                             if executor is not None and ticker in executor._positions:
                                 executor._positions[ticker].pop("pending_exit", None)
                             log.warning(
@@ -2487,8 +2522,11 @@ async def _fill_poll_loop(
                         if not placed_at_s:
                             continue
                         if widen_count >= _EXIT_TIF_MAX_STEPS:
-                            # TIF exhausted — cancel the stale order and let exit_checker
-                            # re-evaluate with fresh price data next cycle.
+                            # TIF exhausted — cancel the stale order and back off
+                            # before retry. Without a cooldown here the exit_checker
+                            # would respawn the same bad limit 60s later, creating
+                            # churn on positions whose market-mid is far from the
+                            # last resting price.
                             try:
                                 await asyncio.to_thread(
                                     client._request, "DELETE",
@@ -2497,16 +2535,17 @@ async def _fill_poll_loop(
                             except Exception:
                                 pass
                             await positions.update_fields(ticker, {
-                                "pending_exit":      False,
-                                "exit_order_id":     "",
-                                "exit_widen_count":  0,
+                                "pending_exit":        False,
+                                "exit_order_id":       "",
+                                "exit_widen_count":    0,
+                                "exit_retry_after_ts": time.time() + _EXIT_RETRY_BACKOFF_S,
                             })
                             if executor is not None and ticker in executor._positions:
                                 executor._positions[ticker].pop("pending_exit", None)
                             log.warning(
                                 "TIF exhausted: %s  max_steps=%d — "
-                                "resetting for fresh-price retry",
-                                ticker, _EXIT_TIF_MAX_STEPS,
+                                "backing off %ds before retry",
+                                ticker, _EXIT_TIF_MAX_STEPS, _EXIT_RETRY_BACKOFF_S,
                             )
                             continue
                         try:
