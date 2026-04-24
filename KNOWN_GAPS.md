@@ -3,6 +3,7 @@
 _As of 2026-04-24 02:10 UTC, following audit session._
 _Updated 2026-04-24 02:34 UTC — three fixes applied and verified._
 _Updated 2026-04-24 04:30 UTC — entry/exit strategy audit, four more fixes patched._
+_Updated 2026-04-24 04:45 UTC — post-deploy observations added below._
 
 ## Silently broken — needs fix
 
@@ -18,10 +19,57 @@ _Updated 2026-04-24 04:30 UTC — entry/exit strategy audit, four more fixes pat
   one try/except so the second failure kills both. Result: every signal
   gets multiplier 1.0 (no-op). Feature is cosmetic until fixed.
 
+  _Post-deploy observation (2026-04-24 04:38 UTC):_ warning fires on
+  every intel cycle (~9 occurrences in the last 4h). Previously was
+  quieter because it logged at DEBUG during certain code paths; now
+  a WARNING on every kelly_calib tick. Not a new break — the query
+  always failed — just now more visible.
+
   Fix: in the second query, rename `model_source`→`strategy`,
   `pnl_cents`→`realized_pnl_cents`, `closed_at`→`exited_at`. Split
   the two queries into separate try/except blocks so bucket calibration
   survives a per-strategy query failure.
+
+- **Item 11 — Metrics port 9091 double-bind on every restart.**
+  `.env` sets `METRICS_PORT=9091` which all services inherit as
+  `EnvironmentFile=/etc/edgepulse/edgepulse.env`. `ep_intel.py:1388`
+  and `ep_exec.py:3344` both call `metrics.start(port=METRICS_PORT)`
+  using that var. ep_intel's default is 9091; ep_exec's is 9092 but
+  the env var override hits both → both try 9091, intel wins (starts
+  first), exec's metrics server silently fails to bind at every
+  startup.
+
+  Live evidence (2026-04-24 04:38 UTC):
+  ```
+  [info] Metrics/health server listening on :9091   ← intel wins
+  [warning] Metrics server could not bind to port 9091
+      ([Errno 98] Address already in use) — metrics will be
+      unavailable this session but trading continues.   ← exec loses
+  ```
+  `ss -tlnp` confirms only PID 390147 (intel) holds 9091; nothing on
+  9092.
+
+  _Impact:_ Prometheus (on :9090) can scrape intel but never scrapes
+  exec — fills, risk-gate rejections, Kelly sizings, BTC P&L counters
+  are all missing from Grafana. Dashboard pages that draw from
+  `ep:metrics` Redis keys still work (metrics.py writes both HTTP and
+  Redis). Fill volume for the ~7-day Prometheus retention window is
+  lost unless backfilled from CSV/Postgres.
+
+  Fix options: either remove `METRICS_PORT=9091` from `.env` (let each
+  service use its own default — 9091 intel / 9092 exec) OR set
+  per-service `Environment=METRICS_PORT=909X` overrides in each
+  systemd unit file. Former is cleaner; the env var existed because
+  at some earlier point only one service had metrics.
+
+## Not a gap (documented to avoid re-reporting)
+
+- **Orphan-order reconciliation on exec startup.** Normal behavior.
+  `_reconcile_orphan_orders` in ep_exec.py runs at service start and
+  pulls any resting Kalshi orders into Redis if they have no record.
+  The "N orphan(s) restored to Redis" WARNING at each restart is
+  informational — it is not a bug. Count will vary with how many
+  resting orders existed when the service last crashed / restarted.
 
 ## Verified working
 
