@@ -24,6 +24,7 @@ import logging
 import math as _math
 import os
 import re
+import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, date, timezone, timedelta
 from typing import Optional
@@ -1041,13 +1042,68 @@ def _parse_ticker_date(ticker: str) -> Optional[_date]:
         return None
 
 
+# ── Open-Meteo response cache ────────────────────────────────────────────────
+# Open-Meteo free tier has a ~10k daily request limit. The weather scanner runs
+# every 120s and iterates per-market, so without caching it burns through the
+# limit in hours (observed 2026-04-24: limit exhausted at 20:37 UTC).
+# Cache key: (endpoint, lat, lon, timezone). Daily forecast updates hourly
+# upstream, so 600s staleness has no material effect on signals.
+# Also covers the per-market duplicate-call pattern (10 NYC weather markets
+# all need the same NYC forecast each cycle → now 1 call serves all).
+_OM_CACHE: dict = {}      # key → (ts, full_response_json_or_None)
+_OM_CACHE_TTL = 600       # seconds
+
+
+def _om_cache_get(key: tuple) -> "Optional[tuple[bool, dict]]":
+    """Return (hit, value) — hit=True if cached and fresh. value may be None."""
+    entry = _OM_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, val = entry
+    if _time.time() - ts > _OM_CACHE_TTL:
+        return None
+    return (True, val)
+
+
+def _om_cache_set(key: tuple, value) -> None:
+    _OM_CACHE[key] = (_time.time(), value)
+
+
+def _extract_om_target(resp_json: dict, target: _date) -> Optional[dict]:
+    """Pull the target-date slice out of a cached Open-Meteo daily payload."""
+    if not resp_json:
+        return None
+    daily = resp_json.get("daily", {})
+    dates = daily.get("time", [])
+    target_str = target.isoformat()
+    if target_str not in dates:
+        return None
+    idx = dates.index(target_str)
+    def _v(key):
+        vals = daily.get(key, [])
+        return vals[idx] if idx < len(vals) else None
+    return {
+        "high":       _v("temperature_2m_max"),
+        "low":        _v("temperature_2m_min"),
+        "precip":     _v("precipitation_sum"),
+        "precip_pct": _v("precipitation_probability_max"),
+        "days_ahead": (_date.today() - target).days * -1,
+        "source":     "open_meteo",
+    }
+
+
 async def fetch_open_meteo(
     lat: float, lon: float, tz: str, target: _date
 ) -> Optional[dict]:
     """
-    Fetch Open-Meteo daily forecast for a specific date.
+    Fetch Open-Meteo GFS daily forecast for a specific date.
     Returns {"high", "low", "precip", "precip_pct", "days_ahead"} or None.
+    Cached 600s per (lat, lon, tz) — see _OM_CACHE comment above.
     """
+    key = ("om_gfs", round(lat, 4), round(lon, 4), tz)
+    cached = _om_cache_get(key)
+    if cached is not None:
+        return _extract_om_target(cached[1], target)
     try:
         http = _get_http_client()
         params = {
@@ -1061,27 +1117,15 @@ async def fetch_open_meteo(
         }
         resp = await http.get("https://api.open-meteo.com/v1/forecast", params=params)
         if resp.status_code != 200:
-            log.warning("Open-Meteo %d for %.4f,%.4f", resp.status_code, lat, lon)
+            log.warning("Open-Meteo GFS %d for %.4f,%.4f", resp.status_code, lat, lon)
+            _om_cache_set(key, None)   # cache the failure so we don't retry every 120s
             return None
-        daily = resp.json().get("daily", {})
-        dates = daily.get("time", [])
-        target_str = target.isoformat()
-        if target_str not in dates:
-            return None
-        idx = dates.index(target_str)
-        def _v(key):
-            vals = daily.get(key, [])
-            return vals[idx] if idx < len(vals) else None
-        return {
-            "high":       _v("temperature_2m_max"),
-            "low":        _v("temperature_2m_min"),
-            "precip":     _v("precipitation_sum"),
-            "precip_pct": _v("precipitation_probability_max"),
-            "days_ahead": (_date.today() - target).days * -1,
-            "source":     "open_meteo",
-        }
+        resp_json = resp.json()
+        _om_cache_set(key, resp_json)
+        return _extract_om_target(resp_json, target)
     except Exception as exc:
-        log.warning("Open-Meteo fetch failed for %.4f,%.4f: %s", lat, lon, exc)
+        log.warning("Open-Meteo GFS fetch failed for %.4f,%.4f: %s", lat, lon, exc)
+        _om_cache_set(key, None)
         return None
 
 
@@ -1092,7 +1136,15 @@ async def fetch_open_meteo_ecmwf(
     Fetch ECMWF IFS model forecast from Open-Meteo.
     ECMWF generally outperforms GFS beyond day 3 and is the gold-standard
     global NWP model. Returns same dict shape as fetch_open_meteo().
+    Cached 600s per (lat, lon, tz) — see _OM_CACHE comment above.
     """
+    key = ("om_ecmwf", round(lat, 4), round(lon, 4), tz)
+    cached = _om_cache_get(key)
+    if cached is not None:
+        base = _extract_om_target(cached[1], target)
+        if base is not None:
+            base["source"] = "ecmwf"
+        return base
     try:
         http = _get_http_client()
         params = {
@@ -1108,26 +1160,17 @@ async def fetch_open_meteo_ecmwf(
         resp = await http.get("https://api.open-meteo.com/v1/forecast", params=params)
         if resp.status_code != 200:
             log.warning("Open-Meteo ECMWF %d for %.4f,%.4f", resp.status_code, lat, lon)
+            _om_cache_set(key, None)
             return None
-        daily = resp.json().get("daily", {})
-        dates = daily.get("time", [])
-        target_str = target.isoformat()
-        if target_str not in dates:
-            return None
-        idx = dates.index(target_str)
-        def _v(key):
-            vals = daily.get(key, [])
-            return vals[idx] if idx < len(vals) else None
-        return {
-            "high":       _v("temperature_2m_max"),
-            "low":        _v("temperature_2m_min"),
-            "precip":     _v("precipitation_sum"),
-            "precip_pct": _v("precipitation_probability_max"),
-            "days_ahead": (_date.today() - target).days * -1,
-            "source":     "ecmwf",
-        }
+        resp_json = resp.json()
+        _om_cache_set(key, resp_json)
+        base = _extract_om_target(resp_json, target)
+        if base is not None:
+            base["source"] = "ecmwf"
+        return base
     except Exception as exc:
         log.warning("Open-Meteo ECMWF fetch failed for %.4f,%.4f: %s", lat, lon, exc)
+        _om_cache_set(key, None)
         return None
 
 
