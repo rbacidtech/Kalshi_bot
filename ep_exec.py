@@ -213,7 +213,7 @@ async def _process_signal(
     Always returns an ExecutionReport — even on rejection — so Intel can
     audit every signal's fate via the ep:executions stream.
     """
-    global _kalshi_api_failures, _kalshi_api_failure_ts
+    global _kalshi_api_failures, _kalshi_api_failure_ts, _arb_legs_in_progress
 
     def _rejected(reason: str) -> ExecutionReport:
         metrics.record_risk_gate(reason, "reject")
