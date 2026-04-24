@@ -1418,10 +1418,14 @@ async def _exit_checker(
                     _t_ticker = _raw_tk.replace("ep:tombstone:", "")
                     log.info("Auto-tombstone triggered for %s — calling cancel_and_tombstone",
                              _t_ticker)
-                    await bus._r.delete(_raw_tk)   # delete raw key — _safe_key strips dots
-                    await cancel_and_tombstone(_t_ticker, executor.client, positions, executor)
+                    try:
+                        await cancel_and_tombstone(_t_ticker, executor.client, positions, executor)
+                        await bus._r.delete(_raw_tk)   # only delete after successful action
+                    except Exception as _tomb_exc:
+                        log.warning("Tombstone consumer: failed to process %s — "
+                                    "key preserved for next-tick retry: %s", _t_ticker, _tomb_exc)
             except Exception as _tomb_exc:
-                log.debug("Tombstone consumer error (non-fatal): %s", _tomb_exc)
+                log.warning("Tombstone consumer: key scan failed: %s", _tomb_exc)
 
             current_positions = await positions.get_all()
             if not current_positions:
@@ -1437,20 +1441,25 @@ async def _exit_checker(
                 for _clk in _cl_keys:
                     _clk_s  = _clk.decode() if isinstance(_clk, bytes) else _clk
                     _cl_t   = _clk_s.replace("ep:cut_loss:", "")
-                    _cl_why = await bus._r.get(_clk_s) or "signal_reversed"
-                    await bus._r.delete(_clk_s)
-                    _cl_pos = current_positions.get(_cl_t)
-                    if not _cl_pos or _cl_pos.get("contracts", 1) == 0:
-                        continue
-                    if not _cl_pos.get("fill_confirmed", True):
-                        log.info("Cut-loss: %s resting order → cancel_and_tombstone (%s)",
-                                 _cl_t, _cl_why)
-                        await cancel_and_tombstone(_cl_t, executor.client, positions, executor)
-                    else:
-                        log.warning("Cut-loss queued for exit: %s (%s)", _cl_t, _cl_why)
-                        _cutloss_tickers.add(_cl_t)
+                    try:
+                        _cl_why = await bus._r.get(_clk_s) or "signal_reversed"
+                        _cl_pos = current_positions.get(_cl_t)
+                        if not _cl_pos or _cl_pos.get("contracts", 1) == 0:
+                            await bus._r.delete(_clk_s)
+                            continue
+                        if not _cl_pos.get("fill_confirmed", True):
+                            log.info("Cut-loss: %s resting order → cancel_and_tombstone (%s)",
+                                     _cl_t, _cl_why)
+                            await cancel_and_tombstone(_cl_t, executor.client, positions, executor)
+                        else:
+                            log.warning("Cut-loss queued for exit: %s (%s)", _cl_t, _cl_why)
+                            _cutloss_tickers.add(_cl_t)
+                        await bus._r.delete(_clk_s)   # only delete after successful action
+                    except Exception as _cle:
+                        log.warning("Cut-loss consumer: failed to process %s — "
+                                    "key preserved for next-tick retry: %s", _cl_t, _cle)
             except Exception as _cle:
-                log.debug("Cut-loss consumer error (non-fatal): %s", _cle)
+                log.warning("Cut-loss consumer: key scan failed: %s", _cle)
 
             # ── Redis config overrides (written by dashboard → ep:config) ─────
             _ov_tp, _ov_sl, _ov_hbc, _ov_ts = await asyncio.gather(
