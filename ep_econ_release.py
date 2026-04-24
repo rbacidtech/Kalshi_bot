@@ -367,7 +367,11 @@ class EconReleaseEngine:
         Returns MoM SA CPI % change when the page shows the expected month/year.
         """
         try:
-            r = await http.get(BLS_CPI_URL, timeout=3.0)
+            # BLS returns 403 to requests without a browser User-Agent.
+            r = await http.get(
+                BLS_CPI_URL, timeout=3.0,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; EdgePulseBot/1.0)"},
+            )
             if r.status_code != 200:
                 return None
             html = r.text
