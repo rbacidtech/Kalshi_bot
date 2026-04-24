@@ -182,8 +182,18 @@ class DataSourceManager:
             return None
 
     async def _fetch_sofr_sr3(self) -> Optional[dict]:
-        """3-month SOFR futures (SR3=F via Yahoo Finance). NOTE: SR3=F was delisted from Yahoo Finance ~2024;
-        this fetcher always returns None. The slot is kept for forward compatibility if the symbol is relisted."""
+        """3-month SOFR futures (SR3=F via Yahoo Finance).
+
+        SR3=F was delisted from Yahoo Finance ~2024. Previously this fetcher
+        ran every cycle, hit the Yahoo endpoint, got an empty response, and
+        returned None — burning ~8s of timeout and adding noise to logs. Now
+        returns None immediately without any network call. Slot preserved so
+        the name still appears in the refresh-all summary; flip ENABLE_SR3
+        to true and add the fetcher body back when/if the symbol is relisted.
+        """
+        if os.getenv("ENABLE_SR3", "false").lower() not in ("1", "true", "yes"):
+            return None
+        # Guarded-off path below retained for forward compatibility.
         try:
             async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": _UA}) as c:
                 r = await c.get(

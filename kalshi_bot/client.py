@@ -127,6 +127,15 @@ class KalshiClient:
                         # Surface immediately — no retry would be safe.
                         raise last_exc
                     continue
+                if resp.status_code == 401:
+                    # 401 is almost always signature rejection. Kalshi's signature
+                    # window is ~30s; NTP drift is a common cause. Log a hint
+                    # so ops doesn't have to hunt for the cause on cascading 401s.
+                    log.error(
+                        "Kalshi 401 Unauthorized on %s %s — possible signature "
+                        "issue. Check NTP / system clock, KALSHI_API_KEY_ID, "
+                        "and private-key path.", method, path,
+                    )
                 resp.raise_for_status()
                 return resp.json()
 

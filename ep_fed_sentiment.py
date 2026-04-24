@@ -117,9 +117,16 @@ def _call_claude(text: str) -> Optional[float]:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
+        # Strip markdown code fences if present. Use regex so a single fence,
+        # double fence, or the common ```json form all parse. Prior split()
+        # approach broke on unbalanced fences and trailing whitespace.
+        import re as _re
+        _fence_match = _re.search(r"```(?:json)?\s*(.+?)\s*```", raw, _re.DOTALL)
+        if _fence_match:
+            raw = _fence_match.group(1).strip()
+        elif raw.startswith("```"):
+            # Fallback: unbalanced fence — take everything after the opener.
+            raw = raw.split("```", 1)[1]
             if raw.startswith("json"):
                 raw = raw[4:]
             raw = raw.strip()

@@ -129,6 +129,9 @@ class SignalMessage:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def is_expired(self) -> bool:
+        # age in microseconds; ttl_ms is milliseconds → * 1000 to match units.
+        # Variable kept as age_us (not renamed) for grep compatibility; math
+        # is unchanged.
         age_us = int(time.time() * 1_000_000) - self.ts_us
         return age_us > self.ttl_ms * 1_000
 
