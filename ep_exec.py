@@ -168,6 +168,14 @@ def _tiered_trailing_stop(base_ts: int, hours_remaining: float) -> int:
 KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS = int(os.getenv("KALSHI_NEAR_CERTAIN_THRESHOLD_CENTS", "8"))
 
 
+def _is_weather_ticker(ticker: str) -> bool:
+    # Weather markets (daily high/low temp, rain) resolve on a fixed observation
+    # at close_time. The signal thesis is a forecast gap — there's no intraday
+    # mean-reversion or momentum to harvest, so pre-expiry tranches, TP and
+    # trailing-stop all exit winners for no good reason. Hold to resolution.
+    return ticker.startswith(("KXHIGH", "KXLOW", "KXRAIN", "KXWEATHER"))
+
+
 async def _execute_btc(
     sig:      SignalMessage,
     size_str: str,
@@ -606,6 +614,7 @@ async def _process_signal(
         close_time   = sig.close_time or "",
         model_source = sig.model_source or "",
         confidence   = sig.confidence,
+        category     = sig.category or "",
         pending      = True,
     )
 
@@ -699,6 +708,7 @@ async def _process_signal(
                     close_time   = sig.close_time or "",
                     model_source = sig.model_source or "",
                     confidence   = sig.confidence,
+                    category     = sig.category or "",
                     pending      = False,
                 )
                 await positions.update_fields(_leg_ticker, {
@@ -815,6 +825,7 @@ async def _process_signal(
                     close_time   = ex_pos.get("close_time", ""),
                     model_source = ex_pos.get("model_source", ""),
                     confidence   = float(ex_pos.get("confidence", 0.0)),
+                    category     = ex_pos.get("category", "") or sig.category or "",
                     pending      = False,
                 )
                 await positions.update_fields(sig.ticker, {
@@ -991,6 +1002,7 @@ async def _process_signal(
                     close_time   = sig.close_time or "",
                     model_source = sig.model_source or "",
                     confidence   = sig.confidence,
+                    category     = sig.category or "",
                 )
                 await positions.update_fields(sig.arb_partner, {
                     "order_id":       partner_order_id,
@@ -1807,8 +1819,13 @@ async def _exit_checker(
                 # ── Pre-expiry two-tranche exit ───────────────────────────────
                 # Tranche 1 at 2× hours_before_close: exit half (protects gains early)
                 # Tranche 2 at 1× hours_before_close: exit remainder
+                # Weather markets are hold-to-resolution (fixed observation at
+                # close_time, no intraday thesis) — skip tranching for them.
                 tranche_done = pos.get("tranche_done", 0)
-                if close_time_str and not _near_certain_skip:
+                _weather = asset_class == "kalshi" and (
+                    pos.get("category") == "weather" or _is_weather_ticker(ticker)
+                )
+                if close_time_str and not _near_certain_skip and not _weather:
                     try:
                         close_dt = datetime.fromisoformat(
                             close_time_str.replace("Z", "+00:00")
@@ -1909,7 +1926,9 @@ async def _exit_checker(
                 )
 
                 # ── Trailing stop ─────────────────────────────────────────────
-                if exit_reason is None and not _is_arb_leg:
+                # Weather: a 3¢ pullback from HWM is noise on a 97¢ potential
+                # payout — don't harvest the small profit and forfeit the rest.
+                if exit_reason is None and not _is_arb_leg and not _weather:
                     trailing_stop_cents = _tiered_trailing_stop(trailing_stop_base, _hours_to_close)
                     if (hwm_pnl >= trailing_stop_cents
                             and (hwm_pnl - move_cents) >= trailing_stop_cents):
@@ -1985,8 +2004,12 @@ async def _exit_checker(
                     exit_reason = f"cut_loss_intel (signal_reversed, pnl={move_cents:+d}¢)"
 
                 # ── Take-profit / stop-loss (skipped for arb legs) ───────────
+                # Weather: skip TP only — harvesting a 5–8¢ gain on a hold-to-
+                # resolution bet gives up the 90¢+ payout. Stop-loss still runs
+                # (catastrophic-loss protection; cut_loss_intel already handled
+                # forecast reversals above).
                 _effective_tp = _tiered_take_profit(take_profit_cents, _hours_to_close)
-                if exit_reason is None and not _is_arb_leg and move_cents >= _effective_tp:
+                if exit_reason is None and not _is_arb_leg and not _weather and move_cents >= _effective_tp:
                     exit_reason = f"take_profit (+{move_cents}¢, tp={_effective_tp}¢)"
                 elif exit_reason is None and not _is_arb_leg and move_cents <= -stop_loss_cents:
                     # Suppress stop-loss within N days of resolution on Kalshi
@@ -3444,6 +3467,7 @@ async def exec_main() -> None:
                     close_time   = _pos.get("close_time", ""),
                     model_source = _pos.get("model_source", ""),
                     confidence   = float(_pos.get("confidence", 0.0)),
+                    category     = _pos.get("category", ""),
                     pending      = False,
                 )
             log.info("Startup: synced %d disk positions → Redis", len(executor._positions))
