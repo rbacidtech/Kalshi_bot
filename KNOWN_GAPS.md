@@ -1,6 +1,7 @@
 # EdgePulse — Known Gaps
 
 _As of 2026-04-24 02:10 UTC, following audit session._
+_Updated 2026-04-24 02:34 UTC — three fixes applied and verified._
 
 ## Silently broken — needs fix
 
@@ -8,14 +9,18 @@ _As of 2026-04-24 02:10 UTC, following audit session._
   Code deployed in ep_exec.py `_process_signal`. The
   `get_strategy_conf_mult()` function reads from `_strategy_conf_mult`
   dict which is populated by `kelly_calib_loop` → `_compute_calibration`.
-  `_compute_calibration` queries a `terminal_trades` table that does
-  not exist in Postgres. The asyncpg exception is caught silently
-  and `{}` is returned. Result: every signal gets multiplier 1.0
-  (no-op). Feature is cosmetic until fixed.
+  `_compute_calibration` queries the `terminal_trades` VIEW (exists).
+  First query (bucket Kelly) works. Second query (per-strategy mult)
+  fails with `column "model_source" does not exist` — the view has
+  `strategy`, not `model_source`. Also: `pnl_cents` → `realized_pnl_cents`,
+  `closed_at` → `exited_at`. Three column mismatches. Both queries share
+  one try/except so the second failure kills both. Result: every signal
+  gets multiplier 1.0 (no-op). Feature is cosmetic until fixed.
 
-  Fix: rewrite `_compute_calibration` to read from trades.csv
-  (same source as divergence monitor) OR join ep:executions entries
-  and exits from Postgres.
+  Fix: in the second query, rename `model_source`→`strategy`,
+  `pnl_cents`→`realized_pnl_cents`, `closed_at`→`exited_at`. Split
+  the two queries into separate try/except blocks so bucket calibration
+  survives a per-strategy query failure.
 
 ## Verified working
 
@@ -37,6 +42,23 @@ _As of 2026-04-24 02:10 UTC, following audit session._
 - **Item 7** — Election+Metaculus scanner wired. Same as item 3.
 - **Item 10** — Divergence monitor. First fire expected 02:48 UTC.
 
+## Fixes applied this session (2026-04-24)
+
+- **Fix 1** — Long-game cap fails closed on exception. `7d3a348`
+  ep_exec.py:568: `log.debug` + fall-through → `log.warning` +
+  `return _rejected("LONG_GAME_CAP_ERROR")`.
+
+- **Fix 2** — Tombstone and cut-loss keys preserved until action
+  succeeds. `d5059a8` ep_exec.py:1421,1450: delete moved to after
+  `cancel_and_tombstone` / `_cutloss_tickers.add`; per-ticker
+  try/except added; outer handlers promoted from `log.debug` to
+  `log.warning`.
+
+- **Fix 3** — Resolution write failures now visible. `cac2db5`
+  ep_exec.py:1298,1325,1348: three `except Exception: pass` blocks
+  replaced with `log.error(...)` including ticker context. No
+  control flow change.
+
 ## Infrastructure gaps (separate workstream)
 
 - No feature-health heartbeat — features can silently stop working
@@ -44,10 +66,10 @@ _As of 2026-04-24 02:10 UTC, following audit session._
   (dead for weeks) are examples. Proposed: per-feature
   `ep:feature_health:{name}` key updated on every successful
   iteration, plus a health checker that flags stale entries.
-- No `except Exception` hygiene sweep done — multiple try/except
-  blocks swallow errors silently. Needs `grep -rn "except Exception"
-  ep_*.py kalshi_bot/` audit with log lines added to each.
-- 30 commits ahead of origin/v2-single-box with no remote backup.
+- `except Exception` hygiene sweep partially done (3 critical-path
+  fixes above). ~280 remaining blocks in ep_*.py / kalshi_bot/
+  still unaudited.
+- 33 commits ahead of origin/v2-single-box with no remote backup.
   HTTPS credentials need resolving.
 - No automated test framework. Every new feature currently requires
   manual in-production verification.
