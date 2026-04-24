@@ -123,9 +123,16 @@ Note: FRED API requires the key as a URL query parameter — no header auth opti
 |----------|---------|-------|
 | `fomc_directional` | KXFED-* | FOMC probability fusion × regime adjustment |
 | `fomc_arb` | KXFED-* pairs | Monotonicity arbitrage (T2.75/T3.00/T3.25 YES) |
-| `fomc_butterfly_arb` | KXFED-* triplets | Convexity violation: P(A)+P(C)−2×P(B) < −0.04 |
+| `fomc_butterfly_arb` | KXFED-* triplets | Convexity violation: P(A)+P(C)−2×P(B) < −0.04 — **DISABLED** (invalid math for binary markets) |
 | `calendar_spread_arb` | KXFED-* same strike | Rate-path arb: NO if later_yes > earlier_yes + 0.10 |
 | `cross_series_coherence` | KXFED-* (45+ days out) | GDP-FOMC coherence: low GDPNow → YES on distant cut strikes |
+| `cross_meeting_coherence` | KXFED-* adjacent meetings | Bayesian path monotonicity check across adjacent meetings |
+| `unrate_fomc_coherence` | KXFED-* (90+ days out) | UNRATE ≥ 4.8% → implied cut premium on low-strike (≤3.75%) YES |
+| `cpi_fomc_coherence` | KXFED-* (90+ days out) | Core CPI ≥ 3.0% → sticky-rate premium on high-strike (≥4.00%) YES |
+| `calendar_decay` | Any open market | Time-premium capture: 92–98¢ near-certain markets with ≥14 days to close |
+| `earnings` | KXERN-* | ATM straddle (Yahoo Finance) → implied EPS sigma vs bracket strike |
+| `election` | election markets | Polymarket + PredictIt + Metaculus 3-source reweight (poly×0.35, pi×0.15, meta×0.50) |
+| `bls_preposition` | KXFED-* before BLS | Strangle entry 5 min before CPI/NFP release |
 | `crypto_price` | KXBTC-*, KXETH-* | Log-normal binary option pricing (Deribit DVOL) |
 | `gdp` | KXGDP-* | GDPNow vs. strike comparison |
 | `economic` | KXCPI-*, KXNFP-* | BLS data vs. strike; ADP leading indicator |

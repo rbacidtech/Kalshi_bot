@@ -34,6 +34,12 @@ ep:advisor:status         STRING   ep_advisor writes last advisor run snapshot (
 ep:advisor:spread_wide_since STRING ep_advisor      BTC cross-exchange spread timer
 ep:econ_release:status    STRING   ep_econ_release  next/last economic release metadata (TTL 24h)
 ep:resolutions            HASH     ep_resolution_db  per-series resolution history (last 10)
+ep:macro                  HASH     Intel writes      macro indicators snapshot (see below)
+ep:releases               HASH     Intel writes      latest BLS release values (set on release day only)
+ep:forced_cycle           STRING   Intel writes      "1" = skip next sleep, trigger immediate scan (TTL 120–300s)
+ep:vol_prev:{ticker}      STRING   Intel writes      FOMC-day KXFED volume snapshot for spike detection (TTL 600s)
+ep:divergence             HASH     Exec writes       edge-capture ratio from last 7-day completed trades (hourly)
+ep:kelly_calib:strategy   HASH     ep_kelly_calib    model_source → empirical confidence multiplier (TTL 48h)
 ```
 
 ### Consumer groups
@@ -280,6 +286,61 @@ HALT_TRADING     "1"          # emergency stop — both nodes check this
 EDGE_THRESHOLD   "0.12"       # override config.py value at runtime
 MAX_CONTRACTS    "3"          # temporary size reduction
 ```
+
+#### `ep:macro` (HASH — Intel writes every 120s)
+
+Key-value pairs (all string):
+
+```
+fed_rate           "4.25"       # current DFEDTARU (%)
+vix                "18.92"      # CBOE VIX
+dgs10              "4.3"        # 10Y Treasury yield (%)
+dgs2               "3.76"       # 2Y Treasury yield (%)
+yield_curve_spread "0.51"       # dgs10 - dgs2
+t10y2y             "0.51"       # FRED T10Y2Y
+core_cpi_yoy       "2.67"       # FRED CPILFESL YoY (%)
+pce_yoy            "2.80"       # FRED PCEPI YoY (%)
+icsa               "214000"     # Initial jobless claims
+t5yifr             "2.26"       # 5Y5Y forward inflation rate
+gdpnow             "2.3"        # Atlanta Fed GDPNow (%)
+move_index         "95.0"       # ICE MOVE bond vol index
+next_fomc_date     "2026-05-07" # next FOMC meeting date (ISO)
+ts                 "1745000000" # Unix timestamp of last refresh
+```
+
+#### `ep:releases` (HASH — Intel writes on BLS release day)
+
+Only populated during the 30-min window around a BLS release (8:28–8:58 ET):
+
+```
+CPI          "3.1"           # CPI value from BLS (%)
+CPI_period   "2026-03"       # period string from BLS response
+CPI_ts       "1745000000"    # Unix timestamp of detection
+NFP          "152000"        # Non-farm payrolls (thousands)
+NFP_period   "2026-03"
+NFP_ts       "1745000000"
+```
+
+#### `ep:divergence` (HASH — Exec writes hourly when ≥5 completed trades in 7d window)
+
+```
+realized_pnl_cents   "1450"    # sum of (exit - entry) * contracts - fee over window
+expected_pnl_cents   "2100"    # sum of (fair_value - entry) * contracts (positive-only)
+edge_capture_ratio   "0.6905"  # realized / expected; < 0.50 triggers Telegram alert
+n_completed          "23"      # completed round-trips counted in window
+window_days          "7"
+ts                   "1745000000"
+```
+
+#### `ep:kelly_calib:strategy` (HASH — ep_kelly_calib writes every 4h from Postgres)
+
+```
+fedwatch+tbill+wsj   "1.12"   # confidence multiplier (>1 = outperforms; <1 = underperforms)
+noaa_nws+open_meteo  "1.00"
+calendar_decay       "0.95"
+```
+
+Multiplied into `confidence` during Kelly sizing. Requires ≥10 terminal trades per `model_source` bucket.
 
 ---
 
