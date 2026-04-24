@@ -7,6 +7,7 @@ _Updated 2026-04-24 04:45 UTC — post-deploy observations added below._
 _Updated 2026-04-24 04:48 UTC — Item 11 (metrics port) fixed and verified._
 _Updated 2026-04-24 04:50 UTC — Item 9 (kelly_calib column mismatch) fixed and verified._
 _Updated 2026-04-24 04:55 UTC — Audit #5 (edge_threshold × 0.7 silent discount) resolved via Option A (drop multiplier, keep operator override at 0.41)._
+_Updated 2026-04-24 05:10 UTC — full second-round audit across advisor, arb engine, BTC strategy, and FOMC model. Findings recorded below under "Second-round audit"._
 
 ## Silently broken — needs fix
 
@@ -169,6 +170,135 @@ patched this session.
   is gone. If that discount turns out to have been load-bearing for
   profitability, restore it by lowering the override to the desired
   EV floor directly.
+
+## Second-round audit (2026-04-24 ~05:10 UTC)
+
+Deep audit of four modules not covered in the entry/exit pass:
+`ep_advisor.py` (meta-controller writing to ep:config), `ep_arb.py`
+(real-time Polymarket↔Kalshi arb, own systemd service), `ep_btc.py` +
+`ep_coinbase.py` (BTC mean-reversion on Coinbase Advanced Trade), and
+`kalshi_bot/models/fomc.py` (FOMC fair-value + confidence fusion).
+Performed by parallel Explore subagents; CRITICAL findings
+spot-verified against live code. Two subagent CRITICALs were false
+positives (marked "downgraded" below).
+
+### CRITICAL
+
+- **Arb #1 — `entry_cents` convention violation for NO legs.**
+  `ep_arb.py:457` stores raw `limit_cents` as `entry_cents`. For a NO
+  leg filled at 47¢, this writes `entry_cents=47` instead of the
+  required YES-equivalent of 53. Every exit P&L calc, trailing stop,
+  and stop-loss trigger on an arb NO leg operates on the wrong basis.
+  This is the exact invariant `ep_positions.py:60-66` warns about,
+  but the warning is only emitted for post-sync updates, not for arb
+  writes. **Fix:** `(100 - limit_cents) if side == "no" else limit_cents`
+  at the hset call site.
+
+- **Arb #2 — Position written to Redis before fill confirmation.**
+  `ep_arb.py:449-462` — on receiving an order_id back from Kalshi,
+  immediately `hset ep:positions` with no `fill_confirmed` flag and
+  no `pending=True`. If the limit order never fills, we have a
+  phantom position that `_exit_checker` treats as real. ep_exec.py
+  already uses the `fill_confirmed=False` → `_fill_poll_loop` pattern
+  for the same problem; arb diverged. **Fix:** add
+  `"fill_confirmed": False, "pending": True` to the dict at line
+  452-462 so fill_poll picks it up automatically.
+
+- **Arb #3 — Capital limits bypassed entirely.**
+  ep_arb.py never queries `total_exposure_cents` or compares against
+  `MAX_TOTAL_EXPOSURE` (80% of balance) or `MAX_LONG_PCT` /
+  `MAX_SHORT_PCT` (70% each). A surge of simultaneous divergence
+  events could place arbitrarily many leg pairs without hitting any
+  cap. Butterflies are dead (Item 1) so exposure is small in practice
+  today, but the gate is structurally absent. **Fix:** ~3 lines
+  using `bus.get_all_positions()` before each FIRE; skip the fire if
+  adding this pair's cost would exceed the cap.
+
+- **Advisor #1 — No per-cycle delta clamp on whitelisted keys.**
+  `ep_advisor.py:76-84` has absolute bounds per key (e.g.,
+  `llm_kelly_fraction ∈ [0.05, 0.35]`) which is good, but Claude
+  can legally jump from 0.05 → 0.35 in a single 30-min cycle. One
+  hallucinated or mis-reasoned adjustment = 7× Kelly change live.
+  **Fix:** add a `max_delta` field to each `_WHITELIST` entry;
+  reject in `_validate_adjustment` if `|new - current| > max_delta`.
+
+- **FOMC #1 — Confidence prior/new log prints same value twice.**
+  `kalshi_bot/models/fomc.py:2747-2756`. Line 2747 mutates
+  `confidence = max(confidence, sr3_mp.confidence)` before the
+  log.info at 2754-2756 reads `confidence` for both "prior" and
+  "new" arguments. Diagnostic only — cross-validation behavior is
+  real, just invisible in logs. **Fix:** `prior_conf = confidence`
+  saved before the `max(...)` assignment.
+
+### HIGH
+
+| # | File:Line | Issue | Fix idea |
+|---|-----------|-------|----------|
+| Adv #2 | ep_advisor.py:289-291 | Config writes don't use WATCH/MULTI; races with operator writes | Single-operator in practice, low urgency; add check-and-set if multi-operator adoption comes later |
+| Arb #4 | ep_arb.py:362-389 | `poly_ts`/`kalshi_ts` read but never compared to wall clock; stale prices can fire an arb after divergence closed | `if (now - pair.poly_ts) > MAX_AGE_MS: skip` |
+| Arb #5 | ep_arb.py:444-468 | Exception after order_id obtained but before Redis write → orphan on Kalshi | Try/except around hset with DELETE of order_id on failure |
+| Arb #6 | ep_arb.py:422 | `hexists` then `hset` is not atomic — race vs ep_exec writing to same ticker | Redis WATCH/MULTI or ep_exec's `_arb_legs_in_progress` set (the latter requires ep_arb to hit that code path) |
+| Arb #7 | ep_arb.py.__init__ | No startup reconciliation of arb-placed orders against Kalshi portfolio | Mirror exec's `_reconcile_orphan_orders` path on arb startup |
+| BTC #1 | ep_risk.py:118 | Hardcoded 0.6% fee in sizing; doesn't follow `COINBASE_TAKER_FEE` env var | Import the env var at top of ep_risk |
+| BTC #2 | ep_btc.py:615,669 | Confidence floor applied before vol multiplier; extreme-vol regime can produce conf < 0.10 | Move `max(0.10, ...)` to after the vol_mult multiplication |
+| BTC #4 | ep_btc.py:337,506 | Z-score period=20 (100 min) but docstring claims "1-hour lookback" — 40-min drift | Either change period to 12 or update docstring; threshold z=1.8 is calibrated to current behavior so a numeric change needs recalibration |
+| BTC #5 | ep_btc.py | `insufficient_data` vol regime gets mult=1.0 — noisy z from sparse buffer fires at full confidence | Return 0.5 for insufficient_data, or require `len(closes) >= 50` before first signal |
+| FOMC #3 | kalshi_bot/models/fomc.py:2759-2797 | No hard floor/ceiling on confidence before `MeetingProbs` write — can drift below 0.50 or above 0.99 | `confidence = max(0.50, min(0.99, confidence))` before line 2793 |
+
+### MEDIUM
+
+- **Adv #6** — `ep_advisor.py:267` hardcodes `recent_n=20`, `baseline_n=50` with no time-span sanity check. In a low-trade-cadence regime, "recent 20 trades" could span 10 days.
+- **Adv #7** — `ep_advisor.py:362-373` validates only the absolute value, not its magnitude relative to the current config value. Confidence-weighted delta constraint would catch large confidence-threshold-just-above-0.80 jumps.
+- **BTC #7** — `ep_exec.py:1944` logs `pnl_half` using `move_cents * half`, but if a second tranche fires soon the logged pnl becomes stale. Reporting-only.
+- **BTC #8** — `ep_btc.py:586,590` hardcoded funding-rate skip threshold (±0.0015) is 50–150% tighter than the adjustment thresholds (±0.0005 / ±0.0010). Creates a small skew at the boundary.
+- **FOMC #4** — `kalshi_bot/models/fomc.py:2920` staleness boundary at exactly 30 min gets penalized (age >= 1_800). Whether this is a bug depends on whether the 30-min threshold is meant to be inclusive.
+
+### LOW
+
+- **Adv #8** — `ep_advisor.py:287-291` calibration-skip reasons not logged; operator can't tell why `override_min_yes_entry_price` isn't being updated.
+- **Adv #5** — `ep_advisor.py:304` bytes/str fallback on hgetall keys is brittle. Normalize keys after read.
+- **BTC #9** — Deribit skew applied without a freshness check on the feed.
+- **FOMC #5** — `data_quality="fallback_only"` flag is set correctly but not enforced downstream (ep_exec doesn't check it). Could sneak a low-confidence FRED-only signal through.
+
+### Downgraded / false positives (do not re-report)
+
+- ~~**BTC #3** — claimed break-even stop broken for SHORT side.~~
+  Actually correct. `ep_exec.py:1980-1981`:
+  `side == "sell" and current_cents > be_cents → exit` fires when
+  a SHORT is losing. Symmetric with the BUY case. Not a bug.
+
+- ~~**FOMC #1 (regime HOLD sign error)**~~ Not actually a bug.
+  `kalshi_bot/models/fomc.py:319-322` leaves HOLD unchanged while
+  multiplying CUT by `easing_mult`, then renormalizes. Standard
+  Bayesian likelihood update; HOLD's share does decrease via the
+  renormalization. Subagent wanted a more aggressive HOLD discount,
+  which is a calibration choice, not a correctness bug.
+
+### Noteworthy discoveries
+
+- **Advisor CANNOT write `override_edge_threshold` or
+  `override_min_confidence`.** The `_WHITELIST` at
+  `ep_advisor.py:76-84` only permits: `llm_scale_factor`,
+  `llm_kelly_fraction`, `llm_rsi_oversold`, `llm_rsi_overbought`,
+  `llm_z_threshold`, `llm_max_contracts`, `HALT_TRADING`. So the
+  current `override_edge_threshold=0.41` came from the operator or
+  the dashboard, NOT the advisor. Today's tactical choice to keep
+  0.41 after Audit #5 is safe from advisor rewriting.
+
+- **Entire ep_arb.py lacks any fill-confirmation loop.** Unlike
+  ep_exec.py which has `_fill_poll_loop` running every 10s to
+  confirm/timeout resting orders, ep_arb.py fires and forgets.
+  Any unfilled arb order stays in Redis indefinitely (or until
+  the 4-hour timeout in ep_exec's poll, if that even runs on
+  ep_arb-written positions — needs verification).
+
+### Recommended patch order
+
+1. **Arb #1 + #2** (one commit) — live arb records recording P&L on wrong basis. Highest blast radius.
+2. **Arb #3** — capital cap. Prevents a pathological market state.
+3. **Advisor #1** — delta clamp. Cheap safety net against LLM weirdness.
+4. **FOMC #1** — one-line log fix.
+5. Rest of HIGH findings batched or individually.
 
 ## Infrastructure gaps (separate workstream)
 
