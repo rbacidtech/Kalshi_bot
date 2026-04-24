@@ -1295,8 +1295,9 @@ async def _sync_positions_with_kalshi(
             if _mkt.get("status") == "resolved":
                 _res_result = _mkt.get("result", "")   # "yes" or "no"
                 _exit_cents = 100 if _res_result == "yes" else 0
-        except Exception:
-            pass
+        except Exception as exc:
+            log.error("Position sync: failed to fetch resolution status for %s — "
+                      "exit record will not be written: %s", ticker, exc)
 
         if _exit_cents is not None:
             _res_side    = pos.get("side", "yes")
@@ -1322,8 +1323,9 @@ async def _sync_positions_with_kalshi(
                         "entered_at":         pos.get("entered_at"),
                         "exited_at":          datetime.now(timezone.utc).isoformat(),
                     })
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.error("Position sync: position_history write failed for %s "
+                              "(exec_id=%s): %s", ticker, _res_exec_id, exc)
             # CSV (for get_performance_summary / ep_resolution_db)
             try:
                 from kalshi_bot.strategy import Signal as _KSig
@@ -1345,8 +1347,9 @@ async def _sync_positions_with_kalshi(
                 executor._log_trade(_exit_sig, "exit",
                                     f"resolved_{_res_result}",
                                     "paper" if cfg.PAPER_TRADE else "live")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.error("Position sync: CSV exit log failed for %s resolved_%s: %s",
+                          ticker, _res_result, exc)
             log.warning(
                 "Position sync: %s resolved_%s → pnl=%+d¢  (logged to CSV/audit)",
                 ticker, _res_result, _res_pnl,
