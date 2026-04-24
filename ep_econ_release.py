@@ -333,6 +333,15 @@ class EconReleaseEngine:
         except Exception as exc:
             log.warning("econ: NO bracket failed for %s: %s", ticker, exc)
 
+        # Only track bracket if at least one leg actually placed. If both legs
+        # failed (Kalshi 409 / capacity / auth), storing an all-None bracket
+        # would leave an orphan entry that cancel_all_brackets can't act on.
+        if not bracket.yes_order_id and not bracket.no_order_id:
+            log.warning(
+                "econ: bracket abandoned for %s — both legs failed to place",
+                ticker,
+            )
+            return
         self._brackets[ticker] = bracket
 
     # ── Release data fetchers ─────────────────────────────────────────────────
@@ -561,6 +570,29 @@ class EconReleaseEngine:
         """Place an aggressive limit entry in the surprise direction."""
         if not self._client:
             return
+
+        # Respect operator's EV floor (override_edge_threshold in ep:config).
+        # The main intel pipeline applies this to every signal; momentum orders
+        # placed here bypass the pipeline, so we must apply it ourselves.
+        # Rough edge proxy: σ × 5¢ (calibrated to CPI where 1σ ≈ 5¢ move on
+        # nearest-strike markets). Conservative on purpose — an operator who
+        # tightens the EV floor for directional trades usually also wants
+        # event-driven momentum to slow down.
+        if self._redis is not None:
+            try:
+                _ov_raw = await self._redis.hget(EP_CONFIG, "override_edge_threshold")
+                if _ov_raw is not None:
+                    _ov = float(_ov_raw.decode() if isinstance(_ov_raw, bytes) else _ov_raw)
+                    _est_edge = sigma * 0.05
+                    if _est_edge < _ov:
+                        log.info(
+                            "econ: MOMENTUM skipped %s — est_edge≈%.3f (σ=%.1f) "
+                            "< override_edge_threshold=%.3f",
+                            release.kalshi_series, _est_edge, sigma, _ov,
+                        )
+                        return
+            except (ValueError, TypeError, AttributeError) as _ov_exc:
+                log.debug("econ: override_edge_threshold read skipped: %s", _ov_exc)
 
         market = await self._find_boundary_market(release.kalshi_series, release.consensus)
         if not market:
