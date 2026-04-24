@@ -1259,10 +1259,7 @@ async def _sync_positions_with_kalshi(
         r_qty    = int(existing.get("contracts", 0))
         r_side   = existing.get("side", "")
         r_entry  = int(existing.get("entry_cents", 0))
-
         r_cf     = int(existing.get("contracts_filled", 0))
-        if r_qty > 0 and r_side == k_side and r_qty == k_qty and abs(r_entry - k_entry) <= 2 and r_cf == k_qty:
-            continue  # already correct
 
         # Derive meeting from ticker so the concentration-limit gate counts
         # adopted positions. Kalshi's /portfolio/positions response does not
@@ -1270,6 +1267,22 @@ async def _sync_positions_with_kalshi(
         # KXFED/KXGDP/KXCPI/KXNFP series.
         k_meeting    = _meeting_from_ticker(ticker)
         k_close_time = mp.get("close_time") or mp.get("expiration_time") or ""
+
+        # "Already correct" check must include meeting/close_time — a prior-version
+        # sync may have written these as "" and those records silently bypass the
+        # meeting-concentration gate until backfilled. Continue only if every
+        # field matches; otherwise fall through to the update path below.
+        _fields_match = (
+            r_qty > 0
+            and r_side == k_side
+            and r_qty == k_qty
+            and abs(r_entry - k_entry) <= 2
+            and r_cf == k_qty
+            and (not k_meeting    or existing.get("meeting")    == k_meeting)
+            and (not k_close_time or existing.get("close_time") == k_close_time)
+        )
+        if _fields_match:
+            continue  # already correct
 
         if r_qty == 0:
             if existing:
