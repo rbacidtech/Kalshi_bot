@@ -2,6 +2,7 @@
 
 _As of 2026-04-24 02:10 UTC, following audit session._
 _Updated 2026-04-24 02:34 UTC — three fixes applied and verified._
+_Updated 2026-04-24 04:30 UTC — entry/exit strategy audit, four more fixes patched._
 
 ## Silently broken — needs fix
 
@@ -58,6 +59,67 @@ _Updated 2026-04-24 02:34 UTC — three fixes applied and verified._
   ep_exec.py:1298,1325,1348: three `except Exception: pass` blocks
   replaced with `log.error(...)` including ticker context. No
   control flow change.
+
+## Entry/exit strategy audit (2026-04-24 ~04:30 UTC)
+
+Full audit performed on entry gates (15 gates in `_process_signal`),
+exit logic (trailing stop, cut-loss, pre-expiry tranches, TIF ratchet),
+intel signal generation, and confidence scoring. Five findings; four
+patched this session.
+
+- **Fix 4 — `min_confidence` parameter was ignored in
+  `fetch_signals_async`.** `kalshi_bot/strategy.py:4007` hardcoded
+  `s.confidence >= 0.50` instead of using the parameter. The dashboard
+  `override_min_confidence` key in `ep:config` was cosmetic — any
+  signal with confidence ≥ 0.50 could trade regardless of the
+  operator-set minimum. `RiskManager.approve()` in `kalshi_bot/risk.py`
+  also has no confidence check, so there was no downstream fallback.
+  Replaced the literal with `min_confidence`.
+
+- **Fix 5 — Meeting-concentration gate silently skipped
+  Kalshi-reconciled positions.** `_sync_positions_with_kalshi` in
+  `ep_exec.py` called `positions.open(...)` without passing `meeting=`
+  or `close_time=`, so PositionStore defaulted them to `""`. The gate
+  at `ep_exec.py:320` does `if p.get("meeting") != sig.meeting:
+  continue`, treating empty strings as non-matching. Result: positions
+  adopted via the periodic sync (every 30 min) did not count toward
+  any meeting's cap. Live impact observed 2026-04-24: KXFED-27APR at
+  7 positions, KXFED-27JAN at 8 positions — both well past the
+  4-per-meeting limit. Added `_meeting_from_ticker()` helper (handles
+  KXFED, KXGDP, KXCPI, KXNFP, KXINFLATION prefixes) and plumbed
+  meeting plus close_time into both the add and update paths. Existing
+  empty-meeting records are backfilled on the next sync cycle.
+
+- **Fix 6 — Strategy calibration multiplier bypassed Kelly's
+  `max_contracts` cap.** `ep_exec.py:443-446` multiplied the
+  already-capped `contracts` by `get_strategy_conf_mult()` (up to
+  1.20×) and re-assigned without re-clamping. RiskManager's
+  `max_contracts=10` ceiling could be quietly exceeded (up to 12
+  contracts before the absolute 500 cap). Post-multiplier
+  `contracts = min(_post_mult, risk_engine._kalshi.cfg.max_contracts)`
+  added.
+
+- **Fix 7 — `NoneType.open_position` log noise at Exec startup.**
+  `kalshi_bot/executor.py:_load_paper_positions` always tried
+  `self.state.open_position(...)` even though Exec explicitly passes
+  `state=None` at `ep_exec.py:3319` (state lives in Redis, not a
+  WebSocket-backed BotState on Exec). Result: every startup logged 48
+  "State sync skipped" DEBUG lines for the real bug of calling
+  `.open_position` on None. Wrapped the sync loop in `if self.state
+  is not None:`. Cosmetic only (positions still load into
+  `self._positions` via `json.loads` above), but the blanket
+  try/except could have hidden a real bug.
+
+## Audit findings still unpatched
+
+- **Audit #5 — `edge_threshold * 0.7` multiplier across 9 scanner
+  filters is undocumented.** `kalshi_bot/strategy.py:3822, 3848, 3859,
+  3870, 3884, 3895, 3928, 3944, 3955` all compare
+  `fee_adjusted_edge >= edge_threshold * 0.7`. With
+  `override_edge_threshold=0.41` that means the effective filter is
+  28.7¢, not 41¢ as the dashboard suggests. Either rename the override
+  to reflect actual behavior or drop the 0.7 multiplier — decision
+  deferred pending discussion with operator about intended semantics.
 
 ## Infrastructure gaps (separate workstream)
 

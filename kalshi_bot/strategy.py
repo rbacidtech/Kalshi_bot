@@ -4003,8 +4003,8 @@ async def fetch_signals_async(
     except Exception as exc:
         log.warning("Earnings scan failed: %s", exc)
 
-    # Filter by min confidence
-    all_signals = [s for s in all_signals if s.confidence >= 0.50]
+    # Filter by min confidence (caller-supplied; override_min_confidence in ep:config)
+    all_signals = [s for s in all_signals if s.confidence >= min_confidence]
 
     # Sort by fee-adjusted edge × confidence
     all_signals.sort(key=lambda s: s.fee_adjusted_edge * s.confidence, reverse=True)

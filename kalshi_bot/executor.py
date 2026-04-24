@@ -507,21 +507,25 @@ class Executor:
                 self._positions = json.loads(self._positions_file.read_text())
                 if self._positions:
                     log.info("Loaded %d paper positions from disk", len(self._positions))
-                    # Sync loaded positions into BotState so dashboard shows them
-                    from .state import PositionState
-                    import datetime
-                    for _ticker, _pos in self._positions.items():
-                        try:
-                            self.state.open_position(PositionState(
-                                ticker      = _ticker,
-                                side        = _pos.get("side", "yes"),
-                                contracts   = int(_pos.get("contracts", 1)),
-                                entry_cents = int(_pos.get("entry_cents", 50)),
-                                entry_time  = datetime.datetime.now(datetime.timezone.utc),
-                                fair_value  = float(_pos.get("fair_value", 0.5)),
-                            ))
-                        except Exception as _e:
-                            log.debug("State sync skipped %s: %s", _ticker, _e)
+                    # Sync loaded positions into BotState so dashboard shows them.
+                    # Exec runs with state=None (state lives in Redis); skip the
+                    # sync entirely in that case rather than logging a NoneType
+                    # error per-ticker at every startup.
+                    if self.state is not None:
+                        from .state import PositionState
+                        import datetime
+                        for _ticker, _pos in self._positions.items():
+                            try:
+                                self.state.open_position(PositionState(
+                                    ticker      = _ticker,
+                                    side        = _pos.get("side", "yes"),
+                                    contracts   = int(_pos.get("contracts", 1)),
+                                    entry_cents = int(_pos.get("entry_cents", 50)),
+                                    entry_time  = datetime.datetime.now(datetime.timezone.utc),
+                                    fair_value  = float(_pos.get("fair_value", 0.5)),
+                                ))
+                            except Exception as _e:
+                                log.debug("State sync skipped %s: %s", _ticker, _e)
             elif not self.paper:
                 resp = self.client.get("/portfolio/positions")
                 for p in resp.get("market_positions", []):

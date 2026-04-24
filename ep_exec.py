@@ -440,12 +440,17 @@ async def _process_signal(
 
     # Apply per-strategy calibration multiplier from 90-day rolling win-rate analysis.
     # Strategies with win_rate > 65% → up to 1.20x; < 40% → down to 0.60x.
+    # Re-clamp to risk_engine's max_contracts so the multiplier can't push the
+    # order over the Kelly ceiling (e.g. 1.20× × max=10 → 12 would violate cap).
     if contracts > 0:
         _strat_mult = get_strategy_conf_mult(sig.model_source or "")
         if _strat_mult != 1.0:
-            contracts = max(1, int(contracts * _strat_mult))
-            log.debug("Strategy calib mult %.2f applied to %s → %d contracts",
-                      _strat_mult, sig.model_source, contracts)
+            _post_mult = max(1, int(contracts * _strat_mult))
+            _kelly_cap = risk_engine._kalshi.cfg.max_contracts \
+                if sig.asset_class == "kalshi" else _post_mult
+            contracts = min(_post_mult, _kelly_cap)
+            log.debug("Strategy calib mult %.2f applied to %s → %d contracts (cap=%d)",
+                      _strat_mult, sig.model_source, contracts, _kelly_cap)
 
     _ABSOLUTE_MAX_CONTRACTS = 500  # hard safety cap — prevents Kelly misconfiguration
     if contracts > _ABSOLUTE_MAX_CONTRACTS:
@@ -1156,6 +1161,21 @@ async def _signal_consumer(
             await bus.ack_signal(entry_id)
 
 
+def _meeting_from_ticker(ticker: str) -> str:
+    """
+    Derive the meeting/event tag from a Kalshi ticker for concentration-limit
+    bookkeeping. Returns "" for series without a meeting concept.
+
+    KXFED-27APR-T3.25  → KXFED-27APR
+    KXGDP-26APR30-T2.5 → KXGDP-26APR30
+    KXNBA-26-OKC       → ""   (no meeting concept; series bet)
+    """
+    if not ticker.startswith(("KXFED-", "KXGDP-", "KXCPI-", "KXNFP-", "KXINFLATION-")):
+        return ""
+    parts = ticker.rsplit("-T", 1)
+    return parts[0] if len(parts) > 1 else ""
+
+
 def _kalshi_entry_cents(mp: dict) -> int:
     """
     Compute entry_cents (= YES price at entry) from a Kalshi market_position dict.
@@ -1244,6 +1264,13 @@ async def _sync_positions_with_kalshi(
         if r_qty > 0 and r_side == k_side and r_qty == k_qty and abs(r_entry - k_entry) <= 2 and r_cf == k_qty:
             continue  # already correct
 
+        # Derive meeting from ticker so the concentration-limit gate counts
+        # adopted positions. Kalshi's /portfolio/positions response does not
+        # carry meeting or close_time, but the ticker encodes meeting for
+        # KXFED/KXGDP/KXCPI/KXNFP series.
+        k_meeting    = _meeting_from_ticker(ticker)
+        k_close_time = mp.get("close_time") or mp.get("expiration_time") or ""
+
         if r_qty == 0:
             if existing:
                 # contracts=0 tombstone in Redis — blocked from re-entry, skip.
@@ -1251,6 +1278,7 @@ async def _sync_positions_with_kalshi(
             # Genuinely missing from Redis — open fresh
             await positions.open(ticker=ticker, side=k_side, contracts=k_qty,
                                  entry_cents=k_entry, fair_value=k_entry / 100.0,
+                                 meeting=k_meeting, close_time=k_close_time,
                                  pending=False)
             await positions.update_fields(ticker, {
                 "fill_confirmed": True,
@@ -1268,6 +1296,13 @@ async def _sync_positions_with_kalshi(
                 patch["side"] = k_side
             if abs(r_entry - k_entry) > 2:
                 patch["entry_cents"] = k_entry
+            # Backfill meeting if the existing record has it empty (prior-version
+            # sync wrote meeting="" and those positions silently bypass the
+            # meeting-concentration gate).
+            if k_meeting and not existing.get("meeting"):
+                patch["meeting"] = k_meeting
+            if k_close_time and not existing.get("close_time"):
+                patch["close_time"] = k_close_time
             await positions.update_fields(ticker, patch)
             updated += 1
 

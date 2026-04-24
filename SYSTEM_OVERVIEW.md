@@ -233,7 +233,7 @@ Queries Kalshi `/markets?status=settled` hourly. Records outcomes in SQLite, fee
 
 **Signal generation:** For each KXFED ticker, computes `fair_value` = model probability that rate will be above the contract's threshold. If `fair_value - market_price > MIN_EDGE_GROSS (0.12)`, generates a YES signal; if `market_price - fair_value > 0.12`, generates a NO signal.
 
-**Concentration limit:** Max 4 positions per FOMC meeting date (`MAX_POSITIONS_PER_MEETING=4`). Once all 8 tracked meetings are full, all FOMC signals are rejected as `MEETING_CONCENTRATION`.
+**Concentration limit:** Max 4 positions per FOMC meeting date (`MAX_POSITIONS_PER_MEETING=4`). Once all 8 tracked meetings are full, all FOMC signals are rejected as `MEETING_CONCENTRATION`. The gate counts any position whose `meeting` field equals the signal's meeting, so positions reconciled from Kalshi (via `_sync_positions_with_kalshi`, every 30 min) must carry the derived meeting tag — `_meeting_from_ticker(ticker)` is applied there so adopted positions contribute to the cap.
 
 **Current model label:** `kalshi_implied+fred`
 
