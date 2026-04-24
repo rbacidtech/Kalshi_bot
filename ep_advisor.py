@@ -73,13 +73,19 @@ _DS_SOURCES: list = [
 
 # Whitelisted ep:config keys the advisor may auto-apply.
 # Value: (min, max) for numeric bounds, or None for special handling.
-_WHITELIST: Dict[str, Optional[Tuple[float, float]]] = {
-    "llm_scale_factor":   (0.10, 2.00),
-    "llm_kelly_fraction": (0.05, 0.35),
-    "llm_rsi_oversold":   (20.0, 45.0),
-    "llm_rsi_overbought": (55.0, 80.0),
-    "llm_z_threshold":    (0.50, 3.00),
-    "llm_max_contracts":  (1.0,  20.0),
+# (lo, hi, max_delta_per_cycle). max_delta caps how far Claude can move a
+# value in a single 30-min advisor cycle. Absolute bounds were present since
+# inception; the per-cycle cap was added 2026-04-24 after a CRITICAL audit
+# finding that a single hallucinated adjustment could swing any whitelisted
+# key across its full range (e.g., llm_kelly_fraction 0.05 → 0.35 = 7×
+# position sizing in one tick).
+_WHITELIST: Dict[str, Optional[Tuple[float, float, float]]] = {
+    "llm_scale_factor":   (0.10, 2.00, 0.30),
+    "llm_kelly_fraction": (0.05, 0.35, 0.05),
+    "llm_rsi_oversold":   (20.0, 45.0, 5.0),
+    "llm_rsi_overbought": (55.0, 80.0, 5.0),
+    "llm_z_threshold":    (0.50, 3.00, 0.50),
+    "llm_max_contracts":  (1.0,  20.0, 3.0),
     "HALT_TRADING":       None,   # special: "1" only, confidence ≥ 0.95
 }
 
@@ -340,10 +346,13 @@ def _check_escalation(ctx: Dict[str, Any]) -> list:
 
 # ── Auto-apply safety ─────────────────────────────────────────────────────────
 
-def _validate_adjustment(adj: dict) -> Optional[str]:
+def _validate_adjustment(adj: dict, current: Optional[dict] = None) -> Optional[str]:
     """
     Validate an adjustment dict from Claude.
     Returns an error string if invalid, or None if it passes all checks.
+
+    `current`: optional dict of current ep:config values (bytes or str).
+    When provided, enforces the per-cycle max_delta clamp.
     """
     key   = adj.get("key", "")
     value = str(adj.get("value", "")).strip()
@@ -368,9 +377,30 @@ def _validate_adjustment(adj: dict) -> Optional[str]:
             v = float(value)
         except (ValueError, TypeError):
             return f"value {value!r} is not numeric"
-        lo, hi = bounds
+        lo, hi, max_delta = bounds
         if not (lo <= v <= hi):
             return f"value {v} outside bounds [{lo}, {hi}]"
+
+        # Per-cycle delta clamp — prevents a single hallucinated adjustment from
+        # swinging a whitelisted key across its full range in one tick.
+        if current is not None:
+            cur_raw = current.get(key)
+            if cur_raw is None:
+                # Also try bytes key for dicts read from aioredis raw hgetall
+                cur_raw = current.get(key.encode()) if isinstance(current, dict) else None
+            if cur_raw is not None:
+                if isinstance(cur_raw, bytes):
+                    cur_raw = cur_raw.decode()
+                try:
+                    cur_v = float(cur_raw)
+                    delta = abs(v - cur_v)
+                    if delta > max_delta:
+                        return (
+                            f"delta {delta:.3f} (current={cur_v} → new={v}) "
+                            f"exceeds max_delta {max_delta} for one cycle"
+                        )
+                except (ValueError, TypeError):
+                    pass  # current value not numeric; skip delta check
 
     return None
 
@@ -513,7 +543,7 @@ async def run_once(
     # ── Auto-apply at most one whitelisted adjustment ─────────────────────────
     applied: Optional[dict] = None
     if adjustment and isinstance(adjustment, dict):
-        err = _validate_adjustment(adjustment)
+        err = _validate_adjustment(adjustment, ctx.get("current_config"))
         if err:
             print(f"[ep_advisor] Adjustment rejected: {err}", flush=True)
             await _emit_alert(

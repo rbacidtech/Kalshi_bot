@@ -2744,6 +2744,7 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
                         f"meeting={mk}",
                     ):
                         blended    = {k: v / _rb_total for k, v in reblended.items()}
+                        prior_conf = confidence
                         confidence = max(confidence, sr3_mp.confidence)
                         if "sofr_sr3" not in sources:
                             sources = sources + ["sofr_sr3"]
@@ -2751,8 +2752,8 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
                             "SOFR SR3 cross-validation applied for %s "
                             "(prior_conf=%.2f → new_conf=%.2f)",
                             mk,
+                            prior_conf,
                             confidence,
-                            max(confidence, sr3_mp.confidence),
                         )
 
             # ── Task 4: Confidence calibration based on macro regime quality ──

@@ -42,6 +42,11 @@ ARB_MIN_CENTS    = float(os.getenv("ARB_MIN_CENTS",     "2.0"))   # divergence t
 HOLD_MS          = int(os.getenv("ARB_HOLD_MS",         "500"))   # debounce ms above threshold
 COOLDOWN_S       = int(os.getenv("ARB_COOLDOWN_S",      "120"))   # per-ticker cooldown
 MAX_CONTRACTS    = int(os.getenv("ARB_MAX_CONTRACTS",   "3"))     # contracts per arb trade
+# Capital cap — skip firing when adding this trade's cost would push total
+# open exposure above this fraction of balance. Parallels ep_exec.py's
+# directional exposure gate; arbs were previously uncapped. Fail-open with
+# a warning if balance can't be read (preserves latency vs the arb opportunity).
+ARB_MAX_TOTAL_EXP_PCT = float(os.getenv("ARB_MAX_TOTAL_EXP_PCT", "0.80"))
 POLY_POLL_MS     = int(os.getenv("ARB_POLY_POLL_MS",    "300"))   # Polymarket poll interval (ms)
 KALSHI_POLL_MS   = int(os.getenv("ARB_KALSHI_POLL_MS",  "200"))   # Kalshi poll interval (ms)
 MAP_REFRESH_S    = int(os.getenv("ARB_MAP_REFRESH_S",   "1800"))  # market remap every 30 min
@@ -49,6 +54,7 @@ POLY_GAMMA_URL   = "https://gamma-api.polymarket.com"
 REDIS_URL        = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 EP_POSITIONS     = "ep:positions"
 EP_CONFIG        = "ep:config"
+EP_BALANCE       = "ep:balance"
 EP_ARB_STATUS    = "ep:arb:status"
 
 # Kalshi meeting code → Polymarket month string
@@ -426,6 +432,48 @@ class ArbEngine:
         except Exception:
             pass
 
+        # ── Capital cap ─────────────────────────────────────────────────────────
+        # Skip firing if total open Kalshi exposure + this trade's cost would
+        # exceed ARB_MAX_TOTAL_EXP_PCT of balance. Prior versions had no gate —
+        # a burst of arb fires could drain the account. Fail-open on balance
+        # read error (latency-sensitive — we'd rather trade than miss the window).
+        trade_cost_cents = MAX_CONTRACTS * limit_cents
+        if self._redis:
+            try:
+                _bals    = await self._redis.hgetall(EP_BALANCE)
+                _intel_v = None
+                for _k, _v in _bals.items():
+                    _ks = _k.decode() if isinstance(_k, bytes) else _k
+                    if "intel" in _ks.lower():
+                        _vs = _v.decode() if isinstance(_v, bytes) else _v
+                        _intel_v = json.loads(_vs)
+                        break
+                if _intel_v and _intel_v.get("balance_cents", 0) > 0:
+                    _bal = int(_intel_v["balance_cents"])
+                    _pos = await self._redis.hgetall(EP_POSITIONS)
+                    _exp = 0
+                    for _pk, _pv in _pos.items():
+                        try:
+                            _pvs = _pv.decode() if isinstance(_pv, bytes) else _pv
+                            _p   = json.loads(_pvs)
+                            if _p.get("user_bet"):
+                                continue
+                            _e  = int(_p.get("entry_cents", 50))
+                            _c  = int(_p.get("contracts_filled") or _p.get("contracts", 1))
+                            _exp += (100 - _e) * _c if _p.get("side") == "no" else _e * _c
+                        except Exception:
+                            continue
+                    if (_exp + trade_cost_cents) / _bal > ARB_MAX_TOTAL_EXP_PCT:
+                        log.info(
+                            "arb: CAP  %s  exposure %.0f¢ + %d¢ > %.0f%% × %d¢ — skip",
+                            ticker, _exp, trade_cost_cents,
+                            ARB_MAX_TOTAL_EXP_PCT * 100, _bal,
+                        )
+                        pair.cooldown_until = time.monotonic() + COOLDOWN_S
+                        return
+            except Exception as _cap_exc:
+                log.warning("arb: capital cap read error (firing anyway): %s", _cap_exc)
+
         self._stats["fired"] += 1
         t_fire = time.monotonic()
         payload = {
@@ -450,15 +498,36 @@ class ArbEngine:
                 self._stats["filled"] += 1
                 log.info("arb: FILL  %-38s  order_id=%s  %.0fms", ticker, order_id, elapsed)
                 if self._redis:
+                    # entry_cents convention: always the YES price (0-100) regardless
+                    # of side. For a NO leg filled at NO-price `limit_cents`, the
+                    # YES-equivalent is `100 - limit_cents`. Prior versions stored
+                    # the raw NO price, which inverted every downstream P&L and
+                    # exit-trigger calc for arb NO legs.
+                    entry_cents_yes = (100 - limit_cents) if side == "no" else limit_cents
+
+                    # Derive meeting from ticker so the concentration-limit gate in
+                    # ep_exec counts arb-placed positions (KXFED / KXGDP / etc.).
+                    meeting = ""
+                    if ticker.startswith(("KXFED-", "KXGDP-", "KXCPI-", "KXNFP-", "KXINFLATION-")):
+                        _parts = ticker.rsplit("-T", 1)
+                        meeting = _parts[0] if len(_parts) > 1 else ""
+
+                    # Write with fill_confirmed=False so ep_exec's _fill_poll_loop
+                    # picks up the resting order. Without this flag the position
+                    # stays as a phantom in Redis if the limit order never fills.
                     await self._redis.hset(EP_POSITIONS, ticker, json.dumps({
-                        "ticker":       ticker,
-                        "side":         side,
-                        "contracts":    MAX_CONTRACTS,
-                        "entry_cents":  limit_cents,
-                        "entered_at":   datetime.now(timezone.utc).isoformat(),
-                        "model_source": "arb_realtime",
-                        "strategy":     "poly_arb",
-                        "order_id":     order_id,
+                        "ticker":         ticker,
+                        "side":           side,
+                        "contracts":      MAX_CONTRACTS,
+                        "contracts_filled": 0,
+                        "entry_cents":    entry_cents_yes,
+                        "meeting":        meeting,
+                        "entered_at":     datetime.now(timezone.utc).isoformat(),
+                        "model_source":   "arb_realtime",
+                        "strategy":       "poly_arb",
+                        "order_id":       order_id,
+                        "fill_confirmed": False,
+                        "pending":        False,
                     }))
             else:
                 self._stats["rejected"] += 1
