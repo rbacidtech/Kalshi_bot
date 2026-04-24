@@ -2441,28 +2441,36 @@ async def intel_main() -> None:
                 log.debug("PredictIt divergence scanner skipped: %s", _pi_exc)
 
             # ── Improvement 8: BLS release pre-positioning ────────────────────
-            try:
-                from kalshi_bot.strategy import scan_bls_preposition
-                # Pass current_positions as a best-effort guard for open bls_preposition count.
-                # Encode existing bls_preposition positions as "bls_preposition:<ticker>" keys.
-                _bls_prices: dict = {
-                    m.get("ticker", ""): _market_mid(m) * 100
-                    for m in markets_cache
-                    if m.get("ticker", "")
-                }
-                for _pos_t, _pos_d in current_positions.items():
-                    if (_pos_d.get("strategy") == "bls_preposition"
-                            or "bls_preposition" in str(_pos_d.get("model_source", ""))):
-                        _bls_prices[f"bls_preposition:{_pos_t}"] = 1
-                _bls_sigs = scan_bls_preposition(markets_cache, _bls_prices)
-                for _bs in _bls_sigs:
-                    if _bs.ticker not in current_positions:
-                        await bus.publish_signal(_bs)
-                        metrics.signal_published(_bs.asset_class, _bs.strategy, _bs.side)
-                if _bls_sigs:
-                    log.info("BLS pre-position: %d strangle leg(s) published", len(_bls_sigs))
-            except Exception as _exc:
-                log.warning("bls_preposition scan failed: %s", _exc)
+            # Strangle strategy: enters BOTH YES and NO legs simultaneously
+            # on a FOMC ticker in the 5 min before a BLS release. Current
+            # implementation has no loser-exit mechanism despite the
+            # docstring's "exit loser within 60s of print" intent — so each
+            # strangle is structurally break-even minus 2× fees. Gated off
+            # by default until a post-release fast-loser-exit is implemented;
+            # enable via ENABLE_BLS_PREPOSITION=true.
+            if os.getenv("ENABLE_BLS_PREPOSITION", "false").lower() == "true":
+                try:
+                    from kalshi_bot.strategy import scan_bls_preposition
+                    # Pass current_positions as a best-effort guard for open bls_preposition count.
+                    # Encode existing bls_preposition positions as "bls_preposition:<ticker>" keys.
+                    _bls_prices: dict = {
+                        m.get("ticker", ""): _market_mid(m) * 100
+                        for m in markets_cache
+                        if m.get("ticker", "")
+                    }
+                    for _pos_t, _pos_d in current_positions.items():
+                        if (_pos_d.get("strategy") == "bls_preposition"
+                                or "bls_preposition" in str(_pos_d.get("model_source", ""))):
+                            _bls_prices[f"bls_preposition:{_pos_t}"] = 1
+                    _bls_sigs = scan_bls_preposition(markets_cache, _bls_prices)
+                    for _bs in _bls_sigs:
+                        if _bs.ticker not in current_positions:
+                            await bus.publish_signal(_bs)
+                            metrics.signal_published(_bs.asset_class, _bs.strategy, _bs.side)
+                    if _bls_sigs:
+                        log.info("BLS pre-position: %d strangle leg(s) published", len(_bls_sigs))
+                except Exception as _exc:
+                    log.warning("bls_preposition scan failed: %s", _exc)
 
             # ── BTC datasource pre-reads (cross-exchange gate + Deribit skew) ──
             _btc_spread_bps    = 0.0

@@ -1838,14 +1838,24 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
             else:
                 projected = latest_val
 
-            # Extract threshold from title (handles "above 3.5%" or "below 200k")
-            thresh_match = re.search(
-                r"(?:above|below|over|under|exceed|than|least|most)\s+(\d+\.?\d*)\s*[%k]?",
-                market.get("title", ""), re.IGNORECASE,
-            )
-            if not thresh_match:
-                continue
-            threshold = float(thresh_match.group(1))
+            # Extract threshold and direction from title. Previously captured
+            # only the number — so "below 3.0%" got treated identically to
+            # "above 3.0%", silently flipping the signal direction for
+            # below-framed markets. Match direction keywords explicitly and
+            # invert fair_yes downstream for below-type titles.
+            _title_raw = market.get("title", "") or ""
+            _above_rx = r"(?:above|over|exceed[s]?|greater than|more than|at least|at or above|higher than)\s+(\d+\.?\d*)\s*[%k]?"
+            _below_rx = r"(?:below|under|less than|fewer than|at most|at or below|lower than)\s+(\d+\.?\d*)\s*[%k]?"
+            _above_m = re.search(_above_rx, _title_raw, re.IGNORECASE)
+            _below_m = re.search(_below_rx, _title_raw, re.IGNORECASE)
+            if _above_m:
+                threshold = float(_above_m.group(1))
+                _title_direction = "above"
+            elif _below_m:
+                threshold = float(_below_m.group(1))
+                _title_direction = "below"
+            else:
+                continue   # ambiguous title — don't guess direction
 
             # PAYEMS: FRED values are in thousands of persons; titles typically
             # quote whole numbers like "above 200" meaning 200k jobs.
@@ -1857,7 +1867,11 @@ async def scan_economic_markets(markets: list[dict], fred_api_key: str, max_cont
             scale    = _ECON_SCALES.get(sid, _DEFAULT_SCALE)
             x        = (projected - threshold) / scale
             # Clip exponent to prevent overflow
-            fair_yes = 1.0 / (1.0 + _math.exp(-max(-20.0, min(20.0, x))))
+            _p_above = 1.0 / (1.0 + _math.exp(-max(-20.0, min(20.0, x))))
+            # For below-framed markets (YES iff series < threshold), fair_yes is
+            # the complement. Previously treated every title as an above market,
+            # flipping signals on below-type tickers.
+            fair_yes = _p_above if _title_direction == "above" else (1.0 - _p_above)
 
             # ── Distance-scaled confidence ────────────────────────────────────
             # Far from threshold → outcome nearly certain → high confidence
@@ -2311,6 +2325,21 @@ async def scan_sports_markets(markets: list[dict], max_contracts: int) -> list[S
                 continue
 
             title = market.get("title", "")
+
+            # ESPN's scoreboard API returns win probabilities for TONIGHT'S
+            # game, not season/championship odds. Tickers like
+            # "KXNBA-26-OKC" ("Will OKC win the 2026 Finals?") contain a
+            # team name that naively matches tonight's game odds, which
+            # would assign e.g. a 60% tonight-win-probability as the fair
+            # value for a 2026 championship bet (actual fair ~5-10%).
+            # Skip long-horizon / season / championship markets — the
+            # scanner only has signal on same-day games.
+            _t_lower = title.lower()
+            if any(k in _t_lower for k in (
+                "championship", "finals", "pennant", "conference",
+                "division", "season", "win the", "win it all",
+            )):
+                continue
 
             # Match market title to ESPN event
             best_match = None
