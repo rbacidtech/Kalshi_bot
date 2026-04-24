@@ -4,6 +4,7 @@ _As of 2026-04-24 02:10 UTC, following audit session._
 _Updated 2026-04-24 02:34 UTC — three fixes applied and verified._
 _Updated 2026-04-24 04:30 UTC — entry/exit strategy audit, four more fixes patched._
 _Updated 2026-04-24 04:45 UTC — post-deploy observations added below._
+_Updated 2026-04-24 04:48 UTC — Item 11 (metrics port) fixed and verified._
 
 ## Silently broken — needs fix
 
@@ -30,37 +31,17 @@ _Updated 2026-04-24 04:45 UTC — post-deploy observations added below._
   the two queries into separate try/except blocks so bucket calibration
   survives a per-strategy query failure.
 
-- **Item 11 — Metrics port 9091 double-bind on every restart.**
-  `.env` sets `METRICS_PORT=9091` which all services inherit as
-  `EnvironmentFile=/etc/edgepulse/edgepulse.env`. `ep_intel.py:1388`
-  and `ep_exec.py:3344` both call `metrics.start(port=METRICS_PORT)`
-  using that var. ep_intel's default is 9091; ep_exec's is 9092 but
-  the env var override hits both → both try 9091, intel wins (starts
-  first), exec's metrics server silently fails to bind at every
-  startup.
-
-  Live evidence (2026-04-24 04:38 UTC):
-  ```
-  [info] Metrics/health server listening on :9091   ← intel wins
-  [warning] Metrics server could not bind to port 9091
-      ([Errno 98] Address already in use) — metrics will be
-      unavailable this session but trading continues.   ← exec loses
-  ```
-  `ss -tlnp` confirms only PID 390147 (intel) holds 9091; nothing on
-  9092.
-
-  _Impact:_ Prometheus (on :9090) can scrape intel but never scrapes
-  exec — fills, risk-gate rejections, Kelly sizings, BTC P&L counters
-  are all missing from Grafana. Dashboard pages that draw from
-  `ep:metrics` Redis keys still work (metrics.py writes both HTTP and
-  Redis). Fill volume for the ~7-day Prometheus retention window is
-  lost unless backfilled from CSV/Postgres.
-
-  Fix options: either remove `METRICS_PORT=9091` from `.env` (let each
-  service use its own default — 9091 intel / 9092 exec) OR set
-  per-service `Environment=METRICS_PORT=909X` overrides in each
-  systemd unit file. Former is cleaner; the env var existed because
-  at some earlier point only one service had metrics.
+- ~~**Item 11 — Metrics port 9091 double-bind on every restart.**~~
+  **FIXED 2026-04-24 04:48 UTC.** `METRICS_PORT=9091` commented out
+  in both `/root/EdgePulse/.env` and `/etc/edgepulse/edgepulse.env`
+  with an inline warning pointing here. Each service now uses its
+  own default (intel 9091 / exec 9092). Post-restart verified:
+  `ss -tlnp` shows both ports bound, `curl
+  http://127.0.0.1:9092/metrics` returns 6437 bytes. Prometheus
+  already has scrape targets for both ports, so exec metrics start
+  flowing immediately. **Note:** this fix lives in `.env` which is
+  gitignored — if `.env` is ever rebuilt from scratch (eg setup
+  script), make sure `METRICS_PORT` stays commented out.
 
 ## Not a gap (documented to avoid re-reporting)
 
