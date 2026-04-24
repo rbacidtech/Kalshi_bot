@@ -566,7 +566,9 @@ async def _process_signal(
                         contracts = _lg_max
                         _sig_cost = _unit * contracts
         except Exception as _lg_exc:
-            log.debug("Long-game cap check failed for %s: %s", sig.ticker, _lg_exc)
+            log.warning("Long-game cap check failed for %s — rejecting (fail-closed): %s",
+                        sig.ticker, _lg_exc)
+            return _rejected("LONG_GAME_CAP_ERROR")
 
     # ── Risk approval ─────────────────────────────────────────────────────────
     try:
