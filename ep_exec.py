@@ -2363,13 +2363,20 @@ return cnt
                             side_for_offer = pos.get("side", "yes")
                             _offer = (current_cents if side_for_offer == "yes"
                                       else (100 - current_cents))
+                            # Don't reset exit_cancel_count here — this path re-runs every
+                            # cycle an exit_reason fires, and resetting would nuke the
+                            # accumulated count so _EXIT_CANCEL_RETRY_CAP never trips.
+                            # On illiquid markets that produced a 2-min cancel/retry loop
+                            # for hours until noticed. positions.close() wipes the whole
+                            # hash entry on resolution, so there's no stale counter risk.
+                            # exit_widen_count IS reset — widen is per-order state and a
+                            # new order correctly starts from the fresh mid.
                             await positions.update_fields(ticker, {
                                 "exit_order_id":        _exit_order_id,
                                 "exit_order_placed_at": datetime.now(timezone.utc).isoformat(),
                                 "exit_offer_cents":     _offer,
                                 "exit_reason":          exit_reason,
                                 "exit_widen_count":     0,
-                                "exit_cancel_count":    0,
                                 "exit_retry_after_ts":  0,
                                 "exit_order_contracts": 0,   # 0 = full exit (not a tranche)
                             })
