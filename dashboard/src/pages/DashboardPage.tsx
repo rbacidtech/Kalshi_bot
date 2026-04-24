@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -7,7 +7,7 @@ import {
 } from 'recharts'
 import {
   TrendingUp, TrendingDown, Activity, RefreshCw,
-  Bitcoin, DollarSign, Layers, Zap, X,
+  Bitcoin, DollarSign, Layers, Zap, X, Trash2,
 } from 'lucide-react'
 import { positions, performance, controls } from '../lib/api'
 import { useAuth } from '../lib/auth'
@@ -280,8 +280,15 @@ function DetailRow({ label, children }: { label: string; children: React.ReactNo
   )
 }
 
-function PositionDetailPanel({ pos, onClose }: { pos: Position; onClose: () => void }) {
+function PositionDetailPanel({ pos, onClose, onForceClose, isClosing }: {
+  pos: Position
+  onClose: () => void
+  onForceClose: (ticker: string) => void
+  isClosing: boolean
+}) {
   const pnl = fmtPnl(pos.unrealized_pnl_cents)
+  const [confirmClose, setConfirmClose] = useState(false)
+
   return (
     <>
       <div
@@ -333,6 +340,14 @@ function PositionDetailPanel({ pos, onClose }: { pos: Position; onClose: () => v
             }
           </DetailRow>
 
+          <DetailRow label="Edge at entry">
+            <span className="tabular-nums">
+              {pos.fair_value != null
+                ? `${Math.round(Math.abs(pos.fair_value * 100 - pos.entry_cents))}¢`
+                : '—'}
+            </span>
+          </DetailRow>
+
           <DetailRow label="Model source">
             <span className="font-mono text-slate-300">{pos.model_source ?? '—'}</span>
           </DetailRow>
@@ -371,6 +386,41 @@ function PositionDetailPanel({ pos, onClose }: { pos: Position; onClose: () => v
             </span>
           </DetailRow>
         </div>
+
+        {/* Force close */}
+        <div className="mt-6 pt-4 border-t border-border/40">
+          {!confirmClose ? (
+            <button
+              onClick={() => setConfirmClose(true)}
+              className="w-full flex items-center justify-center gap-2 py-2 px-4 rounded-xl text-sm font-semibold
+                         text-rose-300 border border-rose-500/30 bg-rose-500/8 hover:bg-rose-500/15 transition-colors"
+            >
+              <Trash2 size={14} />
+              Remove from Redis
+            </button>
+          ) : (
+            <div className="space-y-2">
+              <p className="text-xs text-amber-300 text-center">
+                This removes the Redis record only — it does NOT cancel any live Kalshi order.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setConfirmClose(false)}
+                  className="flex-1 py-2 rounded-xl text-xs font-semibold text-slate-400 border border-border hover:bg-surface-2 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => onForceClose(pos.ticker)}
+                  disabled={isClosing}
+                  className="flex-1 py-2 rounded-xl text-xs font-semibold text-white bg-rose-500/80 hover:bg-rose-500 disabled:opacity-50 transition-colors"
+                >
+                  {isClosing ? 'Removing…' : 'Confirm Remove'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </>
   )
@@ -392,6 +442,16 @@ export default function DashboardPage() {
   const [posFilter, setPosFilter] = useState<PosFilter>('all')
   const [posSort,   setPosSort]   = useState<PosSort>('default')
   const seenEventIds = useRef<Set<string>>(new Set())
+
+  const closeMut = useMutation({
+    mutationFn: (ticker: string) => positions.forceClose(ticker),
+    onSuccess: (_data, ticker) => {
+      queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+      toast(`${ticker} removed from Redis`, 'success', 5000)
+      setSelectedPos(null)
+    },
+    onError: () => toast('Failed to remove position', 'error', 5000),
+  })
 
   const { data, isLoading, isError } = useQuery<PortfolioResponse>({
     queryKey: ['portfolio'],
@@ -857,9 +917,9 @@ export default function DashboardPage() {
                   {filteredPositions.map((pos, idx) => {
                     const cost    = computeCost(pos)
                     const pnl     = fmtPnl(pos.unrealized_pnl_cents)
-                    const avgHoldH = perfData?.avg_hold_time_hours ?? 0
+                    const avgHoldH = perfData?.avg_hold_time_hours ?? null
                     const ageHours = pos.entered_at ? (Date.now() - new Date(pos.entered_at).getTime()) / 3_600_000 : 0
-                    const isAging  = avgHoldH > 0 && ageHours > 2 * avgHoldH
+                    const isAging  = ageHours > (avgHoldH != null && avgHoldH > 0 ? 2 * avgHoldH : 48)
                     return (
                       <div
                         key={`${pos.ticker}-${idx}`}
@@ -924,11 +984,11 @@ export default function DashboardPage() {
                         const cost = computeCost(pos)
                         const pnl  = fmtPnl(pos.unrealized_pnl_cents)
                         const rowAccent = pos.side === 'yes' ? 'border-l-2 border-l-blue-500/60' : 'border-l-2 border-l-cyan-500/60'
-                        const avgHoldH = perfData?.avg_hold_time_hours ?? 0
+                        const avgHoldH = perfData?.avg_hold_time_hours ?? null
                         const ageHours = pos.entered_at
                           ? (Date.now() - new Date(pos.entered_at).getTime()) / 3_600_000
                           : 0
-                        const isAging = avgHoldH > 0 && ageHours > 2 * avgHoldH
+                        const isAging = ageHours > (avgHoldH != null && avgHoldH > 0 ? 2 * avgHoldH : 48)
                         return (
                           <tr
                             key={`${pos.ticker}-${idx}`}
@@ -1010,7 +1070,12 @@ export default function DashboardPage() {
 
       {/* ── Position Detail Drawer ────────────────────────────────────────── */}
       {selectedPos !== null && (
-        <PositionDetailPanel pos={selectedPos} onClose={() => setSelectedPos(null)} />
+        <PositionDetailPanel
+          pos={selectedPos}
+          onClose={() => setSelectedPos(null)}
+          onForceClose={ticker => closeMut.mutate(ticker)}
+          isClosing={closeMut.isPending}
+        />
       )}
     </div>
   )

@@ -53,6 +53,7 @@ export const positions = {
   prices:           () => api.get('/positions/prices'),
   balance:          () => api.get('/positions/balance'),
   coinbaseBalance:  () => api.get('/positions/coinbase'),
+  forceClose:       (ticker: string) => api.delete(`/positions/${encodeURIComponent(ticker)}`),
 }
 
 export const keys = {
@@ -69,8 +70,10 @@ export const subscriptions = {
 }
 
 export const performance = {
-  summary: (days: number) => api.get('/performance', { params: { days } }),
-  history: (hours = 24)   => api.get('/performance/history', { params: { hours } }),
+  summary:     (days: number) => api.get('/performance', { params: { days } }),
+  history:     (hours = 24)   => api.get('/performance/history', { params: { hours } }),
+  equityCurve: (days = 90)    => api.get('/performance/equity-curve', { params: { days } }),
+  trades:      (days = 30, limit = 200) => api.get('/performance/trades', { params: { days, limit } }),
 }
 
 export const controls = {
@@ -83,6 +86,8 @@ export const controls = {
   halt:        () => api.post('/controls/halt'),
   resume:      () => api.post('/controls/resume'),
   haltStatus:  () => api.get('/controls/halt-status'),
+  logs:        (lines = 100, service = 'exec') => api.get('/controls/logs', { params: { lines, service } }),
+  testAlert:   () => api.post('/controls/test-alert'),
 }
 
 export const advisor = {

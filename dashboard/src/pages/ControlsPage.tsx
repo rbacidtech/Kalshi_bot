@@ -4,6 +4,7 @@ import { controls, performance as perfApi } from '../lib/api'
 import {
   Save, RotateCcw, Activity, Wifi, CheckCircle2, AlertTriangle,
   SlidersHorizontal, Cpu, Zap, Bot, ChevronRight, XCircle,
+  Terminal, Bell, ChevronDown, ChevronUp,
 } from 'lucide-react'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -278,6 +279,136 @@ function SourceChip({ name, src }: { name: string; src: SourceHealth }) {
   )
 }
 
+// ── Log Tail Panel ────────────────────────────────────────────────────────────
+
+function LogTailPanel() {
+  const [open,    setOpen]    = useState(false)
+  const [service, setService] = useState('exec')
+  const logRef = useRef<HTMLDivElement>(null)
+
+  const { data, isFetching, refetch } = useQuery<{ lines: string[]; available: boolean; path?: string }>({
+    queryKey: ['logs', service],
+    queryFn: () => controls.logs(120, service).then(r => r.data),
+    enabled: open,
+    staleTime: 10_000,
+  })
+
+  useEffect(() => {
+    if (open && logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight
+    }
+  }, [data, open])
+
+  const SERVICES = ['exec', 'intel', 'advisor', 'dashboard', 'edgepulse']
+
+  return (
+    <div className="rounded-xl border border-border bg-surface-2 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-4 py-3 text-left"
+      >
+        <span className="flex items-center gap-2 text-xs font-semibold text-slate-400">
+          <Terminal size={13} className="text-slate-500" />
+          Log Tail
+        </span>
+        {open ? <ChevronUp size={14} className="text-slate-500" /> : <ChevronDown size={14} className="text-slate-500" />}
+      </button>
+
+      {open && (
+        <div className="border-t border-border/50 px-4 pb-4 space-y-3">
+          <div className="flex items-center gap-2 pt-3">
+            <div className="flex gap-1">
+              {SERVICES.map(s => (
+                <button
+                  key={s}
+                  onClick={() => setService(s)}
+                  className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold transition-all ${
+                    service === s
+                      ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                      : 'text-slate-500 border border-transparent hover:text-slate-300'
+                  }`}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => refetch()}
+              disabled={isFetching}
+              className="ml-auto text-[10px] text-slate-500 hover:text-slate-300 transition-colors px-2 py-1 rounded border border-border"
+            >
+              {isFetching ? 'Loading…' : 'Refresh'}
+            </button>
+          </div>
+
+          {data && !data.available ? (
+            <p className="text-xs text-slate-600 text-center py-4">Log file not available</p>
+          ) : (
+            <div
+              ref={logRef}
+              className="bg-black/60 rounded-lg p-3 h-64 overflow-y-auto font-mono text-[10px] leading-relaxed text-slate-400 space-y-0"
+            >
+              {(data?.lines ?? []).map((line, i) => {
+                const isError   = /error|ERROR|CRITICAL|critical/i.test(line)
+                const isWarning = /warn|WARNING/i.test(line)
+                return (
+                  <div
+                    key={i}
+                    className={`whitespace-pre-wrap break-all ${
+                      isError ? 'text-rose-400' : isWarning ? 'text-amber-400' : ''
+                    }`}
+                  >
+                    {line}
+                  </div>
+                )
+              })}
+              {!data && <div className="text-slate-600">Click Refresh to load logs</div>}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Test Alert Button ────────────────────────────────────────────────────────
+
+function TestAlertButton() {
+  const [result, setResult] = useState<{ ok: boolean; message?: string } | null>(null)
+  const mut = useMutation({
+    mutationFn: () => controls.testAlert().then(r => r.data),
+    onSuccess: (data) => setResult(data),
+    onError: () => setResult({ ok: false, message: 'Request failed' }),
+  })
+
+  return (
+    <div className="rounded-xl border border-border bg-surface-2 p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="flex items-center gap-2 text-xs font-semibold text-slate-400">
+          <Bell size={13} className="text-slate-500" />
+          Test Alert Channel
+        </span>
+        <button
+          type="button"
+          onClick={() => { setResult(null); mut.mutate() }}
+          disabled={mut.isPending}
+          className="text-xs px-3 py-1.5 rounded-lg border border-border bg-surface-3 text-slate-300
+                     hover:bg-surface-2 hover:text-white disabled:opacity-40 transition-colors"
+        >
+          {mut.isPending ? 'Sending…' : 'Send Test'}
+        </button>
+      </div>
+      {result && (
+        <p className={`text-xs ${result.ok ? 'text-emerald-400' : 'text-rose-400'}`}>
+          {result.ok ? '✓ Test message sent via Telegram' : `✗ ${result.message ?? 'Failed'}`}
+        </p>
+      )}
+      <p className="text-[10px] text-slate-600">Requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHANNEL_ID in .env</p>
+    </div>
+  )
+}
+
 // ── Status Tab ────────────────────────────────────────────────────────────────
 
 function StatusTab({ status, onHalt, onResume }: {
@@ -441,6 +572,12 @@ function StatusTab({ status, onHalt, onResume }: {
           </ul>
         </div>
       )}
+
+      {/* ── Log tail ─────────────────────────────────────────────────────────── */}
+      <LogTailPanel />
+
+      {/* ── Test alert ───────────────────────────────────────────────────────── */}
+      <TestAlertButton />
     </div>
   )
 }

@@ -2,14 +2,14 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   TrendingUp, TrendingDown, BarChart2, Clock,
-  Percent, Award, AlertTriangle, Inbox, Flame,
+  Percent, Award, AlertTriangle, Inbox, Flame, List,
 } from 'lucide-react'
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, ReferenceLine,
   BarChart, Bar, Cell, LabelList,
 } from 'recharts'
-import { api, controls } from '../lib/api'
+import { api, controls, performance as perfApi } from '../lib/api'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -35,6 +35,24 @@ interface PerformanceSummary {
 }
 
 type Period = 7 | 30 | 90
+type View   = 'analytics' | 'trades'
+
+interface TradeEntry {
+  timestamp:    string
+  ticker:       string
+  meeting:      string
+  outcome:      string
+  side:         string
+  action:       string
+  contracts:    number
+  price_cents:  number
+  fair_value:   number
+  edge:         number
+  confidence:   number
+  model_source: string
+  order_id:     string
+  mode:         string
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -254,10 +272,98 @@ function PeriodSelector({ value, onChange }: { value: Period; onChange: (p: Peri
   )
 }
 
+// ── Trade Log ─────────────────────────────────────────────────────────────────
+
+function TradeLog({ days }: { days: Period }) {
+  const { data, isLoading } = useQuery<TradeEntry[]>({
+    queryKey: ['trades', days],
+    queryFn:  () => perfApi.trades(days, 500).then(r => r.data),
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  })
+
+  if (isLoading) return (
+    <div className="space-y-2 mt-4">
+      {[0,1,2,3,4].map(i => (
+        <div key={i} className="h-10 rounded-lg bg-surface-2 animate-pulse" />
+      ))}
+    </div>
+  )
+
+  if (!data?.length) return (
+    <div className="py-20 flex flex-col items-center gap-3 text-slate-500">
+      <Inbox size={36} strokeWidth={1.2} />
+      <p className="text-sm">No trades in the last {days} days</p>
+    </div>
+  )
+
+  return (
+    <div className="overflow-x-auto -mx-4 px-4">
+      <table className="w-full text-xs min-w-[800px]">
+        <thead>
+          <tr className="border-b border-border text-left">
+            {['Time', 'Ticker', 'Action', 'Side', 'Qty', 'Price', 'FV', 'Edge', 'Conf', 'Model', 'Mode'].map(col => (
+              <th key={col} className="pb-2 pr-3 font-medium text-slate-500 whitespace-nowrap last:pr-0">{col}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border/40">
+          {data.map((t, i) => {
+            const ts     = new Date(t.timestamp)
+            const isEntry = t.action === 'entry'
+            const isPaper = t.mode === 'paper'
+            return (
+              <tr key={i} className="hover:bg-surface-2/40 transition-colors">
+                <td className="py-2 pr-3 text-slate-500 whitespace-nowrap tabular-nums">
+                  {ts.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })}
+                  {' '}
+                  <span className="text-slate-600">
+                    {ts.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC', hour12: false })}
+                  </span>
+                </td>
+                <td className="py-2 pr-3">
+                  <span className="font-mono text-slate-200 text-[11px]">{t.ticker}</span>
+                </td>
+                <td className="py-2 pr-3">
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border ${
+                    isEntry
+                      ? 'bg-blue-500/10 text-blue-300 border-blue-500/20'
+                      : 'bg-slate-500/10 text-slate-400 border-slate-500/20'
+                  }`}>{t.action}</span>
+                </td>
+                <td className="py-2 pr-3">
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                    t.side === 'yes' ? 'text-blue-300' : 'text-cyan-300'
+                  }`}>{t.side.toUpperCase()}</span>
+                </td>
+                <td className="py-2 pr-3 tabular-nums text-slate-300">{t.contracts}</td>
+                <td className="py-2 pr-3 tabular-nums text-slate-300">{t.price_cents}¢</td>
+                <td className="py-2 pr-3 tabular-nums text-slate-400">{Math.round(t.fair_value * 100)}¢</td>
+                <td className="py-2 pr-3 tabular-nums text-emerald-400">{(t.edge * 100).toFixed(0)}¢</td>
+                <td className="py-2 pr-3 tabular-nums text-slate-400">{(t.confidence * 100).toFixed(0)}%</td>
+                <td className="py-2 pr-3 text-slate-500 font-mono text-[10px] max-w-[120px] truncate">{t.model_source}</td>
+                <td className="py-2">
+                  {isPaper && (
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                      paper
+                    </span>
+                  )}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+      <p className="text-[10px] text-slate-600 mt-3 text-right">{data.length} entries · last {days}d</p>
+    </div>
+  )
+}
+
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 export default function PerformancePage() {
   const [days, setDays] = useState<Period>(30)
+  const [view, setView] = useState<View>('analytics')
 
   const { data, isLoading, isError } = useQuery<PerformanceSummary>({
     queryKey: ['performance', days],
@@ -294,13 +400,50 @@ export default function PerformancePage() {
     <div className="space-y-5">
 
       {/* ── Page Header ───────────────────────────────────────────────────── */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-lg font-bold text-white">Performance Analytics</h1>
           <p className="text-xs text-slate-500 mt-0.5">Closed trade statistics</p>
         </div>
-        <PeriodSelector value={days} onChange={setDays} />
+        <div className="flex items-center gap-2">
+          {/* View toggle */}
+          <div className="flex items-center gap-1 bg-surface-2 border border-border rounded-full p-0.5">
+            <button
+              onClick={() => setView('analytics')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all duration-150 ${
+                view === 'analytics'
+                  ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <BarChart2 size={12} />
+              Analytics
+            </button>
+            <button
+              onClick={() => setView('trades')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all duration-150 ${
+                view === 'trades'
+                  ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <List size={12} />
+              Trade Log
+            </button>
+          </div>
+          <PeriodSelector value={days} onChange={setDays} />
+        </div>
       </div>
+
+      {/* ── Trade Log view ───────────────────────────────────────────────── */}
+      {view === 'trades' && (
+        <div className="card border-t-2 border-blue-500/30 ring-1 ring-border/40">
+          <h2 className="text-base font-semibold text-slate-300 mb-4">Trade Log · last {days}d</h2>
+          <TradeLog days={days} />
+        </div>
+      )}
+
+      {view === 'analytics' && <>
 
       {/* ── Session P&L Banner ────────────────────────────────────────────── */}
       {botStatus?.session_pnl != null && (
@@ -670,6 +813,8 @@ export default function PerformancePage() {
           </div>
         )
       })()}
+
+      </> /* end view === 'analytics' */}
     </div>
   )
 }

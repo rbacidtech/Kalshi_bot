@@ -207,6 +207,30 @@ async def get_balance(
         await r.aclose()
 
 
+@router.delete("/{ticker}", status_code=204)
+@limiter.limit("10/minute")
+async def force_close_position(
+    ticker: str,
+    request: Request,
+    current_user: User = Depends(require_admin),
+) -> None:
+    """
+    Force-remove a position record from Redis.
+    WARNING: does NOT cancel any live Kalshi order — use only for record cleanup.
+    Admin-only, audit-logged.
+    """
+    r = await _get_redis()
+    try:
+        pos_key = "ep:positions"
+        deleted = await r.hdel(pos_key, ticker)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Position {ticker} not found")
+        await record(str(current_user.id), "position_force_close", {"ticker": ticker})
+        logger.warning("FORCE CLOSE: %s removed from Redis by %s", ticker, current_user.email)
+    finally:
+        await r.aclose()
+
+
 def _cb_b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
 import json
+import os
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, text
@@ -105,6 +108,59 @@ async def get_pnl_history(
         return list(buckets.values())
     except Exception:
         return []
+
+
+@router.get("/trades", summary="Recent trades from trades.csv log")
+async def get_trades(
+    limit: int = Query(200, ge=1, le=1000),
+    days: int  = Query(30,  ge=1, le=90),
+    _user=Depends(require_auth),
+) -> list[dict[str, Any]]:
+    """
+    Return recent entries from the exec-node trades.csv, newest-first.
+    Columns: timestamp, ticker, side, action, contracts, price_cents,
+             fair_value, edge, confidence, model_source, mode.
+    """
+    trades_csv = Path(os.getenv("KALSHI_TRADES_CSV", "/root/EdgePulse/output/trades.csv"))
+    if not trades_csv.exists():
+        return []
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    results: list[dict[str, Any]] = []
+
+    try:
+        with open(trades_csv, newline="", errors="replace") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    ts = datetime.fromisoformat(row["timestamp"])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts < cutoff:
+                        continue
+                    results.append({
+                        "timestamp":    row["timestamp"],
+                        "ticker":       row.get("ticker", ""),
+                        "meeting":      row.get("meeting", ""),
+                        "outcome":      row.get("outcome", ""),
+                        "side":         row.get("side", ""),
+                        "action":       row.get("action", ""),
+                        "contracts":    int(float(row.get("contracts", 0) or 0)),
+                        "price_cents":  int(float(row.get("price_cents", 0) or 0)),
+                        "fair_value":   float(row.get("fair_value", 0) or 0),
+                        "edge":         float(row.get("edge", 0) or 0),
+                        "confidence":   float(row.get("confidence", 0) or 0),
+                        "model_source": row.get("model_source", ""),
+                        "order_id":     row.get("order_id", ""),
+                        "mode":         row.get("mode", ""),
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        return []
+
+    results.sort(key=lambda r: r["timestamp"], reverse=True)
+    return results[:limit]
 
 
 @router.get("/equity-curve", summary="Daily cumulative realized P&L for equity curve chart")

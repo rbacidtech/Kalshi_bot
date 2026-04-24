@@ -492,3 +492,86 @@ async def ai_suggest(
         return {"suggestion": msg.content[0].text, "ok": True}
     except Exception as exc:
         return {"suggestion": f"Error: {exc}", "ok": False}
+
+
+_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "output", "logs")
+_VALID_SERVICES = {"exec", "intel", "advisor", "dashboard", "edgepulse"}
+
+
+def _tail_file(path: str, n: int) -> list[str]:
+    """Return last n lines of a file without loading the whole thing."""
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if not p.exists():
+        return []
+    with open(p, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        buf = bytearray()
+        pos = size
+        while pos > 0 and buf.count(b"\n") < n + 1:
+            chunk = min(8192, pos)
+            pos -= chunk
+            f.seek(pos)
+            buf = f.read(chunk) + buf
+    lines = buf.decode("utf-8", errors="replace").splitlines()
+    return lines[-n:] if len(lines) > n else lines
+
+
+@router.get("/logs", summary="Tail service log lines")
+@limiter.limit("20/minute")
+async def get_logs(
+    request: Request,
+    lines: int = Query(100, ge=10, le=500),
+    service: str = Query("exec"),
+    current_user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Return the last N lines of the requested service log file."""
+    svc = service if service in _VALID_SERVICES else "exec"
+    log_path = os.path.join(_LOG_DIR, f"{svc}.log")
+    if not os.path.exists(log_path):
+        # Try edgepulse.log as fallback
+        log_path = os.path.join(_LOG_DIR, "edgepulse.log")
+    try:
+        result = _tail_file(log_path, lines)
+        return {"lines": result, "service": svc, "available": bool(result), "path": log_path}
+    except Exception as exc:
+        return {"lines": [], "service": svc, "available": False, "error": str(exc)}
+
+
+@router.post("/test-alert", summary="Send a test alert via Telegram")
+@limiter.limit("2/minute")
+async def test_alert(
+    request: Request,
+    current_user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Send a test notification to the configured Telegram channel."""
+    import httpx
+
+    token    = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id  = os.getenv("TELEGRAM_CHANNEL_ID", "")
+
+    if not token or not chat_id:
+        return {
+            "ok": False,
+            "reason": "no_telegram_config",
+            "message": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID not set in environment.",
+        }
+
+    msg = (
+        f"✅ EdgePulse test alert\n"
+        f"Sent from dashboard by {current_user.email}\n"
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as http:
+            resp = await http.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": msg},
+            )
+        if resp.status_code == 200:
+            return {"ok": True, "channel": "telegram", "chat_id": chat_id}
+        return {"ok": False, "reason": "telegram_api_error", "status": resp.status_code,
+                "detail": resp.text[:200]}
+    except Exception as exc:
+        return {"ok": False, "reason": "request_failed", "error": str(exc)}
