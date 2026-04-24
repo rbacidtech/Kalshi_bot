@@ -854,19 +854,29 @@ async def _process_signal(
             # dedup with topup=True and merge into Redis via add_contracts.)
             ex_pos = executor._positions[sig.ticker]
 
-            # Exception: if the executor entry has no order_id and is not
-            # fill_confirmed, this is a ghost from a failed order placement
-            # (executor added the position before the HTTP call that then failed).
-            # Drop it and fall through to normal execution so the signal retries.
-            if (not ex_pos.get("order_id") and
-                    not ex_pos.get("fill_confirmed")):
+            # Exception: drop stale executor entries that shouldn't block entry:
+            # - Ghost from a failed order placement (no order_id, not fill_confirmed)
+            # - Tombstone left over from a prior contracts=0 registration (e.g.
+            #   orphan reconciler saw a fractional Kalshi position_fp). These
+            #   linger in executor._positions across restarts via the paper-
+            #   positions disk cache; without this check the divergence handler
+            #   copies them back into Redis on the next signal, re-creating
+            #   the tombstone we just cleared.
+            _ex_ct = int(ex_pos.get("contracts", 0) or 0)
+            _ex_ghost = (not ex_pos.get("order_id") and
+                         not ex_pos.get("fill_confirmed"))
+            if _ex_ghost or _ex_ct == 0:
                 log.warning(
-                    "State divergence: %s in executor has no order_id "
-                    "— dropping ghost position (failed order), allowing retry",
-                    sig.ticker,
+                    "State divergence: %s in executor is %s — dropping, allowing retry",
+                    sig.ticker, "ghost (no order_id)" if _ex_ghost else "tombstone (contracts=0)",
                 )
-                _entry_failed_cooldown[sig.ticker] = time.time()
+                if _ex_ghost:
+                    _entry_failed_cooldown[sig.ticker] = time.time()
                 executor._positions.pop(sig.ticker, None)
+                try:
+                    executor._save_paper_positions()
+                except Exception:
+                    pass
                 # Leave the pending pre-write in Redis (written above) so normal
                 # execution below can confirm or clean it up.
             else:
