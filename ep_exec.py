@@ -3239,8 +3239,13 @@ async def _reconcile_orphan_orders(
         if not ticker:
             continue
         pos_fp   = float(mp.get("position_fp", 0) or 0)
-        if pos_fp == 0:
-            continue   # no holdings — settled/no-position market
+        if abs(pos_fp) < 1:
+            # Fractional positions (< 1 contract) — usually rounding artifacts
+            # from partial fills or fee-adjusted leftovers. Registering them
+            # as contracts=0 creates a phantom tombstone that blocks re-entry
+            # on a ticker where we don't meaningfully hold anything.
+            # _sync_positions_with_kalshi already uses this same threshold.
+            continue
 
         # Derive side and contract count from signed position_fp
         # Kalshi convention: positive = YES, negative = NO
