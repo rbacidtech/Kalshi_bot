@@ -6,6 +6,7 @@ _Updated 2026-04-24 04:30 UTC — entry/exit strategy audit, four more fixes pat
 _Updated 2026-04-24 04:45 UTC — post-deploy observations added below._
 _Updated 2026-04-24 04:48 UTC — Item 11 (metrics port) fixed and verified._
 _Updated 2026-04-24 04:50 UTC — Item 9 (kelly_calib column mismatch) fixed and verified._
+_Updated 2026-04-24 04:55 UTC — Audit #5 (edge_threshold × 0.7 silent discount) resolved via Option A (drop multiplier, keep operator override at 0.41)._
 
 ## Silently broken — needs fix
 
@@ -144,16 +145,30 @@ patched this session.
   `self._positions` via `json.loads` above), but the blanket
   try/except could have hidden a real bug.
 
-## Audit findings still unpatched
+## Audit findings resolved in this session
 
-- **Audit #5 — `edge_threshold * 0.7` multiplier across 9 scanner
-  filters is undocumented.** `kalshi_bot/strategy.py:3822, 3848, 3859,
-  3870, 3884, 3895, 3928, 3944, 3955` all compare
-  `fee_adjusted_edge >= edge_threshold * 0.7`. With
-  `override_edge_threshold=0.41` that means the effective filter is
-  28.7¢, not 41¢ as the dashboard suggests. Either rename the override
-  to reflect actual behavior or drop the 0.7 multiplier — decision
-  deferred pending discussion with operator about intended semantics.
+- ~~**Audit #5 — `edge_threshold * 0.7` multiplier across 9 scanner
+  filters is undocumented.**~~
+  **FIXED 2026-04-24 04:55 UTC (Option A).** Multiplier removed from
+  all 9 filter sites in `kalshi_bot/strategy.py`. Operator's
+  `override_edge_threshold` value is now interpreted literally as the
+  minimum fee-adjusted EV per contract. `kalshi_bot/config.py:52`
+  gained a doc comment explaining current semantics and referencing
+  the historical behavior. `SYSTEM_OVERVIEW.md` threshold row
+  relabeled "Min fee-adjusted EV" (was "Min edge gross").
+
+  Effective behavior change at deploy time: operator's existing
+  `override_edge_threshold=0.41` was an effective 28.7¢ EV floor
+  under the old `× 0.7` math. It now acts as a literal 41¢ EV floor
+  — a 43% tightening. **Operator explicitly chose to keep 0.41 rather
+  than lower to 0.287**, electing for a stricter filter. Expect
+  signal volume to drop; monitor `ep:signals` entry cadence over
+  the next 24h.
+
+  The old rationale (30% fee/slippage discount baked into the knob)
+  is gone. If that discount turns out to have been load-bearing for
+  profitability, restore it by lowering the override to the desired
+  EV floor directly.
 
 ## Infrastructure gaps (separate workstream)
 

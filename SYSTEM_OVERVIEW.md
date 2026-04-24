@@ -358,7 +358,7 @@ Kelly fraction is empirically calibrated per category:
 |---|---|---|
 | Kelly fraction (global default) | 0.25 | KALSHI_KELLY_FRACTION |
 | Max contracts per signal | 15 | KALSHI_MAX_CONTRACTS |
-| Min edge (gross) | 0.10 (10¢) | KALSHI_EDGE_THRESHOLD |
+| Min fee-adjusted EV | 0.10 (10¢) | KALSHI_EDGE_THRESHOLD (literal since 2026-04-24) |
 | Min confidence | 0.60 | KALSHI_MIN_CONFIDENCE |
 | Min YES entry price | 0.60 (KXFED only) | KALSHI_MIN_YES_ENTRY_PRICE |
 | Fallback-only edge threshold | 0.25 (25¢) | KALSHI_FALLBACK_ONLY_EDGE_THRESHOLD |

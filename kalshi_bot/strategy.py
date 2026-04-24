@@ -3819,7 +3819,7 @@ async def fetch_signals_async(
                 release_data=release_data,
                 min_yes_entry_price=min_yes_entry_price,
             )
-            dir_sigs = [s for s in dir_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            dir_sigs = [s for s in dir_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(dir_sigs)
             if dir_sigs:
                 log.info("FOMC directional: %d signals", len(dir_sigs))
@@ -3845,7 +3845,7 @@ async def fetch_signals_async(
     if enable_weather:
         try:
             weather_sigs = await scan_weather_markets(all_markets, max_contracts)
-            weather_sigs = [s for s in weather_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            weather_sigs = [s for s in weather_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(weather_sigs)
             if weather_sigs:
                 log.info("Weather: %d signals", len(weather_sigs))
@@ -3856,7 +3856,7 @@ async def fetch_signals_async(
     if enable_economic and fred_api_key:
         try:
             econ_sigs = await scan_economic_markets(all_markets, fred_api_key, max_contracts)
-            econ_sigs = [s for s in econ_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            econ_sigs = [s for s in econ_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(econ_sigs)
             if econ_sigs:
                 log.info("Economic: %d signals", len(econ_sigs))
@@ -3867,7 +3867,7 @@ async def fetch_signals_async(
     if enable_sports:
         try:
             sports_sigs = await scan_sports_markets(all_markets, max_contracts)
-            sports_sigs = [s for s in sports_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            sports_sigs = [s for s in sports_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(sports_sigs)
             if sports_sigs:
                 log.info("Sports: %d signals", len(sports_sigs))
@@ -3881,7 +3881,7 @@ async def fetch_signals_async(
             if eth_spot is None:
                 eth_spot = await _fetch_eth_spot()
             crypto_sigs = scan_crypto_price_markets(all_markets, btc_spot, eth_spot, max_contracts)
-            crypto_sigs = [s for s in crypto_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            crypto_sigs = [s for s in crypto_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(crypto_sigs)
             if crypto_sigs:
                 log.info("Crypto price: %d signals", len(crypto_sigs))
@@ -3892,7 +3892,7 @@ async def fetch_signals_async(
     if enable_gdp:
         try:
             gdp_sigs = await scan_gdp_markets(all_markets, fred_api_key, max_contracts, macro_regime=macro_regime)
-            gdp_sigs = [s for s in gdp_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            gdp_sigs = [s for s in gdp_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(gdp_sigs)
             if gdp_sigs:
                 log.info("GDP: %d signals", len(gdp_sigs))
@@ -3925,7 +3925,7 @@ async def fetch_signals_async(
                 coherence_sigs = await scan_cross_series_coherence(
                     fomc_markets, _gdp_markets, _gdpnow_pct, max_contracts
                 )
-                coherence_sigs = [s for s in coherence_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+                coherence_sigs = [s for s in coherence_sigs if s.fee_adjusted_edge >= edge_threshold]
                 all_signals.extend(coherence_sigs)
                 if coherence_sigs:
                     log.info("Cross-series coherence: %d signals", len(coherence_sigs))
@@ -3941,7 +3941,7 @@ async def fetch_signals_async(
                 if _t:
                     _prices_snap[_t] = _market_mid(_m)
             cm_coherence_sigs = scan_cross_meeting_coherence(fomc_markets, _prices_snap)
-            cm_coherence_sigs = [s for s in cm_coherence_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            cm_coherence_sigs = [s for s in cm_coherence_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(cm_coherence_sigs)
             if cm_coherence_sigs:
                 log.info("Cross-meeting coherence: %d signals", len(cm_coherence_sigs))
@@ -3952,7 +3952,7 @@ async def fetch_signals_async(
     if enable_fomc:
         try:
             rate_path_sigs = await scan_rate_path_value(fomc_markets, max_contracts)
-            rate_path_sigs = [s for s in rate_path_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            rate_path_sigs = [s for s in rate_path_sigs if s.fee_adjusted_edge >= edge_threshold]
             all_signals.extend(rate_path_sigs)
             if rate_path_sigs:
                 log.info("Rate-path calendar spread: %d signals", len(rate_path_sigs))

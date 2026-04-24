@@ -48,7 +48,15 @@ _DEFAULT_URL = (
 BASE_URL = os.getenv("KALSHI_BASE_URL", "").strip() or _DEFAULT_URL
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-# Minimum edge must exceed typical fee (7¢) plus spread margin
+# Minimum fee-adjusted expected value per contract, in decimal dollars. A signal
+# is kept only if `fee_adjusted_edge >= EDGE_THRESHOLD` where fee_adjusted_edge
+# is EV net of Kalshi fees (see _fee_adjusted_edge in strategy.py). Default 0.10
+# = 10¢/contract EV floor. Operator override at Redis ep:config key
+# `override_edge_threshold` takes precedence at runtime (ep_intel.py:1720).
+#
+# Historical note: until 2026-04-24 every scanner filter silently multiplied this
+# threshold by 0.7 (so 0.10 actually meant 7¢). Multiplier removed; threshold is
+# now interpreted literally. See KNOWN_GAPS.md Audit #5.
 EDGE_THRESHOLD   = _getenv_float("KALSHI_EDGE_THRESHOLD", 0.10)
 MAX_CONTRACTS    = _getenv_int("KALSHI_MAX_CONTRACTS", 10)
 POLL_INTERVAL    = _getenv_int("KALSHI_POLL_INTERVAL", 120)   # 2 min default for FOMC
