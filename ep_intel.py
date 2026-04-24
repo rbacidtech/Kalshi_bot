@@ -1607,9 +1607,13 @@ async def intel_main() -> None:
 
             # ── Market cache (full rescan every 20 min) ───────────────────────
             if time.monotonic() - markets_last_scan > 1200:
+                # Always update markets_last_scan even on failure, so we don't
+                # retry scan_all_markets at the full cycle cadence (every 120s)
+                # on a persistent failure — that burns API quota and floods
+                # logs. Next retry after the normal 20-min cooldown.
+                markets_last_scan = time.monotonic()
                 try:
-                    markets_cache     = scan_all_markets(client)
-                    markets_last_scan = time.monotonic()
+                    markets_cache = scan_all_markets(client)
                     # Only subscribe WebSocket to tradeable markets (skip sports/novelty
                     # series that generate millions of sub-penny ticks we never trade)
                     _WS_PREFIXES = ("KXFED", "KXBTC", "KXETH", "INX", "NASDAQ", "CPI", "JOBS")

@@ -94,10 +94,19 @@ class RedisBus:
     async def publish_signal(self, sig: SignalMessage) -> str:
         """Publish a trading signal to the ep:signals stream (consumed by Exec).
 
-        Returns the Redis stream entry ID assigned to this message.
+        Returns the Redis stream entry ID assigned to this message, or an
+        empty string if the publish failed. XADD errors used to propagate
+        uncaught, dropping signals silently on a Redis blip — now the
+        caller can detect failure and decide whether to log, retry, or
+        continue.
         """
         sig.source_node = self.node_id
-        eid = await self._r.xadd(EP_SIGNALS, sig.to_redis(), maxlen=10_000, approximate=True)
+        try:
+            eid = await self._r.xadd(EP_SIGNALS, sig.to_redis(),
+                                     maxlen=10_000, approximate=True)
+        except aioredis.RedisError as exc:
+            log.error("publish_signal XADD failed for %s: %s", sig.signal_id, exc)
+            return ""
         try:
             audit().write("signals", asdict(sig))
         except Exception:
@@ -212,11 +221,18 @@ class RedisBus:
     async def publish_execution(self, report: ExecutionReport) -> str:
         """Publish an execution report to the ep:executions stream (consumed by Intel).
 
-        Used by Intel for dedup and P&L tracking. Returns the stream entry ID.
+        Used by Intel for dedup and P&L tracking. Returns the stream entry ID,
+        or "" on Redis error. Execution reports are forensic — losing one on a
+        Redis blip is bad, but blocking the exec loop on Redis failure is
+        worse. Log loud so ops can backfill from CSV / Postgres if needed.
         """
         report.source_node = self.node_id
-        eid = await self._r.xadd(EP_EXECUTIONS, report.to_redis(),
-                                  maxlen=5_000, approximate=True)
+        try:
+            eid = await self._r.xadd(EP_EXECUTIONS, report.to_redis(),
+                                      maxlen=5_000, approximate=True)
+        except aioredis.RedisError as exc:
+            log.error("publish_execution XADD failed for %s: %s", report.exec_id, exc)
+            return ""
         try:
             audit().write("executions", asdict(report))
         except Exception:
