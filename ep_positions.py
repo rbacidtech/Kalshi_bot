@@ -167,22 +167,31 @@ class PositionStore:
         await self._bus.set_position(ticker, pos)
 
     async def total_exposure_cents(self) -> int:
-        """Sum of actual contract cost across all open positions.
+        """Sum of actual contract cost across all FILLED positions.
 
         entry_cents stores the YES market price (0–100) for all positions.
         For NO contracts the capital deployed is (100 - entry_cents) per contract,
         not entry_cents — using YES price would overstate cheap NOs and understate
         in-the-money NOs, both causing wrong risk-gate decisions.
+
+        Unfilled resting limit orders are excluded. Kalshi reserves their cost
+        against `balance` already, so counting them here would double-count
+        them (once in this numerator, once by reducing the cash denominator).
+        The account-value denominator used by the approve() call is stable
+        across fills — see ep_exec.py for the pairing.
         """
         positions = await self._bus.get_all_positions()
         total = 0
         for p in positions.values():
             if p.get("user_bet"):
                 continue  # personal bets are not bot capital
-            entry     = p.get("entry_cents", 50)
-            # Use contracts_filled when available (partial-fill window);
-            # falls back to contracts (requested size) for pending/unfilled orders.
-            contracts = p.get("contracts_filled") or p.get("contracts", 1)
+            entry = p.get("entry_cents", 50)
+            filled = int(p.get("contracts_filled") or 0)
+            # Skip if nothing has filled yet — treat as resting order, not exposure.
+            # An unfilled position has contracts_filled=0 AND fill_confirmed=False.
+            if filled == 0 and not p.get("fill_confirmed"):
+                continue
+            contracts = filled or int(p.get("contracts", 1))
             if p.get("side") == "no":
                 total += (100 - entry) * contracts
             else:

@@ -406,6 +406,12 @@ async def _process_signal(
             _entry_failed_cooldown[sig.ticker] = time.time()
             return _rejected("BALANCE_UNKNOWN")
         balance_cents = intel_bal.get("balance_cents", 0)
+        # Kalshi deducts resting-limit-order cost from `balance`. To avoid
+        # double-counting those orders against the total-exposure cap, the
+        # cap denominator is total account value (cash + filled positions at
+        # market). balance_cents alone is kept for Kelly sizing — that's a
+        # cash-on-hand question, different from the aggregate-risk cap.
+        _portfolio_value_cents = int(intel_bal.get("portfolio_value_cents", 0) or 0)
         # Update drawdown tracking and persist halt to Redis if triggered.
         risk_engine._kalshi.set_balance(balance_cents)
         if risk_engine._kalshi._halted:
@@ -669,7 +675,14 @@ async def _process_signal(
     except Exception:
         log.warning("RISK_GATE_REDIS: Redis unavailable during exposure check — rejecting %s", sig.ticker)
         return _rejected("RISK_GATE_REDIS")
-    approved, reason    = risk_engine.approve(sig, contracts, balance_cents, open_exposure)
+    # Total-exposure cap denominator: cash + filled-position mark value. Using
+    # balance_cents alone would double-count resting-limit-order reservations
+    # (Kalshi deducts them from balance, and we count them in open_exposure).
+    # BTC keeps balance_cents as-is since that already represents total
+    # Coinbase account (USD + BTC holdings) per the sizing path above.
+    _risk_denom = (balance_cents + _portfolio_value_cents
+                   if sig.asset_class == "kalshi" else balance_cents)
+    approved, reason    = risk_engine.approve(sig, contracts, _risk_denom, open_exposure)
     if not approved:
         log.info("Risk rejected %s: %s  signal_id=%.8s", sig.ticker, reason, sig.signal_id)
         return _rejected(reason or "RISK_GATE_KALSHI")
