@@ -18,6 +18,7 @@ import json
 import time
 import asyncio
 import logging
+import threading
 
 import requests
 import httpx
@@ -25,6 +26,15 @@ import httpx
 log = logging.getLogger(__name__)
 
 _RETRYABLE = {429, 500, 502, 503, 504}
+
+# Endpoints that are NOT safe to retry on transient errors. A retry here would
+# either double-place an order (POST /portfolio/orders — Kalshi may have
+# accepted the order before the client saw the timeout) or re-cancel an order
+# that was already cancelled under a stale order_id.
+# Keep this list conservative — when in doubt, add the path.
+_NON_IDEMPOTENT_POST_PATHS = (
+    "/portfolio/orders",
+)
 
 
 class KalshiClient:
@@ -58,11 +68,24 @@ class KalshiClient:
         self.backoff     = backoff
         self._concurrency = concurrency
         self._semaphore = None
-        self._session    = requests.Session()
-        self._session.headers.update({"Content-Type": "application/json"})
+        # Thread-local sessions: `requests.Session` is not thread-safe, but the
+        # sync `_request` method is called concurrently via asyncio.to_thread
+        # from multiple places (ep_arb, ep_exec, ep_ob_depth). A shared Session
+        # causes connection-pool state corruption under load. Give each thread
+        # its own Session so the pool is private per caller.
+        self._thread_local = threading.local()
 
     def _api_path(self, path: str) -> str:
         return self._API_PREFIX + path
+
+    def _get_session(self) -> requests.Session:
+        """Return this thread's private requests.Session, lazily created."""
+        sess = getattr(self._thread_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            sess.headers.update({"Content-Type": "application/json"})
+            self._thread_local.session = sess
+        return sess
 
     # ── Sync ──────────────────────────────────────────────────────────────────
 
@@ -73,27 +96,51 @@ class KalshiClient:
         body     = json.dumps(payload) if payload else None
         last_exc = None
 
-        for attempt in range(self.max_retries + 1):
+        # Non-idempotent POSTs (e.g. /portfolio/orders) must NOT retry on
+        # ambiguous failures: a Timeout or ConnectionError after Kalshi
+        # received the request would cause a duplicate order on retry, and
+        # a 5xx response might also be post-accept. Retry only on clearly
+        # idempotent methods / paths.
+        is_non_idempotent = (
+            method.upper() == "POST"
+            and any(path.startswith(p) for p in _NON_IDEMPOTENT_POST_PATHS)
+        )
+        effective_retries = 0 if is_non_idempotent else self.max_retries
+        session = self._get_session()
+
+        for attempt in range(effective_retries + 1):
             if attempt > 0:
                 wait = self.backoff ** attempt
                 log.warning("Retry %d/%d for %s %s — waiting %.1fs",
-                            attempt, self.max_retries, method, path, wait)
+                            attempt, effective_retries, method, path, wait)
                 time.sleep(wait)
 
             try:
-                resp = self._session.request(
+                resp = session.request(
                     method, url,
                     headers=self.auth.sign(method, api_path),
                     params=params, data=body, timeout=self.timeout,
                 )
                 if resp.status_code in _RETRYABLE:
                     last_exc = requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+                    if is_non_idempotent:
+                        # Surface immediately — no retry would be safe.
+                        raise last_exc
                     continue
                 resp.raise_for_status()
                 return resp.json()
 
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_exc = exc
+                if is_non_idempotent:
+                    # Ambiguous — order may or may not have reached Kalshi.
+                    # Caller must reconcile via orphan recovery, not retry.
+                    log.error(
+                        "Non-idempotent %s %s FAILED ambiguously: %s — "
+                        "NOT retrying; caller must reconcile",
+                        method, path, exc,
+                    )
+                    raise
                 log.warning("Request error on %s %s (attempt %d): %s",
                             method, path, attempt + 1, exc)
 
