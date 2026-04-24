@@ -38,7 +38,12 @@ def kalshi_signal_to_message(sig: Signal, node_id: str) -> SignalMessage:
         kelly_fraction    = cfg.KELLY_FRACTION,
         risk_flags        = risk_flags,
         spread_cents      = sig.spread_cents,
-        book_depth        = getattr(sig, "book_depth", 0),
+        # Signal.book_depth defaults to 0 when a scanner doesn't measure the
+        # book (weather, arb bypass). Treat 0 as "unknown" (None) so the
+        # Exec book-depth gate skips rather than mis-reading 0 as "dry book
+        # → reject". Actual 0-depth markets are caught by the book-empty
+        # check on the exchange side.
+        book_depth        = (getattr(sig, "book_depth", 0) or None),
         meeting           = sig.meeting,
         outcome           = sig.outcome,
         model_source      = sig.model_source,
