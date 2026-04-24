@@ -190,17 +190,32 @@ class RedisBus:
 
             except aioredis.ResponseError as exc:
                 if "NOGROUP" in str(exc):
-                    # Consumer group was lost (Intel restart can wipe it).
-                    # Recreate at "0" (stream start) so signals published
-                    # during the Intel restart window are replayed rather
-                    # than dropped.
-                    log.warning("Consumer group lost — recreating %s on %s",
-                                EXEC_GROUP, EP_SIGNALS)
+                    # Consumer group was lost (Redis FLUSHALL, explicit delete,
+                    # or manual maintenance). Prior behavior recreated at "0"
+                    # which replayed the ENTIRE stream (up to maxlen=10_000)
+                    # — exec would re-process thousands of old signals, mostly
+                    # dedup-rejected but still hammering the pipeline and
+                    # risking a double-fill for any that raced with position
+                    # cleanup. Recreate at "$" (stream tail) so we only see
+                    # new signals. Signals published during the group-outage
+                    # window are lost — that's acceptable when balanced
+                    # against the replay-flood risk. Log LOUDLY so ops knows.
+                    log.critical(
+                        "Consumer group %s was lost on %s — recreating at "
+                        "stream TAIL ($). Any signals published during the "
+                        "outage window will NOT be replayed. If this is "
+                        "unexpected, investigate Redis persistence.",
+                        EXEC_GROUP, EP_SIGNALS,
+                    )
                     try:
                         await self._r.xgroup_create(
-                            EP_SIGNALS, EXEC_GROUP, id="0", mkstream=True
+                            EP_SIGNALS, EXEC_GROUP, id="$", mkstream=True
                         )
-                        log.info("Consumer group %s recreated at stream start (backlog replay)", EXEC_GROUP)
+                        log.info(
+                            "Consumer group %s recreated at stream tail — "
+                            "only new signals will be delivered",
+                            EXEC_GROUP,
+                        )
                     except aioredis.ResponseError as _cg_exc:
                         if "BUSYGROUP" not in str(_cg_exc):
                             log.error("Failed to recreate consumer group: %s", _cg_exc)
