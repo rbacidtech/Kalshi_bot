@@ -438,6 +438,15 @@ async def _process_signal(
         _scale = max(0.1, min(3.0, float(llm_scale)))
         contracts = max(1, int(contracts * _scale))
 
+    # Apply per-strategy calibration multiplier from 90-day rolling win-rate analysis.
+    # Strategies with win_rate > 65% → up to 1.20x; < 40% → down to 0.60x.
+    if contracts > 0:
+        _strat_mult = get_strategy_conf_mult(sig.model_source or "")
+        if _strat_mult != 1.0:
+            contracts = max(1, int(contracts * _strat_mult))
+            log.debug("Strategy calib mult %.2f applied to %s → %d contracts",
+                      _strat_mult, sig.model_source, contracts)
+
     _ABSOLUTE_MAX_CONTRACTS = 500  # hard safety cap — prevents Kelly misconfiguration
     if contracts > _ABSOLUTE_MAX_CONTRACTS:
         log.warning("Contract cap: %s sized %d → %d (hard limit)",
@@ -3091,12 +3100,17 @@ async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> No
 
 async def _divergence_monitor_loop(bus: RedisBus, positions: "PositionStore", interval_s: int = 3600) -> None:
     """
-    Hourly: compare live P&L vs paper P&L by reading trades.csv
-    and checking for systematic divergence (> 15% gap) that may
-    indicate slippage, fee model error, or execution bugs.
+    Hourly: measure edge-capture ratio from completed trades in trades.csv.
+
+    Compares realized P&L vs model-expected P&L on each completed round-trip:
+      expected_pnl = edge_at_entry * contracts  (fair_value - entry_price)
+      realized_pnl = (exit_price - entry_price) * contracts - fee
+
+    Edge-capture ratio = sum(realized) / sum(expected).
+    Ratio < 0.50 over the trailing 7 days indicates systematic slippage or
+    fee-model error and warrants investigation.
 
     Writes results to ep:divergence Redis hash.
-    Alert if |live_pnl - paper_pnl| / max(|paper_pnl|, 1) > 0.15
     """
     trades_csv = os.getenv("KALSHI_TRADES_CSV", "/root/EdgePulse/output/trades.csv")
 
@@ -3106,57 +3120,68 @@ async def _divergence_monitor_loop(bus: RedisBus, positions: "PositionStore", in
             if not os.path.exists(trades_csv):
                 continue
 
-            live_pnl    = 0.0
-            paper_pnl   = 0.0
-            live_count  = 0
-            paper_count = 0
+            cutoff_s = 7 * 86400
+            entries: dict = {}
+            realized_pnl  = 0.0
+            expected_pnl  = 0.0
+            n_completed   = 0
 
             with open(trades_csv, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
+                for row in csv.DictReader(f):
                     try:
-                        pnl   = float(row.get("pnl_cents", 0) or 0)
-                        mode  = row.get("mode", "live")
-                        ts_s  = row.get("ts") or row.get("timestamp") or ""
+                        ts_s = row.get("timestamp", "")
                         if ts_s:
-                            import datetime as _dt
-                            row_dt = _dt.datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
-                            age_s = (datetime.now(timezone.utc) - row_dt.astimezone(timezone.utc)).total_seconds()
-                            if age_s > 7 * 86400:
+                            row_dt = datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
+                            if (datetime.now(timezone.utc) - row_dt.astimezone(timezone.utc)).total_seconds() > cutoff_s:
                                 continue
-                        if mode == "paper":
-                            paper_pnl   += pnl
-                            paper_count += 1
-                        else:
-                            live_pnl   += pnl
-                            live_count += 1
+                        ticker = row.get("ticker", "")
+                        action = row.get("action", "")
+                        if action == "entry":
+                            entries[ticker] = row
+                        elif action == "exit" and ticker in entries:
+                            e = entries.pop(ticker)
+                            ep  = float(e.get("price_cents", 50) or 50)
+                            xp  = float(row.get("price_cents", ep) or ep)
+                            fv  = float(e.get("fair_value", ep / 100) or ep / 100)
+                            side = e.get("side", "yes")
+                            contracts = int(e.get("contracts", 1) or 1)
+                            if side == "yes":
+                                gross_r = (xp - ep) * contracts
+                                gross_e = (fv * 100 - ep) * contracts
+                            else:
+                                gross_r = (ep - xp) * contracts
+                                gross_e = (ep - fv * 100) * contracts
+                            fee = max(0.0, abs(gross_r) * 0.07)
+                            realized_pnl  += gross_r - fee
+                            expected_pnl  += max(0.0, gross_e)  # only positive expected PnL
+                            n_completed   += 1
                     except Exception:
                         continue
 
-            if live_count < 5 or paper_count < 5:
+            if n_completed < 5:
                 continue
 
-            divergence_pct = abs(live_pnl - paper_pnl) / max(abs(paper_pnl), 1.0)
+            capture_ratio = realized_pnl / max(abs(expected_pnl), 1.0)
 
             await bus._r.hset("ep:divergence", mapping={
-                "live_pnl_cents":  str(int(live_pnl)),
-                "paper_pnl_cents": str(int(paper_pnl)),
-                "live_count":      str(live_count),
-                "paper_count":     str(paper_count),
-                "divergence_pct":  f"{divergence_pct:.4f}",
-                "ts":              str(time.time()),
+                "realized_pnl_cents":  str(int(realized_pnl)),
+                "expected_pnl_cents":  str(int(expected_pnl)),
+                "edge_capture_ratio":  f"{capture_ratio:.4f}",
+                "n_completed":         str(n_completed),
+                "ts":                  str(time.time()),
+                "window_days":         "7",
             })
 
-            if divergence_pct > 0.15:
+            if capture_ratio < 0.50:
                 log.warning(
-                    "Live/paper divergence: live=%.0f¢ paper=%.0f¢ (%.1f%%) — "
-                    "check for slippage, fee model error, or execution bugs",
-                    live_pnl, paper_pnl, divergence_pct * 100,
+                    "Edge-capture BELOW 50%%: realized=%.0f¢ expected=%.0f¢ ratio=%.2f "
+                    "(%d trades, 7d) — check slippage and fee model",
+                    realized_pnl, expected_pnl, capture_ratio, n_completed,
                 )
             else:
                 log.info(
-                    "Live/paper check: live=%.0f¢ paper=%.0f¢ divergence=%.1f%% (OK)",
-                    live_pnl, paper_pnl, divergence_pct * 100,
+                    "Edge-capture OK: realized=%.0f¢ expected=%.0f¢ ratio=%.2f (%d trades, 7d)",
+                    realized_pnl, expected_pnl, capture_ratio, n_completed,
                 )
 
         except asyncio.CancelledError:
