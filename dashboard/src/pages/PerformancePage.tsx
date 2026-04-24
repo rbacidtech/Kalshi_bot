@@ -606,9 +606,8 @@ export default function PerformancePage() {
       {/* ── Equity Curve ──────────────────────────────────────────────────── */}
       {equityData && equityData.length > 1 && equityData.every(pt => /^\d{4}-\d{2}-\d{2}$/.test(pt.date ?? '')) && (() => {
         const chartPoints = equityData.map(pt => {
-          const [year, month, day] = pt.date.split('-').map(Number)
-          const d = new Date(year, month - 1, day)
-          const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+          const d = new Date(`${pt.date}T00:00:00Z`)
+          const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
           return { label, value: pt.cumulative_pnl_cents }
         })
         const lastVal   = equityData[equityData.length - 1].cumulative_pnl_cents

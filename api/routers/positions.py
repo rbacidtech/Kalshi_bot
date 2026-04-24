@@ -82,6 +82,7 @@ async def get_positions(
         positions: list[PositionResponse] = []
         total_deployed   = 0
         total_unrealized = 0
+        missing_price_count = 0
 
         for raw_key, raw_val in raw_positions.items():
             ticker = (raw_key.decode() if isinstance(raw_key, bytes) else raw_key)
@@ -102,6 +103,8 @@ async def get_positions(
             total_deployed += cost
             if pnl is not None:
                 total_unrealized += pnl
+            else:
+                missing_price_count += 1
 
             positions.append(PositionResponse(
                 ticker            = ticker,
@@ -149,6 +152,7 @@ async def get_positions(
             balance_cents              = balance_cents,
             total_value_cents          = total_value,
             position_count             = len(positions),
+            positions_without_price    = missing_price_count,
         )
     finally:
         await r.aclose()

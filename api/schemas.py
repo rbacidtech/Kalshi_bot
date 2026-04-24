@@ -164,6 +164,7 @@ class PortfolioResponse(BaseModel):
     balance_cents: Optional[int]          # available cash from Kalshi API
     total_value_cents: Optional[int]      # available + deployed (total account value)
     position_count: int
+    positions_without_price: int = 0      # positions excluded from P&L total (price feed gap)
 
 
 # ---------------------------------------------------------------------------

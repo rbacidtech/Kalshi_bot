@@ -116,6 +116,8 @@ async def get_config(
             cfg["max_contracts"] = int(float(raw_live["override_max_contracts"]))
         if raw_live.get("override_min_confidence"):
             cfg["min_confidence"] = float(raw_live["override_min_confidence"])
+        if raw_live.get("llm_kelly_fraction"):
+            cfg["kelly_fraction"] = float(raw_live["llm_kelly_fraction"])
     except Exception:
         pass
 
@@ -139,6 +141,7 @@ async def patch_config(
             "override_edge_threshold": str(body.edge_threshold),
             "override_max_contracts":  str(body.max_contracts),
             "override_min_confidence": str(body.min_confidence),
+            "llm_kelly_fraction":      str(body.kelly_fraction),
         })
     except Exception:
         pass
@@ -199,6 +202,16 @@ async def _session_pnl_from_db(db: AsyncSession) -> Optional[int]:
         """), {"today": today_utc})
         start_row = result.fetchone()
         if start_row is None:
+            # No snapshot since midnight — fall back to last snapshot before today
+            result_prev = await db.execute(text("""
+                SELECT balance_cents, deployed_cents, unrealized_pnl_cents
+                FROM pnl_snapshots
+                WHERE ts < :today
+                ORDER BY ts DESC
+                LIMIT 1
+            """), {"today": today_utc})
+            start_row = result_prev.fetchone()
+        if start_row is None:
             return None
 
         result2 = await db.execute(text("""
@@ -247,7 +260,8 @@ async def get_status(
 
     # ── Node health (ep:health hash) — separate Intel from Exec ─────────────
     business_issues: list[str] = []
-    exec_health_overall: Optional[str] = None
+    intel_data: dict[str, Any] = {}
+    exec_health: Optional[str] = None
     for node_id_raw, raw in raw_health.items():
         node_id = node_id_raw.decode() if isinstance(node_id_raw, bytes) else node_id_raw
         try:
@@ -256,23 +270,24 @@ async def get_status(
             continue
         if node_id.startswith("intel"):
             ws = h.get("sources", {}).get("kalshi_ws", {})
-            status = {
-                "node_id":       node_id,
-                "health":        h.get("overall", "unknown"),
-                "ws_connected":  ws.get("status") == "ok",
-                "last_cycle_at": _ts_us_to_iso(h.get("ts_us")),
-                "sources":       h.get("sources", {}),
-                "cycle_count":   h.get("cycle_count"),
-                "uptime_seconds":h.get("uptime_seconds"),
-                "session_pnl":   await _session_pnl_from_db(db),
+            intel_data = {
+                "node_id":        node_id,
+                "health":         h.get("overall", "unknown"),
+                "ws_connected":   ws.get("status") == "ok",
+                "last_cycle_at":  _ts_us_to_iso(h.get("ts_us")),
+                "sources":        h.get("sources", {}),
+                "cycle_count":    h.get("cycle_count"),
+                "uptime_seconds": h.get("uptime_seconds"),
             }
         elif node_id.startswith("exec"):
-            exec_health_overall = h.get("overall", "unknown")
+            exec_health = h.get("overall", "unknown")
             biz_error = h.get("sources", {}).get("business", {}).get("error", "")
             if biz_error:
                 business_issues = [s.strip() for s in biz_error.split(";") if s.strip()]
 
-    # Surface exec business issues; upgrade overall health if needed
+    status.update(intel_data)
+    status["exec_health"]    = exec_health
+    status["session_pnl"]    = await _session_pnl_from_db(db)
     status["business_issues"] = business_issues
     if business_issues and status.get("health") not in ("critical",):
         status["health"] = "degraded"

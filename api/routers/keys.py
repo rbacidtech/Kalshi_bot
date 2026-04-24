@@ -410,7 +410,7 @@ async def verify_key(
         if exchange == ExchangeType.kalshi:
             result_payload = await _verify_kalshi(key_id, private_key)
         elif exchange == ExchangeType.coinbase:
-            result_payload = {"status": "not_implemented", "exchange": exchange.value}
+            result_payload = await _verify_coinbase(key_id, private_key)
         else:
             # Defensive: unreachable given the ExchangeType enum, but guard anyway.
             result_payload = {"status": "error", "detail": "Unknown exchange"}
@@ -463,6 +463,64 @@ async def verify_key(
 # ---------------------------------------------------------------------------
 # Kalshi connectivity helper
 # ---------------------------------------------------------------------------
+
+async def _verify_coinbase(key_id: str, private_key: str) -> dict[str, Any]:
+    """
+    Verify Coinbase credentials by calling GET /api/v3/brokerage/accounts.
+    Uses ES256 JWT signing identical to positions.py (_cb_make_jwt).
+    Returns {"status": "ok", "exchange": "coinbase"} or {"status": "error", ...}.
+    """
+    import time as _time
+    import httpx
+
+    def _b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    def _make_jwt(key_name: str, pem: str, method: str, path: str) -> str:
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+        now = int(_time.time())
+        header  = {"alg": "ES256", "kid": key_name}
+        payload = {
+            "sub": key_name, "iss": "cdp", "nbf": now, "exp": now + 120,
+            "uri": f"{method} api.coinbase.com{path}",
+        }
+        h64 = _b64url(json.dumps(header,  separators=(",", ":")).encode())
+        p64 = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+        signing_input = f"{h64}.{p64}".encode()
+        priv = serialization.load_pem_private_key(pem.encode(), password=None)
+        der_sig = priv.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+        r_val, s_val = decode_dss_signature(der_sig)
+        raw_sig = r_val.to_bytes(32, "big") + s_val.to_bytes(32, "big")
+        return f"{h64}.{p64}.{_b64url(raw_sig)}"
+
+    path = "/api/v3/brokerage/accounts"
+    try:
+        jwt_token = _make_jwt(key_id, private_key, "GET", path)
+    except Exception as exc:
+        logger.warning("Coinbase verify JWT error: %s", type(exc).__name__)
+        return {"status": "error", "detail": "Invalid private key — expected EC P-256 PEM"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get(
+                f"https://api.coinbase.com{path}",
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+    except Exception as exc:
+        logger.warning("Coinbase verify request failed: %s", type(exc).__name__)
+        return {"status": "error", "detail": "Network error contacting Coinbase API"}
+
+    if resp.status_code == 200:
+        return {"status": "ok", "exchange": "coinbase"}
+    if resp.status_code == 401:
+        return {"status": "error", "detail": "Authentication failed — check key name and PEM"}
+    if resp.status_code == 403:
+        return {"status": "error", "detail": "Key authenticated but missing required permissions"}
+    return {"status": "error", "detail": f"Coinbase API returned HTTP {resp.status_code}"}
+
 
 async def _verify_kalshi(key_id: str, private_key: str) -> dict[str, Any]:
     """
