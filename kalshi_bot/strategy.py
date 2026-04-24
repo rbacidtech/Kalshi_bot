@@ -1276,19 +1276,15 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         strike_type = "greater"  # default; overwritten for temp markets below
 
         if cfg["type"] in ("high_temp", "low_temp"):
-            # Prefer floor_strike from market object; fall back to title regex
-            floor_strike_raw = market.get("floor_strike")
-            if floor_strike_raw is not None:
-                threshold = float(floor_strike_raw)
-            else:
-                tm = re.search(r"(\d+)\s*[°º Ff]+", title)
-                if not tm:
-                    log.debug("Weather: no threshold in title %r", title[:60])
-                    continue
-                threshold = float(tm.group(1))
-
-            # strike_type: "greater" → YES if temp > threshold; "less" → YES if temp < threshold
+            # Kalshi weather market types (verified live):
+            #   strike_type="greater"  YES iff temp >  floor_strike
+            #   strike_type="less"     YES iff temp <  cap_strike
+            #   strike_type="between"  YES iff floor_strike <= temp <= cap_strike
+            # Kalshi's yes_price represents P(YES wins) for the market's own
+            # outcome question — no external inversion required.
             strike_type = market.get("strike_type", "greater")
+            floor_raw   = market.get("floor_strike")
+            cap_raw     = market.get("cap_strike")
 
             # Gather temperature estimates from all available sources.
             # Weights: ECMWF > NWS hourly > GFS > NWS daily (accuracy ranking).
@@ -1330,9 +1326,44 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
             if spread < 1.5 and len(raw_temps) >= 2:
                 base_sigma *= 0.85
             effective_sig = _math.sqrt(base_sigma ** 2 + (spread / 2) ** 2)
-            z             = (threshold - mean_temp) / effective_sig
-            p_above       = 0.5 * (1.0 - _math.erf(z / _math.sqrt(2)))
-            fair_value    = p_above if strike_type != "less" else (1.0 - p_above)
+
+            def _p_above(thresh: float) -> float:
+                """P(actual temp > thresh) under N(mean_temp, effective_sig)."""
+                z = (thresh - mean_temp) / effective_sig
+                return 0.5 * (1.0 - _math.erf(z / _math.sqrt(2)))
+
+            if strike_type == "greater":
+                thresh = float(floor_raw) if floor_raw is not None else None
+                if thresh is None:
+                    tm = re.search(r"(\d+)\s*[°º Ff]+", title)
+                    if not tm:
+                        log.debug("Weather greater: no threshold for %s", ticker)
+                        continue
+                    thresh = float(tm.group(1))
+                fair_value = _p_above(thresh)
+            elif strike_type == "less":
+                thresh = float(cap_raw) if cap_raw is not None else None
+                if thresh is None:
+                    tm = re.search(r"(\d+)\s*[°º Ff]+", title)
+                    if not tm:
+                        log.debug("Weather less: no threshold for %s", ticker)
+                        continue
+                    thresh = float(tm.group(1))
+                fair_value = 1.0 - _p_above(thresh)
+            elif strike_type == "between":
+                # Band market: YES iff floor <= temp <= cap.
+                # fair_value = Φ(z_cap) - Φ(z_floor) = P(temp>floor) - P(temp>cap).
+                if floor_raw is None or cap_raw is None:
+                    log.debug("Weather between: missing floor/cap for %s", ticker)
+                    continue
+                floor_t = float(floor_raw)
+                cap_t   = float(cap_raw)
+                if cap_t < floor_t:
+                    floor_t, cap_t = cap_t, floor_t
+                fair_value = max(0.0, _p_above(floor_t) - _p_above(cap_t))
+            else:
+                log.debug("Weather: unsupported strike_type=%r for %s", strike_type, ticker)
+                continue
 
         elif cfg["type"] == "precip":
             tm = re.search(r"(\d+\.?\d*)\s*inch", title, re.IGNORECASE)
@@ -1372,10 +1403,12 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
 
         fair_value = max(0.02, min(0.98, fair_value))
 
-        # For "less" (below-threshold) B-series markets, Kalshi stores the price
-        # as the "above" YES price.  Invert to get the actual YES price for this market.
-        if strike_type == "less":
-            price = 1.0 - price
+        # Kalshi's yes_price represents P(YES wins) for the market's own
+        # outcome definition — applies equally to "greater", "less", and
+        # "between" markets. No external inversion is needed; the old
+        # `if strike_type == "less": price = 1 - price` was wrong (a
+        # double-flip for T-series "less" markets whose yes_price already
+        # represents P(high < cap_strike)).
 
         diff = fair_value - price
         if abs(diff) < MIN_EDGE_GROSS:
