@@ -45,8 +45,16 @@ REDIS_URL        = os.getenv("REDIS_URL",      "redis://localhost:6379/0")
 FRED_KEY         = os.getenv("FRED_API_KEY",   "")
 TE_KEY           = os.getenv("TE_API_KEY",     "")
 LOOP_INTERVAL_S  = int(os.getenv("DATASOURCES_INTERVAL_S", "60"))
+# Back-off window after a FRED 429/403. Demo keys are 120 req/day so a hit
+# means we're saturating; 1h cool-off prevents hammering and restores after.
+FRED_BACKOFF_S   = int(os.getenv("FRED_BACKOFF_S", "3600"))
 
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+# Shared FRED back-off state. Mutable dict so _fred can update from any
+# enclosing coroutine. `ts` is the wall-clock second until which FRED calls
+# should be suppressed. 0 = not in back-off.
+_FRED_BACKOFF_UNTIL: Dict[str, float] = {"ts": 0.0}
 
 # ── Redis keys & TTLs ──────────────────────────────────────────────────────────
 _SOURCES: List[tuple] = [
@@ -107,9 +115,21 @@ class DataSourceManager:
         await self._r.set(key, payload, ex=ttl)
 
     async def _fred(self, series_id: str, limit: int = 5) -> Optional[List[dict]]:
-        """Fetch FRED observations, newest first. Returns None on any error."""
+        """Fetch FRED observations, newest first. Returns None on any error.
+
+        FRED demo keys are rate-limited to ~120 req/day. Production keys get
+        ~1000/day. On 429 / 403 we back off (in-memory) so a rate-limit event
+        doesn't silently skip writes forever — the back-off ends at the next
+        `refresh_all` cycle after FRED_BACKOFF_S seconds.
+        """
         if not FRED_KEY:
             log.debug("FRED_API_KEY not set — skipping %s", series_id)
+            return None
+        # Module-level back-off timestamp — if we got a 429/403 recently, skip.
+        _now = time.time()
+        if _now < _FRED_BACKOFF_UNTIL["ts"]:
+            log.debug("FRED %s skipped — in back-off for %.0fs",
+                      series_id, _FRED_BACKOFF_UNTIL["ts"] - _now)
             return None
         url = (
             "https://api.stlouisfed.org/fred/series/observations"
@@ -122,6 +142,13 @@ class DataSourceManager:
             if r.status_code == 200:
                 return [o for o in r.json().get("observations", [])
                         if o.get("value", ".") != "."]
+            if r.status_code in (429, 403):
+                _FRED_BACKOFF_UNTIL["ts"] = _now + FRED_BACKOFF_S
+                log.warning(
+                    "FRED rate-limit / forbidden (status=%d) on %s — "
+                    "backing off %ds for all FRED series",
+                    r.status_code, series_id, FRED_BACKOFF_S,
+                )
         except Exception as exc:
             log.warning("FRED %s error: %s", series_id, exc)
         return None
@@ -369,6 +396,18 @@ class DataSourceManager:
         skew = None
         if put_ivs and call_ivs:
             skew = round(sum(put_ivs) / len(put_ivs) - sum(call_ivs) / len(call_ivs), 3)
+
+        # Rollover blindness guard: Deribit rolls option expiries at midnight
+        # UTC. During the ~60s rollover window, the 7-60 DTE band can be empty
+        # or heavily biased. Skip the write so the previous cache value (valid
+        # up to its 10-min TTL) remains the latest reading. Consumers tolerate
+        # a missing payload (ep_intel:2431 already has an age check).
+        if len(put_ivs) + len(call_ivs) == 0:
+            log.warning(
+                "Deribit skew: 0 options in 7-60 DTE band (rollover?) — "
+                "skipping write, prior cache persists until TTL"
+            )
+            return None
 
         return {
             "dvol":              round(float(dvol), 3) if dvol else None,
