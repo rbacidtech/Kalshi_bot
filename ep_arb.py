@@ -47,6 +47,11 @@ MAX_CONTRACTS    = int(os.getenv("ARB_MAX_CONTRACTS",   "3"))     # contracts pe
 # directional exposure gate; arbs were previously uncapped. Fail-open with
 # a warning if balance can't be read (preserves latency vs the arb opportunity).
 ARB_MAX_TOTAL_EXP_PCT = float(os.getenv("ARB_MAX_TOTAL_EXP_PCT", "0.80"))
+# Max age (seconds) of poly + kalshi prices before the arb opportunity is
+# considered stale. Polygon polls every ~300ms and Kalshi every ~200ms, so
+# normal wall clock age at FIRE time is < 1s. Reject if either price is older
+# than this — the divergence may have already closed.
+ARB_MAX_PRICE_AGE_S = float(os.getenv("ARB_MAX_PRICE_AGE_S", "2.0"))
 POLY_POLL_MS     = int(os.getenv("ARB_POLY_POLL_MS",    "300"))   # Polymarket poll interval (ms)
 KALSHI_POLL_MS   = int(os.getenv("ARB_KALSHI_POLL_MS",  "200"))   # Kalshi poll interval (ms)
 MAP_REFRESH_S    = int(os.getenv("ARB_MAP_REFRESH_S",   "1800"))  # market remap every 30 min
@@ -404,6 +409,19 @@ class ArbEngine:
         if time.monotonic() < pair.cooldown_until:
             return
 
+        # Price staleness gate: reject if either leg's price is older than
+        # ARB_MAX_PRICE_AGE_S. The divergence we detected may already have
+        # closed; trading on stale quotes is worse than skipping.
+        _now_mono = time.monotonic()
+        _poly_age = _now_mono - pair.poly_ts
+        _kal_age  = _now_mono - pair.kalshi_ts
+        if _poly_age > ARB_MAX_PRICE_AGE_S or _kal_age > ARB_MAX_PRICE_AGE_S:
+            log.debug(
+                "arb: STALE  %s  poly_age=%.2fs  kalshi_age=%.2fs  (max %.1fs) — skip",
+                ticker, _poly_age, _kal_age, ARB_MAX_PRICE_AGE_S,
+            )
+            return
+
         # Re-verify divergence with freshest prices
         poly_cents = pair.poly_price * 100.0
         diff       = poly_cents - pair.kalshi_mid
@@ -512,23 +530,73 @@ class ArbEngine:
                         _parts = ticker.rsplit("-T", 1)
                         meeting = _parts[0] if len(_parts) > 1 else ""
 
+                    # Race re-check: another service (ep_exec most likely) may have
+                    # written to this ticker during our ~100ms order-placement HTTP
+                    # call. If so, our hset would overwrite their record. Cancel our
+                    # order and abort rather than corrupt their state.
+                    try:
+                        raced = await self._redis.hexists(EP_POSITIONS, ticker)
+                    except Exception:
+                        raced = False
+                    if raced:
+                        log.warning(
+                            "arb: RACE %s — another writer claimed ticker during "
+                            "order placement; cancelling order_id=%s",
+                            ticker, order_id,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                self._client._request, "DELETE",
+                                f"/portfolio/orders/{order_id}",
+                            )
+                        except Exception as _cx:
+                            log.error(
+                                "arb: cancel FAILED after race; order_id=%s open on "
+                                "Kalshi with no Redis record: %s",
+                                order_id, _cx,
+                            )
+                        return
+
                     # Write with fill_confirmed=False so ep_exec's _fill_poll_loop
                     # picks up the resting order. Without this flag the position
                     # stays as a phantom in Redis if the limit order never fills.
-                    await self._redis.hset(EP_POSITIONS, ticker, json.dumps({
-                        "ticker":         ticker,
-                        "side":           side,
-                        "contracts":      MAX_CONTRACTS,
-                        "contracts_filled": 0,
-                        "entry_cents":    entry_cents_yes,
-                        "meeting":        meeting,
-                        "entered_at":     datetime.now(timezone.utc).isoformat(),
-                        "model_source":   "arb_realtime",
-                        "strategy":       "poly_arb",
-                        "order_id":       order_id,
-                        "fill_confirmed": False,
-                        "pending":        False,
-                    }))
+                    #
+                    # If the Redis write fails after the Kalshi order succeeded we
+                    # have an orphan. Cancel the Kalshi order to keep Redis as the
+                    # source of truth. (ep_exec's orphan reconciliation would also
+                    # eventually pick it up, but an explicit cancel is cleaner.)
+                    try:
+                        await self._redis.hset(EP_POSITIONS, ticker, json.dumps({
+                            "ticker":         ticker,
+                            "side":           side,
+                            "contracts":      MAX_CONTRACTS,
+                            "contracts_filled": 0,
+                            "entry_cents":    entry_cents_yes,
+                            "meeting":        meeting,
+                            "entered_at":     datetime.now(timezone.utc).isoformat(),
+                            "model_source":   "arb_realtime",
+                            "strategy":       "poly_arb",
+                            "order_id":       order_id,
+                            "fill_confirmed": False,
+                            "pending":        False,
+                        }))
+                    except Exception as _re:
+                        log.error(
+                            "arb: Redis hset FAILED after fill; cancelling order_id=%s "
+                            "to prevent orphan: %s", order_id, _re,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                self._client._request, "DELETE",
+                                f"/portfolio/orders/{order_id}",
+                            )
+                        except Exception as _cx:
+                            log.error(
+                                "arb: cancel FAILED after Redis error; order_id=%s "
+                                "open on Kalshi with no Redis record (ep_exec "
+                                "orphan reconciliation will eventually pick it up): %s",
+                                order_id, _cx,
+                            )
             else:
                 self._stats["rejected"] += 1
                 log.info("arb: REJECTED  %s  %.0fms  resp=%s", ticker, elapsed, str(resp)[:120])
