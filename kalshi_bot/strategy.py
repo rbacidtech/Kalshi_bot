@@ -34,6 +34,7 @@ from kalshi_bot.models.fomc import (
     fair_value_with_confidence as _fomc_fair_value,
     set_current_fed_rate       as _set_fomc_rate,
     parse_fomc_ticker          as _parse_fomc_ticker,
+    get_meeting_probs          as _get_meeting_probs,
 )
 
 log = logging.getLogger(__name__)
@@ -542,13 +543,19 @@ async def scan_fomc_directional(
     # Pre-fetch fomc model probabilities for all tickers concurrently.
     # Builds a flat list so we can run a single asyncio.gather().
     all_markets_flat = [m for group in groups.values() for m in group]
-    fomc_results: dict[str, tuple] = {}  # ticker → (fair_yes, model_conf)
+    fomc_results: dict[str, tuple] = {}  # ticker → (fair_yes, model_conf, sources_str)
 
     async def _fetch_one(ticker: str, price: float) -> None:
         try:
             fv, mc = await _fomc_fair_value(ticker, price)
             if fv is not None:
-                fomc_results[ticker] = (fv, mc)
+                parsed = _parse_fomc_ticker(ticker)
+                sources_str = "fomc"
+                if parsed:
+                    mp = await _get_meeting_probs(parsed["meeting"])
+                    if mp and getattr(mp, "sources", None):
+                        sources_str = "+".join(mp.sources)
+                fomc_results[ticker] = (fv, mc, sources_str)
         except Exception as exc:
             log.debug("fomc model fetch failed for %s: %s", ticker, exc)
 
@@ -588,11 +595,10 @@ async def scan_fomc_directional(
 
             # ── Fair value: real model or FRED-anchor fallback ────────────────
             if ticker in fomc_results:
-                fair_yes, model_conf = fomc_results[ticker]
+                fair_yes, model_conf, model_src = fomc_results[ticker]
                 # Apply proximity adjustment to model confidence, then 2Y delta
                 confidence = max(0.40, min(0.95,
                     _fomc_proximity_confidence(model_conf) + tsy_conf_adj))
-                model_src  = "fedwatch+zq+wsj"
             else:
                 # FRED rate-anchor fallback (unchanged from prior implementation)
                 rate_diff_bps = (strike - current_rate) * 100
@@ -2006,7 +2012,7 @@ async def scan_gdp_markets(
             edge = price - fair_value
 
         fee_edge = _fee_adjusted_edge(fair_value, price, side)
-        if fee_edge < 0.04:
+        if fee_edge < 0.08:  # must clear 7¢ fee; 0.04 was below the fee floor
             continue
 
         # ── GDP directional consistency guard ────────────────────────────────
