@@ -83,7 +83,12 @@ class BookState:
     cooldown_until: float = 0.0
 
     def mid_cents(self) -> float:
-        """Estimate mid from best YES bid + best NO bid."""
+        """Estimate mid from best YES bid + best NO bid.
+
+        Returns 0.0 when BOTH books are empty — callers must guard against
+        mid=0 before any price-dependent logic (line 190 check in _apply_delta
+        rejects but downstream _publish_signal also re-checks).
+        """
         top_yes = max((float(p) for p in self.yes_bids), default=0.0) * 100
         top_no  = max((float(p) for p in self.no_bids),  default=0.0) * 100
         if top_yes and top_no:
@@ -94,6 +99,12 @@ class BookState:
         """
         YES depth ratio = total YES contracts within DEPTH_BAND_C of mid /
                           (total YES + total NO contracts in same band).
+
+        Note on NO bid geometry: self.no_bids stores NO bid prices (what a
+        buyer of NO is willing to pay). The equivalent YES ask price is
+        100 - no_bid. The below arithmetic converts NO bids to YES-space
+        before comparing to `mid` so YES and NO legs are measured in the
+        same coordinate.
         """
         yes_depth = sum(
             qty for p, qty in self.yes_bids.items()

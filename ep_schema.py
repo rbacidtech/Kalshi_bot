@@ -136,10 +136,24 @@ class SignalMessage:
         """Flat string mapping for XADD (Redis Streams requirement)."""
         return {"payload": json.dumps(asdict(self))}
 
+    _SUPPORTED_VERSIONS = frozenset(("1",))
+
     @classmethod
     def from_redis(cls, mapping: Dict) -> "SignalMessage":
         key  = b"payload" if b"payload" in mapping else "payload"
         data = json.loads(mapping[key])
+        # Schema version check — surface mismatches loudly so incompatible
+        # message formats don't get silently degraded by field-filtering.
+        # Unknown versions are accepted with a warning so we don't block a
+        # rollout of a newer Intel / Exec binary; known-bad can be added.
+        v = str(data.get("schema_version", "1"))
+        if v not in cls._SUPPORTED_VERSIONS:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "SignalMessage schema_version=%s not in supported set %s — "
+                "processing best-effort; new fields will be dropped",
+                v, sorted(cls._SUPPORTED_VERSIONS),
+            )
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(**known)
 

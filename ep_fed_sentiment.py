@@ -8,6 +8,7 @@ Result is cached 6 hours in Redis under ep:fed_sentiment.
 
 import json
 import logging
+import os
 import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Optional
@@ -46,18 +47,41 @@ def _fetch_recent_speeches(n: int = 3) -> str:
         log.warning("Fed RSS: no <channel> element found")
         return ""
 
-    items = channel.findall("item")[:n]
-    if not items:
-        log.warning("Fed RSS: no <item> elements found")
-        return ""
+    # Collect items with their publication date so we can filter out stale
+    # speeches. Old speeches (>14 days) have no bearing on current Fed
+    # stance and would bias the hawk/dove score toward yesterday's regime.
+    # The previous behavior took the first N items regardless of date.
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from email.utils import parsedate_to_datetime as _pdt
+    _MAX_SPEECH_AGE = _td(days=14)
+    _now = _dt.now(_tz.utc)
 
-    parts = []
-    for item in items:
+    candidates: list[tuple[_dt, str, str]] = []
+    for item in channel.findall("item"):
         title = (item.findtext("title") or "").strip()
         desc  = (item.findtext("description") or "").strip()
-        if title or desc:
-            parts.append(f"Title: {title}\nDescription: {desc}")
+        if not (title or desc):
+            continue
+        pub_raw = (item.findtext("pubDate") or "").strip()
+        pub_dt: Optional[_dt] = None
+        if pub_raw:
+            try:
+                pub_dt = _pdt(pub_raw)
+                if pub_dt.tzinfo is None:
+                    pub_dt = pub_dt.replace(tzinfo=_tz.utc)
+            except (TypeError, ValueError):
+                pub_dt = None
+        if pub_dt is not None and (_now - pub_dt) > _MAX_SPEECH_AGE:
+            continue  # drop stale speeches
+        candidates.append((pub_dt or _dt.min.replace(tzinfo=_tz.utc), title, desc))
 
+    if not candidates:
+        log.warning("Fed RSS: no recent (<14d) speeches found")
+        return ""
+
+    # Newest first; take up to n
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    parts = [f"Title: {t}\nDescription: {d}" for _ts, t, d in candidates[:n]]
     return "\n\n".join(parts)
 
 
@@ -82,8 +106,13 @@ def _call_claude(text: str) -> Optional[float]:
             "-1.0 = extremely dovish (rate cuts expected), 0.0 = neutral. "
             f"Speeches: {text}"
         )
+        # Model read from env — avoid hardcoding a version that may be
+        # deprecated in a future Anthropic API release. FED_SENTIMENT_MODEL
+        # defaults to the current production alias; operator can override
+        # without a code change on deprecation.
+        _model = os.getenv("FED_SENTIMENT_MODEL", "claude-sonnet-4-6")
         message = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=_model,
             max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )

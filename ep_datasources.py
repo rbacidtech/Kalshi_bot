@@ -272,6 +272,15 @@ class DataSourceManager:
         Filters: US events with forecasts, next 7 days, high-importance only.
         """
         api_key = TE_KEY or "guest:guest"
+        if not TE_KEY:
+            # Log the fallback once per instance so operators notice the quota
+            # degradation. Guest is 500–1000 req/month; easy to exhaust.
+            if not getattr(self, "_te_guest_warned", False):
+                log.info(
+                    "TE_API_KEY unset — falling back to guest:guest (limited quota). "
+                    "Set TE_API_KEY to restore full quota."
+                )
+                self._te_guest_warned = True
         try:
             async with httpx.AsyncClient(timeout=12.0) as client:
                 r = await client.get(
@@ -461,6 +470,18 @@ class DataSourceManager:
 
         valid = {k: v for k, v in prices.items() if v is not None}
         if not valid:
+            return None
+        # Require at least 2 sources for the spread to be meaningful. With 1
+        # source the reported spread is 0 and the "mid" is just that one
+        # exchange's price, which consumers (ep_advisor / ep_btc spread gate)
+        # may interpret as "narrow spread → safe to trade". Surface partial
+        # outages explicitly so ops sees when 3 of 4 exchanges are down.
+        if len(valid) < 2:
+            log.warning(
+                "BTC cross-exchange: only %d/4 sources responding — "
+                "skipping write to avoid misleading 0-spread reading",
+                len(valid),
+            )
             return None
 
         lo_exch = min(valid, key=valid.__getitem__)
