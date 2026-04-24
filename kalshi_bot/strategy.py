@@ -1237,8 +1237,11 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         if target < today:
             continue   # already resolved
         days_ahead = (target - today).days
-        if days_ahead == 0:
-            continue   # same-day markets trigger immediate pre_expiry (close within 24h)
+        # Day-of weather markets used to be skipped here because the exit loop
+        # fired pre_expiry_t1 immediately on entry. That path is now guarded
+        # for weather (ep_exec._is_weather_ticker), so same-day is fine —
+        # often the highest-conviction signal because day-of forecast has the
+        # lowest uncertainty.
 
         # RFC3339 close_time: end of target date in UTC (weather markets close at 23:59 local ≈ midnight UTC next day)
         _close_dt = datetime(target.year, target.month, target.day, 23, 59, 59, tzinfo=timezone.utc)

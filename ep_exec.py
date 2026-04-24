@@ -2069,7 +2069,10 @@ async def _exit_checker(
                     # squeeze in between the deletion and the cooldown assignment,
                     # see no cooldown, and immediately re-enter the position —
                     # causing an exit → re-entry → exit loop every 60s.
-                    if "stop_loss" in exit_reason or "trailing_stop" in exit_reason:
+                    if ("stop_loss" in exit_reason or "trailing_stop" in exit_reason) and not _weather:
+                        # Weather tickers rotate daily (KXHIGHNY-26APR24 → …-26APR25),
+                        # so per-ticker stopcnt escalation never repeats and the
+                        # 7d TTL just carries dead state. Skip it.
                         _exit_cooldown[ticker] = time.time()
                         # Escalate cooldown based on repeated stops (persisted in Redis)
                         try:
