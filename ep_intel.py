@@ -904,9 +904,17 @@ async def _enrich_orderbook_imbalance(
     if not signals or min_imb <= 0.0:
         return signals
 
-    # Arb signals bypass the filter; non-arb signals get enriched
-    arb      = [s for s in signals if getattr(s, "arb_partner", None)]
-    to_check = [s for s in signals if not getattr(s, "arb_partner", None)]
+    # Arb signals bypass the filter; non-arb signals get enriched.
+    # Weather is also bypassed: cheap-YES / cheap-NO band bets are
+    # asymmetric-payoff plays where a book stacked against the direction
+    # is precisely WHY the entry price is good — e.g. T60 YES at 1¢ when
+    # 1655 NO bids / 0 YES bids. Applying the opposing-book filter here
+    # was starving every top-up opportunity on the ticker we already
+    # hold, so the OB filter runs only on directional strategies.
+    arb      = [s for s in signals if getattr(s, "arb_partner", None)
+                                    or getattr(s, "category", "") == "weather"]
+    to_check = [s for s in signals if not getattr(s, "arb_partner", None)
+                                    and getattr(s, "category", "") != "weather"]
 
     if not to_check:
         return signals
