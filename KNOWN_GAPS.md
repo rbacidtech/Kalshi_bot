@@ -8,6 +8,7 @@ _Updated 2026-04-24 04:48 UTC — Item 11 (metrics port) fixed and verified._
 _Updated 2026-04-24 04:50 UTC — Item 9 (kelly_calib column mismatch) fixed and verified._
 _Updated 2026-04-24 04:55 UTC — Audit #5 (edge_threshold × 0.7 silent discount) resolved via Option A (drop multiplier, keep operator override at 0.41)._
 _Updated 2026-04-24 05:10 UTC — full second-round audit across advisor, arb engine, BTC strategy, and FOMC model. Findings recorded below under "Second-round audit"._
+_Updated 2026-04-24 05:20 UTC — all 5 CRITICAL items from second-round audit patched (commit 9bbabaf)._
 
 ## Silently broken — needs fix
 
@@ -184,51 +185,45 @@ positives (marked "downgraded" below).
 
 ### CRITICAL
 
-- **Arb #1 — `entry_cents` convention violation for NO legs.**
-  `ep_arb.py:457` stores raw `limit_cents` as `entry_cents`. For a NO
-  leg filled at 47¢, this writes `entry_cents=47` instead of the
-  required YES-equivalent of 53. Every exit P&L calc, trailing stop,
-  and stop-loss trigger on an arb NO leg operates on the wrong basis.
-  This is the exact invariant `ep_positions.py:60-66` warns about,
-  but the warning is only emitted for post-sync updates, not for arb
-  writes. **Fix:** `(100 - limit_cents) if side == "no" else limit_cents`
-  at the hset call site.
+All 5 CRITICAL findings patched in commit `9bbabaf` on 2026-04-24 ~05:20 UTC.
 
-- **Arb #2 — Position written to Redis before fill confirmation.**
-  `ep_arb.py:449-462` — on receiving an order_id back from Kalshi,
-  immediately `hset ep:positions` with no `fill_confirmed` flag and
-  no `pending=True`. If the limit order never fills, we have a
-  phantom position that `_exit_checker` treats as real. ep_exec.py
-  already uses the `fill_confirmed=False` → `_fill_poll_loop` pattern
-  for the same problem; arb diverged. **Fix:** add
-  `"fill_confirmed": False, "pending": True` to the dict at line
-  452-462 so fill_poll picks it up automatically.
+- ~~**Arb #1 — `entry_cents` convention violation for NO legs.**~~
+  **FIXED.** `ep_arb.py:457` now writes `(100 - limit_cents) if
+  side == "no" else limit_cents`. Invariant restored. Any NO-leg arb
+  positions opened under the old code will still have inverted
+  entry_cents in Redis until they exit and clear — no retroactive
+  backfill applied because we'd risk corrupting in-flight trades
+  whose exit logic has already compensated for the bug. Going
+  forward, new NO-leg arbs are correct.
 
-- **Arb #3 — Capital limits bypassed entirely.**
-  ep_arb.py never queries `total_exposure_cents` or compares against
-  `MAX_TOTAL_EXPOSURE` (80% of balance) or `MAX_LONG_PCT` /
-  `MAX_SHORT_PCT` (70% each). A surge of simultaneous divergence
-  events could place arbitrarily many leg pairs without hitting any
-  cap. Butterflies are dead (Item 1) so exposure is small in practice
-  today, but the gate is structurally absent. **Fix:** ~3 lines
-  using `bus.get_all_positions()` before each FIRE; skip the fire if
-  adding this pair's cost would exceed the cap.
+- ~~**Arb #2 — Position written to Redis before fill confirmation.**~~
+  **FIXED.** `ep_arb.py` hset now includes
+  `fill_confirmed=False, contracts_filled=0, pending=False` (same
+  convention ep_exec uses for resting orders). ep_exec's
+  `_fill_poll_loop` runs every 10s and will confirm or timeout
+  arb-placed orders automatically. Also derives `meeting` from
+  ticker so arb positions count toward the concentration gate.
 
-- **Advisor #1 — No per-cycle delta clamp on whitelisted keys.**
-  `ep_advisor.py:76-84` has absolute bounds per key (e.g.,
-  `llm_kelly_fraction ∈ [0.05, 0.35]`) which is good, but Claude
-  can legally jump from 0.05 → 0.35 in a single 30-min cycle. One
-  hallucinated or mis-reasoned adjustment = 7× Kelly change live.
-  **Fix:** add a `max_delta` field to each `_WHITELIST` entry;
-  reject in `_validate_adjustment` if `|new - current| > max_delta`.
+- ~~**Arb #3 — Capital limits bypassed entirely.**~~
+  **FIXED.** `ep_arb.py` now reads balance from `ep:balance`,
+  computes total exposure from `ep:positions`, and skips FIRE if
+  adding the trade cost would exceed `ARB_MAX_TOTAL_EXP_PCT`
+  (default 0.80) of balance. Fail-open with `log.warning` if
+  balance read fails — preserves latency on the arb opportunity.
 
-- **FOMC #1 — Confidence prior/new log prints same value twice.**
-  `kalshi_bot/models/fomc.py:2747-2756`. Line 2747 mutates
-  `confidence = max(confidence, sr3_mp.confidence)` before the
-  log.info at 2754-2756 reads `confidence` for both "prior" and
-  "new" arguments. Diagnostic only — cross-validation behavior is
-  real, just invisible in logs. **Fix:** `prior_conf = confidence`
-  saved before the `max(...)` assignment.
+- ~~**Advisor #1 — No per-cycle delta clamp on whitelisted keys.**~~
+  **FIXED.** `_WHITELIST` extended to `(lo, hi, max_delta)`.
+  `_validate_adjustment` now takes a `current` config dict and
+  rejects adjustments whose delta from current exceeds max_delta.
+  Per-key clamps: scale_factor ±0.30, kelly_fraction ±0.05,
+  rsi_oversold/overbought ±5, z_threshold ±0.50, max_contracts ±3.
+  Caller passes `ctx["current_config"]`.
+
+- ~~**FOMC #1 — Confidence prior/new log prints same value twice.**~~
+  **FIXED.** `kalshi_bot/models/fomc.py:2747` now captures
+  `prior_conf = confidence` before the `max(...)` mutation; log
+  passes `prior_conf, confidence` instead of the post-mutation
+  value twice.
 
 ### HIGH
 
