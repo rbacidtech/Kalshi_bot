@@ -2828,12 +2828,19 @@ async def _reconcile_orphan_orders(
             entry_cents = int(float(yes_price or 0.5) * 100)
         contracts    = int(float(order.get("initial_count_fp", 1) or 1))
 
+        # Derive meeting from ticker so the concentration-limit gate counts
+        # orphan-restored resting orders. Same rationale as in
+        # _sync_positions_with_kalshi — /portfolio/orders does not carry
+        # meeting, but the ticker encodes it for KXFED/KXGDP/etc.
+        meeting = _meeting_from_ticker(ticker)
+
         await positions.open(
             ticker      = ticker,
             side        = side,
             contracts   = contracts,
             entry_cents = entry_cents,
             fair_value  = float(yes_price or 0.5),
+            meeting     = meeting,
             pending     = False,
         )
         await positions.update_fields(ticker, {
@@ -2847,7 +2854,7 @@ async def _reconcile_orphan_orders(
                 "entry_cents":   entry_cents,
                 "contracts":     contracts,
                 "fair_value":    float(yes_price or 0.5),
-                "meeting":       "",
+                "meeting":       meeting,
                 "outcome":       "",
                 "entered_at":    datetime.now(timezone.utc).isoformat(),
                 "order_id":      order_id,
