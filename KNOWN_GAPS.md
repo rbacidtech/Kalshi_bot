@@ -10,6 +10,7 @@ _Updated 2026-04-24 04:55 UTC — Audit #5 (edge_threshold × 0.7 silent discoun
 _Updated 2026-04-24 05:10 UTC — full second-round audit across advisor, arb engine, BTC strategy, and FOMC model. Findings recorded below under "Second-round audit"._
 _Updated 2026-04-24 05:20 UTC — all 5 CRITICAL items from second-round audit patched (commit 9bbabaf)._
 _Updated 2026-04-24 05:25 UTC — 9 of 10 HIGH items patched (commits 60a40e4, 8be6934). Adv #2 deferred._
+_Updated 2026-04-24 05:30 UTC — MEDIUM/LOW sweep (commit 8e7218d). 4 MEDIUM fixed or resolved as not-a-bug; 1 deferred. 3 LOW fixed; 1 already gated._
 
 ## Silently broken — needs fix
 
@@ -247,18 +248,27 @@ in single-operator deployment).
 
 ### MEDIUM
 
-- **Adv #6** — `ep_advisor.py:267` hardcodes `recent_n=20`, `baseline_n=50` with no time-span sanity check. In a low-trade-cadence regime, "recent 20 trades" could span 10 days.
-- **Adv #7** — `ep_advisor.py:362-373` validates only the absolute value, not its magnitude relative to the current config value. Confidence-weighted delta constraint would catch large confidence-threshold-just-above-0.80 jumps.
-- **BTC #7** — `ep_exec.py:1944` logs `pnl_half` using `move_cents * half`, but if a second tranche fires soon the logged pnl becomes stale. Reporting-only.
-- **BTC #8** — `ep_btc.py:586,590` hardcoded funding-rate skip threshold (±0.0015) is 50–150% tighter than the adjustment thresholds (±0.0005 / ±0.0010). Creates a small skew at the boundary.
-- **FOMC #4** — `kalshi_bot/models/fomc.py:2920` staleness boundary at exactly 30 min gets penalized (age >= 1_800). Whether this is a bug depends on whether the 30-min threshold is meant to be inclusive.
+4 of 5 MEDIUM items resolved (patched or correctly identified as
+not-a-bug). Commit `8e7218d` on 2026-04-24 ~05:30 UTC.
+
+| # | Status | Notes |
+|---|--------|-------|
+| Adv #6 | FIXED (8e7218d) | `recent_span_days` and `baseline_span_days` added to strategy_health result. Advisor can now distinguish an active strategy from a dead one with the same n. |
+| Adv #7 | COVERED | Already addressed by Advisor #1 CRITICAL fix (delta clamp) in commit 9bbabaf. No separate patch needed. |
+| BTC #7 | NOT A BUG | `pnl_half` log at ep_exec.py:1944 fires once at tranche-1 time and uses that tick's move_cents correctly. Subagent misread the control flow. Do not re-report. |
+| BTC #8 | CALIBRATION CHOICE | Funding-rate skip threshold (±0.0015) tighter than adj thresholds (±0.0005 / ±0.0010) is a deliberate step function, not a correctness bug. Re-evaluate only with P&L evidence. |
+| FOMC #4 | EDGE CASE | Staleness boundary at exactly 30 min (age >= 1800) fires at a single instant per cycle. Docstring is ambiguous about inclusive vs exclusive. Not worth changing. |
 
 ### LOW
 
-- **Adv #8** — `ep_advisor.py:287-291` calibration-skip reasons not logged; operator can't tell why `override_min_yes_entry_price` isn't being updated.
-- **Adv #5** — `ep_advisor.py:304` bytes/str fallback on hgetall keys is brittle. Normalize keys after read.
-- **BTC #9** — Deribit skew applied without a freshness check on the feed.
-- **FOMC #5** — `data_quality="fallback_only"` flag is set correctly but not enforced downstream (ep_exec doesn't check it). Could sneak a low-confidence FRED-only signal through.
+3 of 4 LOW items resolved. Commit `8e7218d`.
+
+| # | Status | Notes |
+|---|--------|-------|
+| Adv #5 | FIXED (8e7218d) | `cfg_raw` normalized to str keys and values immediately after hgetall. Downstream lookups no longer need the brittle bytes/str fallback. |
+| Adv #8 | FIXED (8e7218d) | Calibration-skip reasons now printed when `yes_gate`/`stop_days` fall back to defaults. Includes the `note` field from each calibrator. |
+| BTC #9 | FIXED (8e7218d) | Deribit skew payload `ts` compared against wall clock; adjustment skipped if > 300s old. Tightens beyond the 600s Redis TTL. |
+| FOMC #5 | ALREADY GATED | `data_quality="fallback_only"` signals are already blocked at ep_intel.py:2617 unless edge >= FALLBACK_ONLY_EDGE_THRESHOLD (0.25). Subagent missed the downstream gate. Do not re-report. |
 
 ### Downgraded / false positives (do not re-report)
 
