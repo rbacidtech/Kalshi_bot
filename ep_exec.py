@@ -9,6 +9,7 @@ Both run under asyncio.gather() — neither blocks the other.
 """
 
 import asyncio
+import csv
 import json
 import os
 import re as _re
@@ -35,11 +36,12 @@ from ep_resolution_db import ResolutionDB, poll_resolutions_loop
 from kalshi_bot.executor import ArbRollbackFailed
 from ep_pg_audit import init_audit_writer, stop_audit_writer, audit as _audit_writer
 try:
-    from ep_kelly_calib import get_calibrated_kelly, kelly_calib_loop
+    from ep_kelly_calib import get_calibrated_kelly, kelly_calib_loop, get_strategy_conf_mult
     _KELLY_CALIB_AVAILABLE = True
 except ImportError:
     _KELLY_CALIB_AVAILABLE = False
     def get_calibrated_kelly(_edge): return None
+    def get_strategy_conf_mult(_src): return 1.0
     async def kelly_calib_loop(_bus, **_kw): pass
 
 
@@ -3087,6 +3089,82 @@ async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> No
         await asyncio.sleep(interval)
 
 
+async def _divergence_monitor_loop(bus: RedisBus, positions: "PositionStore", interval_s: int = 3600) -> None:
+    """
+    Hourly: compare live P&L vs paper P&L by reading trades.csv
+    and checking for systematic divergence (> 15% gap) that may
+    indicate slippage, fee model error, or execution bugs.
+
+    Writes results to ep:divergence Redis hash.
+    Alert if |live_pnl - paper_pnl| / max(|paper_pnl|, 1) > 0.15
+    """
+    trades_csv = os.getenv("KALSHI_TRADES_CSV", "/root/EdgePulse/output/trades.csv")
+
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            if not os.path.exists(trades_csv):
+                continue
+
+            live_pnl    = 0.0
+            paper_pnl   = 0.0
+            live_count  = 0
+            paper_count = 0
+
+            with open(trades_csv, newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        pnl   = float(row.get("pnl_cents", 0) or 0)
+                        mode  = row.get("mode", "live")
+                        ts_s  = row.get("ts") or row.get("timestamp") or ""
+                        if ts_s:
+                            import datetime as _dt
+                            row_dt = _dt.datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
+                            age_s = (datetime.now(timezone.utc) - row_dt.astimezone(timezone.utc)).total_seconds()
+                            if age_s > 7 * 86400:
+                                continue
+                        if mode == "paper":
+                            paper_pnl   += pnl
+                            paper_count += 1
+                        else:
+                            live_pnl   += pnl
+                            live_count += 1
+                    except Exception:
+                        continue
+
+            if live_count < 5 or paper_count < 5:
+                continue
+
+            divergence_pct = abs(live_pnl - paper_pnl) / max(abs(paper_pnl), 1.0)
+
+            await bus._r.hset("ep:divergence", mapping={
+                "live_pnl_cents":  str(int(live_pnl)),
+                "paper_pnl_cents": str(int(paper_pnl)),
+                "live_count":      str(live_count),
+                "paper_count":     str(paper_count),
+                "divergence_pct":  f"{divergence_pct:.4f}",
+                "ts":              str(time.time()),
+            })
+
+            if divergence_pct > 0.15:
+                log.warning(
+                    "Live/paper divergence: live=%.0f¢ paper=%.0f¢ (%.1f%%) — "
+                    "check for slippage, fee model error, or execution bugs",
+                    live_pnl, paper_pnl, divergence_pct * 100,
+                )
+            else:
+                log.info(
+                    "Live/paper check: live=%.0f¢ paper=%.0f¢ divergence=%.1f%% (OK)",
+                    live_pnl, paper_pnl, divergence_pct * 100,
+                )
+
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log.debug("Divergence monitor error: %s", exc)
+
+
 async def _wait_for_dependencies() -> None:
     """Retry Redis and Postgres until reachable before marking the service ready."""
     import redis.asyncio as _aioredis
@@ -3313,6 +3391,7 @@ async def exec_main() -> None:
             _business_health_loop(bus),
             _midnight_reset_loop(bus, risk_engine),
             kelly_calib_loop(bus),
+            _divergence_monitor_loop(bus, positions),
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         log.info("Exec loop cancelled.")

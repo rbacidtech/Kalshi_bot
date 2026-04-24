@@ -80,6 +80,10 @@ _PRICE_GATE_EXEMPT_SOURCES: frozenset = frozenset({
     "calendar_spread_arb",
     "gdp_fomc_coherence",
     "cross_series_coherence",
+    "calendar_decay",
+    "earnings_yfinance",
+    "unrate_fomc_coherence",
+    "cpi_fomc_coherence",
 })
 
 # ── Signal dataclass ──────────────────────────────────────────────────────────
@@ -3190,6 +3194,524 @@ def scan_near_resolution(markets: list[dict], max_contracts: int = 2) -> list[Si
     return signals
 
 
+# ── UNRATE↔FOMC coherence ─────────────────────────────────────────────────────
+
+def scan_unrate_fomc_coherence(
+    fomc_markets: list[dict],
+    unrate: Optional[float],
+    max_contracts: int = 3,
+) -> list[Signal]:
+    """
+    High unemployment implies the Fed cuts more aggressively than the market
+    currently prices.  Each 0.1pp of UNRATE above 4.5% adds ~0.8¢ premium to
+    low-strike (at/below-target) KXFED YES prices.
+
+    Only fires when unrate >= 4.8 and the implied premium lifts the
+    fee-adjusted edge above 4¢.
+    """
+    signals: list[Signal] = []
+    try:
+        if unrate is None or unrate < 4.5:
+            return signals
+
+        implied_cut_premium = (unrate - 4.5) * 0.08
+
+        if unrate < 4.8 or implied_cut_premium < 0.04:
+            return signals
+
+        now_utc = datetime.now(timezone.utc)
+
+        for market in fomc_markets:
+            if market.get("status", "") != "open":
+                continue
+            ticker = market.get("ticker", "")
+            strike = _extract_strike(ticker)
+            if strike is None or strike > 3.75:
+                continue
+
+            close_raw = market.get("close_time") or market.get("expiration_time")
+            if not close_raw:
+                continue
+            try:
+                close_dt = datetime.fromisoformat(close_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            days_to_close = (close_dt - now_utc).total_seconds() / 86400.0
+            if days_to_close <= 90:
+                continue
+
+            market_price = _market_mid(market)
+            if market_price <= 0.01:
+                continue
+
+            fair_value = min(0.99, market_price + implied_cut_premium)
+            edge       = fair_value - market_price
+            fee_edge   = _fee_adjusted_edge(fair_value, market_price, "yes")
+
+            if fee_edge < 0.04:
+                continue
+
+            confidence = min(0.82, 0.70 + (unrate - 4.5) * 0.04)
+            title      = market.get("title", ticker)
+
+            signals.append(Signal(
+                ticker            = ticker,
+                title             = title,
+                category          = "fomc",
+                side              = "yes",
+                fair_value        = round(fair_value, 4),
+                market_price      = round(market_price, 4),
+                edge              = round(edge, 4),
+                fee_adjusted_edge = round(fee_edge, 4),
+                contracts         = max_contracts,
+                confidence        = round(confidence, 3),
+                model_source      = "unrate_fomc_coherence",
+                close_time        = close_raw,
+            ))
+            log.info(
+                "UNRATE-FOMC: %s  unrate=%.1f  strike=%.2f  premium=%.3f  fee_edge=%.3f",
+                ticker, unrate, strike, implied_cut_premium, fee_edge,
+            )
+    except Exception as exc:
+        log.warning("scan_unrate_fomc_coherence failed: %s", exc)
+
+    signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+    return signals
+
+
+# ── CPI↔FOMC coherence ────────────────────────────────────────────────────────
+
+def scan_cpi_fomc_coherence(
+    fomc_markets: list[dict],
+    core_cpi_yoy: Optional[float],
+    max_contracts: int = 3,
+) -> list[Signal]:
+    """
+    Sticky core CPI means the Fed keeps rates higher for longer than the market
+    prices.  Each 0.1pp above 2.5% adds ~0.3¢ premium to high-strike KXFED
+    YES prices (rate stays high = YES).
+
+    Only fires when core_cpi_yoy >= 3.0 and fee-adjusted edge >= 4¢.
+    """
+    signals: list[Signal] = []
+    try:
+        if core_cpi_yoy is None or core_cpi_yoy < 2.8:
+            return signals
+
+        sticky_premium = (core_cpi_yoy - 2.5) * 0.03
+
+        if core_cpi_yoy < 3.0 or sticky_premium < 0.04:
+            return signals
+
+        now_utc = datetime.now(timezone.utc)
+
+        for market in fomc_markets:
+            if market.get("status", "") != "open":
+                continue
+            ticker = market.get("ticker", "")
+            strike = _extract_strike(ticker)
+            if strike is None or strike < 4.00:
+                continue
+
+            close_raw = market.get("close_time") or market.get("expiration_time")
+            if not close_raw:
+                continue
+            try:
+                close_dt = datetime.fromisoformat(close_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            days_to_close = (close_dt - now_utc).total_seconds() / 86400.0
+            if days_to_close <= 90:
+                continue
+
+            market_price = _market_mid(market)
+            if market_price <= 0.01:
+                continue
+
+            fair_value = min(0.99, market_price + sticky_premium)
+            edge       = fair_value - market_price
+            fee_edge   = _fee_adjusted_edge(fair_value, market_price, "yes")
+
+            if fee_edge < 0.04:
+                continue
+
+            confidence = min(0.80, 0.65 + (core_cpi_yoy - 2.5) * 0.03)
+            title      = market.get("title", ticker)
+
+            signals.append(Signal(
+                ticker            = ticker,
+                title             = title,
+                category          = "fomc",
+                side              = "yes",
+                fair_value        = round(fair_value, 4),
+                market_price      = round(market_price, 4),
+                edge              = round(edge, 4),
+                fee_adjusted_edge = round(fee_edge, 4),
+                contracts         = max_contracts,
+                confidence        = round(confidence, 3),
+                model_source      = "cpi_fomc_coherence",
+                close_time        = close_raw,
+            ))
+            log.info(
+                "CPI-FOMC: %s  core_cpi=%.2f  strike=%.2f  premium=%.3f  fee_edge=%.3f",
+                ticker, core_cpi_yoy, strike, sticky_premium, fee_edge,
+            )
+    except Exception as exc:
+        log.warning("scan_cpi_fomc_coherence failed: %s", exc)
+
+    signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+    return signals
+
+
+# ── Calendar time-decay entry ─────────────────────────────────────────────────
+
+def scan_calendar_decay(
+    markets: list[dict],
+    min_days: int = 14,
+    max_days: int = 180,
+    max_contracts: int = 3,
+) -> list[Signal]:
+    """
+    Buy stable near-certain markets at a small time-premium discount.
+
+    A market priced at 92-98¢ with weeks left is offering a small risk premium
+    over the expected $1.00 payout.  We approximate fair value at 97.5¢ and buy
+    whenever the fee-adjusted edge is positive (>= 0.5¢).
+    """
+    signals: list[Signal] = []
+    now_utc = datetime.now(timezone.utc)
+
+    for market in markets:
+        try:
+            if market.get("status", "") != "open":
+                continue
+
+            close_raw = market.get("close_time") or market.get("expiration_time")
+            if not close_raw:
+                continue
+            try:
+                close_dt = datetime.fromisoformat(close_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            days_to_close = (close_dt - now_utc).total_seconds() / 86400.0
+            if days_to_close < min_days or days_to_close > max_days:
+                continue
+
+            yes_ask = float(market.get("yes_ask_dollars") or 0)
+            if yes_ask < 0.92 or yes_ask >= 0.99:
+                continue
+
+            vol = _market_volume(market)
+            if vol < 100:
+                continue
+
+            fair_value = 0.975
+            edge       = fair_value - yes_ask
+            fee_edge   = _fee_adjusted_edge(fair_value, yes_ask, "yes")
+
+            if fee_edge < 0.005:
+                continue
+
+            confidence = min(0.99, 0.72 + (yes_ask - 0.92) * 0.5)
+            contracts  = min(max_contracts, max(1, int(fee_edge * 100)))
+            ticker     = market.get("ticker", "")
+            title      = market.get("title", ticker)
+
+            signals.append(Signal(
+                ticker            = ticker,
+                title             = title,
+                category          = "arb",
+                side              = "yes",
+                fair_value        = round(fair_value, 4),
+                market_price      = round(yes_ask, 4),
+                edge              = round(edge, 4),
+                fee_adjusted_edge = round(fee_edge, 4),
+                contracts         = contracts,
+                confidence        = round(confidence, 3),
+                model_source      = "calendar_decay",
+                close_time        = close_raw,
+            ))
+            log.info(
+                "Calendar decay: %s  yes_ask=%.3f  days=%.0f  fee_edge=%.4f",
+                ticker, yes_ask, days_to_close, fee_edge,
+            )
+        except Exception as exc:
+            log.debug("scan_calendar_decay market error: %s", exc)
+
+    signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+    return signals
+
+
+# ── Earnings markets (KXERN) ──────────────────────────────────────────────────
+
+async def scan_earnings_markets(
+    markets: list[dict],
+    max_contracts: int = 3,
+) -> list[Signal]:
+    """
+    Score KXERN bracket markets using Yahoo Finance consensus EPS estimates.
+
+    Ticker format: KXERN-26APR25-AAPL-A20  (A=above, B=below threshold).
+    Fair value is derived from a normal CDF over the consensus EPS vs threshold,
+    assuming 15% EPS uncertainty.
+    """
+    import re as _re
+
+    signals: list[Signal] = []
+    kxern_markets = [
+        m for m in markets
+        if m.get("ticker", "").startswith("KXERN") and m.get("status", "") == "open"
+    ]
+    if not kxern_markets:
+        return signals
+
+    _ticker_re = _re.compile(r"^KXERN-\d{6}-([A-Z]+)-([AB])(\d+\.?\d*)$")
+
+    async def _fetch_consensus(symbol: str) -> Optional[float]:
+        try:
+            url  = (
+                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+                "?modules=earningsTrend"
+            )
+            http = _get_http_client()
+            resp = await asyncio.wait_for(
+                http.get(url, headers={"User-Agent": "Mozilla/5.0"}),
+                timeout=5.0,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            trend = (
+                data.get("quoteSummary", {})
+                    .get("result", [{}])[0]
+                    .get("earningsTrend", {})
+                    .get("trend", [])
+            )
+            if not trend:
+                return None
+            raw = trend[0].get("epsTrend", {}).get("current", {}).get("raw")
+            return float(raw) if raw is not None else None
+        except Exception:
+            return None
+
+    symbols = {}
+    parsed  = {}
+    for market in kxern_markets:
+        ticker = market.get("ticker", "")
+        m      = _ticker_re.match(ticker)
+        if not m:
+            continue
+        symbol, direction, threshold_str = m.group(1), m.group(2), m.group(3)
+        symbols[symbol] = True
+        parsed[ticker]  = (symbol, direction, threshold_str, market)
+
+    if not parsed:
+        return signals
+
+    unique_symbols = list(symbols.keys())
+    consensus_results = await asyncio.gather(
+        *[_fetch_consensus(sym) for sym in unique_symbols],
+        return_exceptions=True,
+    )
+    consensus_map: dict[str, Optional[float]] = {}
+    for sym, result in zip(unique_symbols, consensus_results):
+        consensus_map[sym] = None if isinstance(result, Exception) else result
+
+    for ticker, (symbol, direction, threshold_str, market) in parsed.items():
+        try:
+            consensus = consensus_map.get(symbol)
+            if consensus is None:
+                continue
+
+            threshold = float(threshold_str)
+            sigma     = max(0.05, abs(consensus) * 0.15)
+            z         = (consensus - threshold) / sigma
+
+            fair_value_above = 0.5 * (1 + _math.erf(z / _math.sqrt(2)))
+            fair_value       = fair_value_above if direction == "A" else (1.0 - fair_value_above)
+            fair_value       = max(0.01, min(0.99, fair_value))
+
+            market_price = _market_mid(market)
+            if market_price <= 0.01:
+                continue
+
+            side     = "yes" if fair_value > market_price else "no"
+            edge     = abs(fair_value - market_price)
+            fee_edge = _fee_adjusted_edge(fair_value, market_price, side)
+
+            confidence = min(0.78, 0.55 + abs(z) * 0.08)
+
+            if fee_edge < 0.06 or confidence < 0.58:
+                continue
+
+            title = market.get("title", ticker)
+            signals.append(Signal(
+                ticker            = ticker,
+                title             = title,
+                category          = "economic",
+                side              = side,
+                fair_value        = round(fair_value, 4),
+                market_price      = round(market_price, 4),
+                edge              = round(edge, 4),
+                fee_adjusted_edge = round(fee_edge, 4),
+                contracts         = max_contracts,
+                confidence        = round(confidence, 3),
+                model_source      = "earnings_yfinance",
+            ))
+            log.info(
+                "Earnings: %s  symbol=%s  consensus=%.3f  threshold=%.3f  z=%.2f  fv=%.3f  fee_edge=%.3f",
+                ticker, symbol, consensus, threshold, z, fair_value, fee_edge,
+            )
+        except Exception as exc:
+            log.debug("scan_earnings_markets signal error for %s: %s", ticker, exc)
+
+    return signals
+
+
+# ── 538 polling helper + election coherence scanner ──────────────────────────
+
+async def _fetch_538_polling() -> dict:
+    """
+    Fetch FiveThirtyEight archived presidential polling CSV from GitHub and
+    return a dict mapping lowercase candidate name → average poll probability.
+
+    Filters to polls whose end_date is within the last 14 days.
+    Returns {} on any failure.
+    """
+    import csv as _csv
+    import io  as _io
+
+    url = (
+        "https://raw.githubusercontent.com/fivethirtyeight/data/master/"
+        "polls/president_polls.csv"
+    )
+    try:
+        http = _get_http_client()
+        resp = await asyncio.wait_for(http.get(url), timeout=5.0)
+        if resp.status_code != 200:
+            return {}
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+        reader = _csv.DictReader(_io.StringIO(resp.text))
+
+        totals: dict[str, list[float]] = {}
+        for row in reader:
+            end_date_str = row.get("end_date", "")
+            try:
+                end_dt = datetime.strptime(end_date_str, "%m/%d/%y").replace(tzinfo=timezone.utc)
+            except Exception:
+                try:
+                    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+            if end_dt < cutoff:
+                continue
+
+            candidate = (row.get("answer") or row.get("candidate_name") or "").strip().lower()
+            pct_str   = row.get("pct", "")
+            if not candidate or not pct_str:
+                continue
+            try:
+                pct = float(pct_str)
+            except ValueError:
+                continue
+            totals.setdefault(candidate, []).append(pct)
+
+        if not totals:
+            return {}
+
+        return {name: sum(vals) / len(vals) / 100.0 for name, vals in totals.items()}
+    except Exception as exc:
+        log.debug("_fetch_538_polling failed: %s", exc)
+        return {}
+
+
+async def scan_election_markets_with_538(
+    kalshi_markets: list[dict],
+    polymarket_prices: dict,
+    predictit_prices: dict,
+) -> list:
+    """
+    Wrap scan_election_markets with 538 as a third polling source.
+
+    When a 538 match is found, re-weights fair_value as:
+      poly*0.35 + pi*0.15 + 538*0.50  (when all three present)
+    and boosts confidence by +0.05.
+
+    Falls back to the base scan_election_markets result if 538 data unavailable.
+    """
+    probs_538 = await _fetch_538_polling()
+    base_sigs = scan_election_markets(kalshi_markets, polymarket_prices, predictit_prices)
+
+    if not probs_538:
+        return base_sigs
+
+    updated = []
+    for sig in base_sigs:
+        title_lower = sig.title.lower() if hasattr(sig, "title") else ""
+
+        matched_538: Optional[float] = None
+        for candidate, prob in probs_538.items():
+            words = [w for w in candidate.split() if len(w) > 3]
+            if words and any(w in title_lower for w in words):
+                matched_538 = prob
+                break
+
+        if matched_538 is None:
+            updated.append(sig)
+            continue
+
+        try:
+            model_src = getattr(sig, "model_source", "") or ""
+            poly_str  = ""
+            pi_str    = ""
+            for part in model_src.split("_"):
+                if part.startswith("poly="):
+                    poly_str = part[5:]
+                elif part.startswith("pi="):
+                    pi_str = part[3:]
+
+            poly_val = float(poly_str) if poly_str else None
+            pi_val   = float(pi_str)   if pi_str   else None
+
+            if poly_val is not None and pi_val is not None:
+                new_fair = poly_val * 0.35 + pi_val * 0.15 + matched_538 * 0.50
+            elif poly_val is not None:
+                new_fair = poly_val * 0.50 + matched_538 * 0.50
+            else:
+                new_fair = matched_538
+
+            new_fair   = max(0.01, min(0.99, new_fair))
+            mp         = getattr(sig, "market_price", 0.5)
+            new_gap    = new_fair - mp
+            new_side   = "yes" if new_gap > 0 else "no"
+            new_edge   = abs(new_gap)
+            new_fee_e  = _fee_adjusted_edge(new_fair, mp, new_side)
+            new_conf   = min(0.90, (getattr(sig, "confidence", 0.65) or 0.65) + 0.05)
+
+            updated_sig = sig.__class__(
+                **{
+                    **sig.__dict__,
+                    "fair_value":        round(new_fair,  4),
+                    "side":              new_side,
+                    "edge":              round(new_edge,  4),
+                    "fee_adjusted_edge": round(new_fee_e, 4),
+                    "confidence":        round(new_conf,  3),
+                    "model_source":      model_src + f"_538={matched_538:.3f}",
+                },
+            )
+            updated.append(updated_sig)
+            log.info(
+                "Election+538: %s  538_prob=%.3f  new_fair=%.3f  fee_edge=%.3f",
+                getattr(sig, "ticker", "?"), matched_538, new_fair, new_fee_e,
+            )
+        except Exception as exc:
+            log.debug("scan_election_markets_with_538 update failed: %s", exc)
+            updated.append(sig)
+
+    return updated
+
+
 # ── Main fetch_signals function ───────────────────────────────────────────────
 
 async def fetch_signals_async(
@@ -3433,6 +3955,50 @@ async def fetch_signals_async(
                 log.info("Rate-path calendar spread: %d signals", len(rate_path_sigs))
         except Exception as exc:
             log.warning("Rate-path calendar spread scan failed: %s", exc)
+
+    # 8b. UNRATE↔FOMC coherence
+    if enable_fomc:
+        try:
+            _unrate = (macro_regime or {}).get("unrate") or None
+            if _unrate:
+                _unrate = float(_unrate)
+            unrate_sigs = scan_unrate_fomc_coherence(fomc_markets, _unrate, max_contracts)
+            all_signals.extend(unrate_sigs)
+            if unrate_sigs:
+                log.info("UNRATE-FOMC coherence: %d signals", len(unrate_sigs))
+        except Exception as exc:
+            log.warning("UNRATE-FOMC coherence scan failed: %s", exc)
+
+    # 8c. CPI↔FOMC coherence
+    if enable_fomc:
+        try:
+            _core_cpi = (macro_regime or {}).get("core_cpi_yoy") or None
+            if _core_cpi:
+                _core_cpi = float(_core_cpi)
+            cpi_sigs = scan_cpi_fomc_coherence(fomc_markets, _core_cpi, max_contracts)
+            all_signals.extend(cpi_sigs)
+            if cpi_sigs:
+                log.info("CPI-FOMC coherence: %d signals", len(cpi_sigs))
+        except Exception as exc:
+            log.warning("CPI-FOMC coherence scan failed: %s", exc)
+
+    # 10. Calendar time decay
+    try:
+        decay_sigs = scan_calendar_decay(all_markets, max_contracts=max_contracts)
+        all_signals.extend(decay_sigs)
+        if decay_sigs:
+            log.info("Calendar decay: %d signals", len(decay_sigs))
+    except Exception as exc:
+        log.warning("Calendar decay scan failed: %s", exc)
+
+    # 11. Earnings markets (KXERN)
+    try:
+        earnings_sigs = await scan_earnings_markets(all_markets, max_contracts)
+        all_signals.extend(earnings_sigs)
+        if earnings_sigs:
+            log.info("Earnings: %d signals", len(earnings_sigs))
+    except Exception as exc:
+        log.warning("Earnings scan failed: %s", exc)
 
     # Filter by min confidence
     all_signals = [s for s in all_signals if s.confidence >= 0.50]

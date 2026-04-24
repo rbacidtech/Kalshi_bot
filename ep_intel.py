@@ -132,6 +132,56 @@ async def _fetch_dgs10() -> Optional[float]:
     return None
 
 
+async def _fetch_dgs5() -> Optional[float]:
+    """Fetch 5-year Treasury yield from FRED (DGS5)."""
+    import httpx as _httpx
+    fred_key = os.getenv("FRED_API_KEY", "")
+    if not fred_key:
+        return None
+    url = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id=DGS5&api_key={fred_key}&sort_order=desc&limit=5&file_type=json"
+    )
+    try:
+        async with _httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(url)
+        if r.status_code == 200:
+            obs = r.json().get("observations", [])
+            for o in obs:
+                if o.get("value", ".") != ".":
+                    val = float(o["value"])
+                    log.info("FRED DGS5: 5Y Treasury yield = %.3f%%", val)
+                    return val
+    except Exception as exc:
+        log.debug("DGS5 fetch failed: %s", exc)
+    return None
+
+
+async def _fetch_dgs30() -> Optional[float]:
+    """Fetch 30-year Treasury yield from FRED (DGS30)."""
+    import httpx as _httpx
+    fred_key = os.getenv("FRED_API_KEY", "")
+    if not fred_key:
+        return None
+    url = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id=DGS30&api_key={fred_key}&sort_order=desc&limit=5&file_type=json"
+    )
+    try:
+        async with _httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(url)
+        if r.status_code == 200:
+            obs = r.json().get("observations", [])
+            for o in obs:
+                if o.get("value", ".") != ".":
+                    val = float(o["value"])
+                    log.info("FRED DGS30: 30Y Treasury yield = %.3f%%", val)
+                    return val
+    except Exception as exc:
+        log.debug("DGS30 fetch failed: %s", exc)
+    return None
+
+
 async def _fetch_move_index() -> Optional[float]:
     """Fetch ICE BofA MOVE Index (bond market volatility) from FRED (MOVE).
 
@@ -669,10 +719,12 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
         _fetch_unrate(),
         _fetch_move_index(),
         _fetch_credit_spread(),
+        _fetch_dgs5(),    # NEW
+        _fetch_dgs30(),   # NEW
         return_exceptions=True,
     )
     # Unpack (handle exceptions gracefully)
-    (fed_rate, vix, dgs10, core_cpi, pce_yoy, icsa, t10y2y, t5yifr, unrate, move, cs) = [
+    (fed_rate, vix, dgs10, core_cpi, pce_yoy, icsa, t10y2y, t5yifr, unrate, move, cs, dgs5, dgs30) = [
         r if not isinstance(r, Exception) else None
         for r in results
     ]
@@ -714,6 +766,8 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
     if t10y2y   is not None: regime["yield_curve_spread"] = t10y2y
     if move     is not None: regime["move_index"]          = move
     if cs       is not None: regime["credit_spread_hyg_lqd"] = cs
+    if dgs5     is not None: regime["dgs5"]  = dgs5
+    if dgs30    is not None: regime["dgs30"] = dgs30
 
     # Update fomc module
     from kalshi_bot.models.fomc import set_macro_regime, set_current_fed_rate
@@ -770,6 +824,8 @@ async def _refresh_macro_data(bus: RedisBus) -> None:
         if v is not None:
             macro_hash[k] = str(v)
     if dgs10  is not None: macro_hash["dgs10"]    = str(dgs10)
+    if dgs5   is not None: macro_hash["dgs5"]     = str(dgs5)
+    if dgs30  is not None: macro_hash["dgs30"]    = str(dgs30)
     if dgs2:               macro_hash["dgs2"]     = str(dgs2)
     if unrate is not None: macro_hash["unrate"]   = str(unrate)
     if fed_rate is not None: macro_hash["fed_rate"] = str(fed_rate)
@@ -1703,6 +1759,45 @@ async def intel_main() -> None:
                 _vol = float(_m.get("volume", 0) or 0)
                 record_volume(_m["ticker"], _vol)
                 _market_vol_map[_m["ticker"]] = _vol
+
+            # ── FOMC meeting day orderflow detection ───────────────────────────
+            # On FOMC decision days, large single trades signal informed flow.
+            # Detect by checking if any KXFED market had volume spike in last
+            # 5 minutes compared to its rolling average. If so, force re-scan
+            # by setting ep:forced_cycle to skip the next sleep.
+            _now_h_utc = datetime.utcnow().hour
+            _is_fomc_day = False
+            try:
+                _fomc_day_raw = await bus._r.hget("ep:macro", "next_fomc_date")
+                if _fomc_day_raw:
+                    _fomc_day_str = _fomc_day_raw.decode() if isinstance(_fomc_day_raw, bytes) else str(_fomc_day_raw)
+                    _fomc_date = datetime.strptime(_fomc_day_str, "%Y-%m-%d").date()
+                    _is_fomc_day = (_fomc_date == datetime.utcnow().date())
+            except Exception:
+                pass
+
+            if _is_fomc_day and 17 <= _now_h_utc <= 19:
+                # Check KXFED near-term market volumes for spikes
+                try:
+                    _fomc_near = [
+                        m for m in markets_cache
+                        if m.get("ticker", "").startswith("KXFED-")
+                    ][:3]
+                    for _fmkt in _fomc_near:
+                        _vol_now = int(_fmkt.get("volume", 0) or 0)
+                        _vol_key = f"ep:vol_prev:{_fmkt.get('ticker','')}"
+                        _vol_prev_raw = await bus._r.get(_vol_key)
+                        _vol_prev = int(_vol_prev_raw or 0)
+                        if _vol_prev and _vol_now > _vol_prev * 3:
+                            log.info(
+                                "FOMC orderflow spike: %s vol=%d (+%d×) — forcing rescan",
+                                _fmkt.get("ticker",""), _vol_now, _vol_now // max(_vol_prev, 1)
+                            )
+                            await bus._r.set("ep:forced_cycle", "1", ex=120)
+                            break
+                        await bus._r.set(_vol_key, str(_vol_now), ex=600)
+                except Exception as _of_exc:
+                    log.debug("FOMC orderflow check failed: %s", _of_exc)
 
             # ── Signal generation ─────────────────────────────────────────────
             # Direct await — intel_main() IS the running event loop;

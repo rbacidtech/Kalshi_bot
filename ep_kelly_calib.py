@@ -44,12 +44,21 @@ _MIN_KELLY         = 0.01        # floor — never fully zero out sizing from ca
 _calib: Dict[str, float] = {}
 _calib_updated_at: float = 0.0
 
+# Per-strategy win-rate calibration: model_source → confidence multiplier
+# Values > 1.0 mean the strategy historically outperforms its stated confidence.
+_strategy_conf_mult: dict[str, float] = {}
+
 
 def _bucket_key(edge: float) -> Optional[str]:
     for lo, hi in _BUCKETS:
         if lo <= edge < hi:
             return f"{lo:.2f}-{hi:.2f}"
     return None
+
+
+def get_strategy_conf_mult(model_source: str) -> float:
+    """Return empirical confidence multiplier for model_source. Default 1.0."""
+    return _strategy_conf_mult.get(model_source, 1.0)
 
 
 def get_calibrated_kelly(stated_edge: float) -> Optional[float]:
@@ -84,19 +93,19 @@ def _empirical_kelly(n: int, wins: int, sum_win_r: float, sum_loss_r: float) -> 
     return max(_MIN_KELLY, min(_MAX_KELLY, f))
 
 
-async def _compute_calibration(dsn: str) -> Dict[str, float]:
-    """Query terminal_trades and return {bucket_key: kelly_fraction}."""
+async def _compute_calibration(dsn: str) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Query terminal_trades and return ({bucket_key: kelly_fraction}, {model_source: conf_mult})."""
     try:
         import asyncpg
     except ImportError:
         log.debug("asyncpg not available — Kelly calibration disabled")
-        return {}
+        return {}, {}
 
     try:
         conn = await asyncpg.connect(dsn, timeout=10)
     except Exception as exc:
         log.warning("kelly_calib: DB connect failed: %s", exc)
-        return {}
+        return {}, {}
 
     try:
         rows = await conn.fetch(f"""
@@ -107,9 +116,22 @@ async def _compute_calibration(dsn: str) -> Dict[str, float]:
               AND return_frac  IS NOT NULL
               AND is_terminal  = true
         """)
+        strat_rows = await conn.fetch("""
+            SELECT
+                model_source,
+                COUNT(*) as n,
+                SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END) as wins,
+                AVG(pnl_cents) as avg_pnl
+            FROM terminal_trades
+            WHERE closed_at > NOW() - INTERVAL '90 days'
+              AND model_source IS NOT NULL
+              AND model_source != ''
+            GROUP BY model_source
+            HAVING COUNT(*) >= 10
+        """)
     except Exception as exc:
         log.warning("kelly_calib: query failed: %s", exc)
-        return {}
+        return {}, {}
     finally:
         await conn.close()
 
@@ -149,7 +171,20 @@ async def _compute_calibration(dsn: str) -> Dict[str, float]:
                  key, n, win_rate, kf)
         result[key] = kf
 
-    return result
+    strat_mult: Dict[str, float] = {}
+    for row in strat_rows:
+        n        = int(row["n"])
+        wins     = int(row["wins"])
+        win_rate = wins / n
+        if win_rate > 0.65 and n >= 20:
+            mult = min(1.20, 1.0 + (win_rate - 0.55) * 1.0)
+        elif win_rate < 0.40 and n >= 20:
+            mult = max(0.60, 1.0 - (0.55 - win_rate) * 1.5)
+        else:
+            mult = 1.0
+        strat_mult[row["model_source"]] = mult
+
+    return result, strat_mult
 
 
 async def kelly_calib_loop(bus, interval_s: int = _CALIB_INTERVAL_S) -> None:
@@ -160,7 +195,7 @@ async def kelly_calib_loop(bus, interval_s: int = _CALIB_INTERVAL_S) -> None:
 
     bus: RedisBus instance (for Redis writes)
     """
-    global _calib, _calib_updated_at
+    global _calib, _calib_updated_at, _strategy_conf_mult
 
     dsn = os.environ.get("DATABASE_URL", "").replace(
         "postgresql+asyncpg://", "postgresql://"
@@ -174,7 +209,7 @@ async def kelly_calib_loop(bus, interval_s: int = _CALIB_INTERVAL_S) -> None:
 
     while True:
         try:
-            result = await _compute_calibration(dsn)
+            result, strat_mult = await _compute_calibration(dsn)
             if result:
                 _calib = result
                 _calib_updated_at = time.time()
@@ -194,6 +229,12 @@ async def kelly_calib_loop(bus, interval_s: int = _CALIB_INTERVAL_S) -> None:
                     log.debug("kelly_calib: Redis write failed: %s", exc)
             else:
                 log.info("kelly_calib: no buckets with sufficient data — using configured defaults")
+            if strat_mult:
+                _strategy_conf_mult = strat_mult
+                try:
+                    await bus._r.hset("ep:kelly_calib:strategy", mapping={k: str(v) for k, v in strat_mult.items()})
+                except Exception as exc:
+                    log.debug("kelly_calib: strategy Redis write failed: %s", exc)
         except Exception as exc:
             log.warning("kelly_calib_loop error: %s", exc)
 

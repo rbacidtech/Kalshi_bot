@@ -401,6 +401,35 @@ class BTCMeanReversionStrategy:
         self.last_bb_upper:  Optional[float] = None
         self.last_vol_ratio: Optional[float] = None   # latest_vol / vol_ma
 
+    def _vol_regime(self, closes: List[float]) -> str:
+        """Classify vol regime: 'low', 'normal', 'high', 'extreme'.
+        Uses ratio of 10-bar realized vol to 50-bar realized vol.
+        Returns 'insufficient_data' if not enough bars."""
+        if len(closes) < 50:
+            return "insufficient_data"
+
+        def _rvol(n):
+            w = closes[-n:]
+            rets = [w[i]/w[i-1]-1 for i in range(1, len(w))]
+            if not rets:
+                return 0.0
+            mean = sum(rets) / len(rets)
+            return (sum((r - mean)**2 for r in rets) / len(rets)) ** 0.5
+
+        rv10 = _rvol(10)
+        rv50 = _rvol(50)
+        if rv50 == 0:
+            return "insufficient_data"
+        ratio = rv10 / rv50
+        if ratio < 0.7:
+            return "low"
+        elif ratio < 1.4:
+            return "normal"
+        elif ratio < 2.5:
+            return "high"
+        else:
+            return "extreme"
+
     async def generate(self) -> List:
         """
         Fetch BTC data, compute indicators, and return 0 or 1 SignalMessages.
@@ -465,6 +494,7 @@ class BTCMeanReversionStrategy:
             return signals
 
         closes     = [c.c for c in candles]
+        vol_regime = self._vol_regime(closes)
         spot_price = (
             spot_result
             if isinstance(spot_result, float) and spot_result and spot_result > 0
@@ -516,11 +546,12 @@ class BTCMeanReversionStrategy:
 
         log.debug(
             "BTC indicators: spot=%.2f  RSI=%.1f  z=%.2f  "
-            "BB=[%.2f / %.2f / %.2f]  vol_ratio=%.2f%s  trend_dev=%.3f%s",
+            "BB=[%.2f / %.2f / %.2f]  vol_ratio=%.2f%s  trend_dev=%.3f%s  vol_regime=%s",
             spot_price, rsi, z, lower_bb, mid_bb, upper_bb,
             vol_ratio, " [SPIKE]" if _vol_spike else "",
             trend_dev,
             " [DOWNTREND]" if _in_downtrend else " [UPTREND]" if _in_uptrend else "",
+            vol_regime,
         )
 
         # ── Sentiment adjustments ─────────────────────────────────────────────
@@ -579,7 +610,9 @@ class BTCMeanReversionStrategy:
             elif not _should_skip_on_sentiment("buy"):
                 edge       = (mid_bb - spot_price) / spot_price
                 conf_adj   = _sentiment_conf_adj("buy")
-                confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj))
+                # Vol regime: extreme vol = breakdown risk, scale confidence down
+                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.65, "insufficient_data": 1.0}.get(vol_regime, 1.0)
+                confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj)) * _vol_mult
                 fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(
                     source_node       = self.source_node,
@@ -631,7 +664,9 @@ class BTCMeanReversionStrategy:
             elif not _should_skip_on_sentiment("sell"):
                 edge       = (spot_price - mid_bb) / spot_price
                 conf_adj   = _sentiment_conf_adj("sell")
-                confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj))
+                # Vol regime: extreme vol = breakdown risk, scale confidence down
+                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.65, "insufficient_data": 1.0}.get(vol_regime, 1.0)
+                confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj)) * _vol_mult
                 fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(
                     source_node       = self.source_node,
