@@ -186,6 +186,19 @@ class EconReleaseEngine:
             except (ValueError, AttributeError):
                 continue
 
+            # DST sanity check: BLS/BEA releases are 8:30 ET (winter=13:30 UTC,
+            # summer=12:30 UTC). If the parsed time lands far outside that band,
+            # the upstream source (ep:econ_consensus writer) may have fed us
+            # naive ET without UTC conversion. Log — don't reject, since the
+            # check may be wrong (non-8:30 releases exist), but surface it.
+            _hr = ev_dt.hour
+            if _hr < 11 or _hr > 15:
+                log.warning(
+                    "econ: %s release_time %s has unusual hour %d (expect 12-14 UTC "
+                    "for 8:30 ET); check for DST/TZ mis-conversion upstream",
+                    ev_name, ev_dt.isoformat(), _hr,
+                )
+
             if ev_dt <= now:
                 continue  # already past
 
