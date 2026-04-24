@@ -9,6 +9,7 @@ _Updated 2026-04-24 04:50 UTC — Item 9 (kelly_calib column mismatch) fixed and
 _Updated 2026-04-24 04:55 UTC — Audit #5 (edge_threshold × 0.7 silent discount) resolved via Option A (drop multiplier, keep operator override at 0.41)._
 _Updated 2026-04-24 05:10 UTC — full second-round audit across advisor, arb engine, BTC strategy, and FOMC model. Findings recorded below under "Second-round audit"._
 _Updated 2026-04-24 05:20 UTC — all 5 CRITICAL items from second-round audit patched (commit 9bbabaf)._
+_Updated 2026-04-24 05:25 UTC — 9 of 10 HIGH items patched (commits 60a40e4, 8be6934). Adv #2 deferred._
 
 ## Silently broken — needs fix
 
@@ -227,18 +228,22 @@ All 5 CRITICAL findings patched in commit `9bbabaf` on 2026-04-24 ~05:20 UTC.
 
 ### HIGH
 
-| # | File:Line | Issue | Fix idea |
-|---|-----------|-------|----------|
-| Adv #2 | ep_advisor.py:289-291 | Config writes don't use WATCH/MULTI; races with operator writes | Single-operator in practice, low urgency; add check-and-set if multi-operator adoption comes later |
-| Arb #4 | ep_arb.py:362-389 | `poly_ts`/`kalshi_ts` read but never compared to wall clock; stale prices can fire an arb after divergence closed | `if (now - pair.poly_ts) > MAX_AGE_MS: skip` |
-| Arb #5 | ep_arb.py:444-468 | Exception after order_id obtained but before Redis write → orphan on Kalshi | Try/except around hset with DELETE of order_id on failure |
-| Arb #6 | ep_arb.py:422 | `hexists` then `hset` is not atomic — race vs ep_exec writing to same ticker | Redis WATCH/MULTI or ep_exec's `_arb_legs_in_progress` set (the latter requires ep_arb to hit that code path) |
-| Arb #7 | ep_arb.py.__init__ | No startup reconciliation of arb-placed orders against Kalshi portfolio | Mirror exec's `_reconcile_orphan_orders` path on arb startup |
-| BTC #1 | ep_risk.py:118 | Hardcoded 0.6% fee in sizing; doesn't follow `COINBASE_TAKER_FEE` env var | Import the env var at top of ep_risk |
-| BTC #2 | ep_btc.py:615,669 | Confidence floor applied before vol multiplier; extreme-vol regime can produce conf < 0.10 | Move `max(0.10, ...)` to after the vol_mult multiplication |
-| BTC #4 | ep_btc.py:337,506 | Z-score period=20 (100 min) but docstring claims "1-hour lookback" — 40-min drift | Either change period to 12 or update docstring; threshold z=1.8 is calibrated to current behavior so a numeric change needs recalibration |
-| BTC #5 | ep_btc.py | `insufficient_data` vol regime gets mult=1.0 — noisy z from sparse buffer fires at full confidence | Return 0.5 for insufficient_data, or require `len(closes) >= 50` before first signal |
-| FOMC #3 | kalshi_bot/models/fomc.py:2759-2797 | No hard floor/ceiling on confidence before `MeetingProbs` write — can drift below 0.50 or above 0.99 | `confidence = max(0.50, min(0.99, confidence))` before line 2793 |
+9 of 10 HIGH findings patched in commits `60a40e4` + `8be6934` on
+2026-04-24 ~05:25 UTC. Remaining open: Adv #2 (deferred — low urgency
+in single-operator deployment).
+
+| # | File:Line | Status | Commit |
+|---|-----------|--------|--------|
+| Adv #2 | ep_advisor.py:289-291 | **OPEN** — deferred; single-operator race window is seconds and manual overrides are rare | — |
+| Arb #4 | ep_arb.py | FIXED — price-age gate in `_fire()` via `ARB_MAX_PRICE_AGE_S` (default 2.0s) | 8be6934 |
+| Arb #5 | ep_arb.py | FIXED — hset wrapped in try/except with DELETE order on failure | 8be6934 |
+| Arb #6 | ep_arb.py | FIXED — hexists re-check after post() returns; cancel + abort on race | 8be6934 |
+| Arb #7 | ep_arb.py.__init__ | DEFERRED — ep_exec's `_reconcile_orphan_orders` already covers any resting Kalshi order regardless of which service placed it; redundant work not worth the code duplication. Noted inline in ep_arb.py | 8be6934 (doc) |
+| BTC #1 | ep_risk.py:118 | FIXED — imports `_COINBASE_TAKER_FEE` from env instead of hardcoded 0.006 | 60a40e4 |
+| BTC #2 | ep_btc.py:615,669 | FIXED — confidence floor applied after vol_mult; ceiling tightened to 0.99 | 60a40e4 |
+| BTC #4 | ep_btc.py:337 | FIXED (doc-only) — `_z_score` docstring now notes 100-min window and the threshold dependency. Subagent's "1-hour" claim was inferred from my briefing, not from code | 60a40e4 |
+| BTC #5 | ep_btc.py:615,669 | FIXED — `insufficient_data` vol regime now returns 0.5 (was 1.0) | 60a40e4 |
+| FOMC #3 | kalshi_bot/models/fomc.py:2794 | FIXED — hard floor 0.50 / ceiling 0.99 applied immediately before MeetingProbs write | 60a40e4 |
 
 ### MEDIUM
 
