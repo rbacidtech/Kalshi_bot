@@ -73,6 +73,17 @@ def _hash(data: Any) -> str:
     return hashlib.md5(_djson(data).encode()).hexdigest()
 
 
+def _stable(stat: dict) -> dict:
+    """Strip rapidly-changing age_s floats so the hash only flips on real state changes."""
+    import copy
+    s = copy.deepcopy(stat)
+    for src in (s.get("sources") or {}).values():
+        src.pop("age_s", None)
+    for node in (s.get("nodes") or {}).values():
+        node.pop("age_s", None)
+    return s
+
+
 def _ts_us_to_iso(ts_us: Any) -> Optional[str]:
     try:
         return datetime.fromtimestamp(int(ts_us) / 1_000_000, tz=timezone.utc).isoformat()
@@ -204,6 +215,7 @@ async def _status(r) -> dict[str, Any]:
     business_issues: list[str] = []
     intel_data: dict[str, Any] = {}
     exec_health: Optional[str] = None
+    exec_health_ts_s: Optional[float] = None  # fallback ts from ep:health
 
     for node_id_raw, raw in raw_health.items():
         node_id = node_id_raw.decode() if isinstance(node_id_raw, bytes) else node_id_raw
@@ -227,6 +239,10 @@ async def _status(r) -> dict[str, Any]:
             biz = h.get("sources", {}).get("business", {}).get("error", "")
             if biz:
                 business_issues = [s.strip() for s in biz.split(";") if s.strip()]
+            try:
+                exec_health_ts_s = float(h["ts_us"]) / 1_000_000
+            except Exception:
+                pass
 
     status.update(intel_data)
     status["exec_health"]     = exec_health
@@ -262,6 +278,14 @@ async def _status(r) -> dict[str, Any]:
             }
         if len(seen) >= 2:
             break
+    # Fallback: if exec wasn't in ep:system stream, use ep:health ts_us
+    if "exec" not in nodes and exec_health_ts_s:
+        age_s = round(now - exec_health_ts_s, 1)
+        nodes["exec"] = {
+            "last_heartbeat_at": datetime.fromtimestamp(exec_health_ts_s, tz=timezone.utc).isoformat(),
+            "age_s":  age_s,
+            "alive":  age_s < 300,  # ep:health refreshes less frequently than ep:system
+        }
     status["nodes"] = nodes
 
     # Balance
@@ -394,7 +418,7 @@ async def websocket_endpoint(
         if port: await _send("portfolio", port)
         if stat: await _send("status",    stat)
         portfolio_hash = _hash(port)
-        status_hash    = _hash(stat)
+        status_hash    = _hash(_stable(stat))
 
         # ── Poll loop ────────────────────────────────────────────────────────
         while True:
@@ -425,7 +449,7 @@ async def websocket_endpoint(
             try:
                 stat = await _status(r)
                 stat["session_pnl"] = cached_pnl
-                h = _hash(stat)
+                h = _hash(_stable(stat))  # strip age_s floats before comparing
                 if h != status_hash:
                     await _send("status", stat)
                     status_hash = h
