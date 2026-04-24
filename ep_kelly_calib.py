@@ -107,6 +107,9 @@ async def _compute_calibration(dsn: str) -> Tuple[Dict[str, float], Dict[str, fl
         log.warning("kelly_calib: DB connect failed: %s", exc)
         return {}, {}
 
+    # Bucket query: samples for per-edge Kelly calibration. Run in its own
+    # try/except so a failure in the strategy-multiplier query below cannot
+    # knock out the primary calibration.
     try:
         rows = await conn.fetch(f"""
             SELECT stated_edge, return_frac
@@ -116,22 +119,32 @@ async def _compute_calibration(dsn: str) -> Tuple[Dict[str, float], Dict[str, fl
               AND return_frac  IS NOT NULL
               AND is_terminal  = true
         """)
+    except Exception as exc:
+        log.warning("kelly_calib: bucket query failed: %s", exc)
+        rows = []
+
+    # Strategy-multiplier query: terminal_trades view exposes the columns as
+    # `strategy` (not model_source), `realized_pnl_cents` (not pnl_cents),
+    # and `exited_at` (not closed_at). The historical names here used to raise
+    # "column does not exist" on every tick and silently poisoned the whole
+    # calibration result. Separate try/except so bucket calibration survives.
+    try:
         strat_rows = await conn.fetch("""
             SELECT
-                model_source,
+                strategy,
                 COUNT(*) as n,
-                SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END) as wins,
-                AVG(pnl_cents) as avg_pnl
+                SUM(CASE WHEN realized_pnl_cents > 0 THEN 1 ELSE 0 END) as wins,
+                AVG(realized_pnl_cents) as avg_pnl
             FROM terminal_trades
-            WHERE closed_at > NOW() - INTERVAL '90 days'
-              AND model_source IS NOT NULL
-              AND model_source != ''
-            GROUP BY model_source
+            WHERE exited_at > NOW() - INTERVAL '90 days'
+              AND strategy IS NOT NULL
+              AND strategy != ''
+            GROUP BY strategy
             HAVING COUNT(*) >= 10
         """)
     except Exception as exc:
-        log.warning("kelly_calib: query failed: %s", exc)
-        return {}, {}
+        log.warning("kelly_calib: strategy query failed: %s", exc)
+        strat_rows = []
     finally:
         await conn.close()
 
@@ -182,7 +195,7 @@ async def _compute_calibration(dsn: str) -> Tuple[Dict[str, float], Dict[str, fl
             mult = max(0.60, 1.0 - (0.55 - win_rate) * 1.5)
         else:
             mult = 1.0
-        strat_mult[row["model_source"]] = mult
+        strat_mult[row["strategy"]] = mult
 
     return result, strat_mult
 

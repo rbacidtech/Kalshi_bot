@@ -5,31 +5,36 @@ _Updated 2026-04-24 02:34 UTC — three fixes applied and verified._
 _Updated 2026-04-24 04:30 UTC — entry/exit strategy audit, four more fixes patched._
 _Updated 2026-04-24 04:45 UTC — post-deploy observations added below._
 _Updated 2026-04-24 04:48 UTC — Item 11 (metrics port) fixed and verified._
+_Updated 2026-04-24 04:50 UTC — Item 9 (kelly_calib column mismatch) fixed and verified._
 
 ## Silently broken — needs fix
 
-- **Item 9 — Per-strategy Kelly calibration multiplier.**
-  Code deployed in ep_exec.py `_process_signal`. The
-  `get_strategy_conf_mult()` function reads from `_strategy_conf_mult`
-  dict which is populated by `kelly_calib_loop` → `_compute_calibration`.
-  `_compute_calibration` queries the `terminal_trades` VIEW (exists).
-  First query (bucket Kelly) works. Second query (per-strategy mult)
-  fails with `column "model_source" does not exist` — the view has
-  `strategy`, not `model_source`. Also: `pnl_cents` → `realized_pnl_cents`,
-  `closed_at` → `exited_at`. Three column mismatches. Both queries share
-  one try/except so the second failure kills both. Result: every signal
-  gets multiplier 1.0 (no-op). Feature is cosmetic until fixed.
+- ~~**Item 9 — Per-strategy Kelly calibration multiplier.**~~
+  **FIXED 2026-04-24 04:48 UTC.** `ep_kelly_calib.py:_compute_calibration`
+  had three column-name mismatches against the `terminal_trades` view:
+  `model_source`→`strategy`, `pnl_cents`→`realized_pnl_cents`,
+  `closed_at`→`exited_at`. All three renamed. Both queries now sit in
+  separate try/except blocks so a strategy-query failure can no longer
+  wipe out bucket calibration. `row["model_source"]` consumer at line
+  185 also renamed to `row["strategy"]`.
 
-  _Post-deploy observation (2026-04-24 04:38 UTC):_ warning fires on
-  every intel cycle (~9 occurrences in the last 4h). Previously was
-  quieter because it logged at DEBUG during certain code paths; now
-  a WARNING on every kelly_calib tick. Not a new break — the query
-  always failed — just now more visible.
+  Post-fix verified via live DB dry-run:
+  ```
+  bucket_kelly: {}
+  strat_mult:   {'fomc_butterfly_arb': 1.0, 'noaa_nws+open_meteo': 1.0}
+  ```
+  Both strategies return multiplier 1.0 because neither has reached
+  the `n >= 20` threshold for applying a boost/penalty (currently 11
+  and 10 samples respectively). Redis `ep:kelly_calib:strategy` key
+  now populated for dashboard visibility. Log output shows the
+  previously-loud WARNING replaced by a single INFO per tick
+  ("no buckets with sufficient data — using configured defaults").
 
-  Fix: in the second query, rename `model_source`→`strategy`,
-  `pnl_cents`→`realized_pnl_cents`, `closed_at`→`exited_at`. Split
-  the two queries into separate try/except blocks so bucket calibration
-  survives a per-strategy query failure.
+  _Note on historical data:_ `fomc_butterfly_arb` has 9% win rate over
+  11 samples. Once it crosses the n>=20 threshold (it won't — Item 1
+  disabled butterfly signal generation, so no new samples accumulate),
+  its multiplier would drop to 0.60. Good — the empirical calibration
+  is now live and would catch a similar future misfire.
 
 - ~~**Item 11 — Metrics port 9091 double-bind on every restart.**~~
   **FIXED 2026-04-24 04:48 UTC.** `METRICS_PORT=9091` commented out
