@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import time
+import uuid as _uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
@@ -54,6 +55,20 @@ MIN_ORDER_SIZE      = float(os.getenv("OB_MIN_ORDER_SZ", "50.0")) # contracts in
 ORDER_LOTS          = int(os.getenv("OB_ORDER_LOTS",     "2"))
 COOLDOWN_S          = int(os.getenv("OB_COOLDOWN_S",     "60"))
 RECONNECT_DELAY_S   = int(os.getenv("OB_RECONNECT_S",   "5"))
+
+# Signal publishing — as of 2026-04-24, this service publishes to ep:signals
+# instead of placing orders directly. ep_exec then consumes and applies all
+# standard gates (dedup, Kelly, exposure, halt, etc.). Previously this service
+# placed orders directly, bypassing every gate — see KNOWN_GAPS.md C3.
+EP_SIGNALS          = "ep:signals"
+EP_SIGNALS_MAXLEN   = 10_000
+SIGNAL_TTL_MS       = int(os.getenv("OB_SIGNAL_TTL_MS",  "15000"))  # 15s — short
+# Edge injected into signals: OB imbalance is a directional momentum signal,
+# not a fundamental fair-value forecast. We assert a small edge (~3¢) in the
+# imbalance direction. If the operator's override_edge_threshold is tighter
+# than this, ep_exec will (correctly) reject these signals — that is the
+# intended behavior under a tight-EV regime.
+OB_EDGE_DECIMAL     = float(os.getenv("OB_EDGE_DECIMAL", "0.03"))
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -110,7 +125,7 @@ class ObDepthEngine:
         self._halt        = False
         self._books:  Dict[str, BookState]  = {}
         self._tickers: List[str]            = []
-        self._stats = {"signals": 0, "orders_placed": 0, "orders_filled": 0}
+        self._stats = {"signals": 0, "signals_published": 0}
 
     # ── Halt check ────────────────────────────────────────────────────────────
 
@@ -258,12 +273,17 @@ class ObDepthEngine:
         book.prev_ratio = new_ratio
         return direction   # return direction string as the trigger
 
-    # ── Order placement ───────────────────────────────────────────────────────
+    # ── Signal publishing ─────────────────────────────────────────────────────
 
-    async def _place_order(self, ticker: str, direction: str) -> None:
-        """Place a limit order in the imbalance direction."""
-        if not self._client:
-            return
+    async def _publish_signal(self, ticker: str, direction: str) -> None:
+        """
+        Publish an OB-imbalance signal to ep:signals.
+
+        ep_exec consumes the stream and applies every standard gate (dedup,
+        Kelly sizing, balance, exposure, halt, meeting-concentration, etc.).
+        This service owns the detection but not the trading decision.
+        Prior behavior: direct POST /portfolio/orders with zero gates.
+        """
         if await self._check_halt():
             return
 
@@ -271,39 +291,82 @@ class ObDepthEngine:
         if not book:
             return
 
-        mid = book.mid_cents()
-        if direction == "yes":
-            # Buy YES at current best ask + 1¢ (aggressive limit)
-            top_no_bid = max((float(p) * 100 for p in book.no_bids), default=0)
-            yes_ask = 100 - top_no_bid if top_no_bid else mid + 2
-            limit_c = min(99, int(yes_ask) + 1)
-            side, price_key = "yes", "yes_price"
-        else:
-            top_yes_bid = max((float(p) * 100 for p in book.yes_bids), default=0)
-            no_ask = 100 - top_yes_bid if top_yes_bid else 100 - mid + 2
-            limit_c = min(99, int(no_ask) + 1)
-            side, price_key = "no", "no_price"
+        mid_cents = book.mid_cents()
+        if mid_cents <= 0:
+            return
 
-        limit_c = max(1, limit_c)
+        # SignalMessage convention: market_price is always the YES mid (decimal
+        # 0-1). fair_value is P(YES wins) per the model — for an imbalance
+        # momentum signal, we assert a small edge in the direction of the shift.
+        mid_decimal = mid_cents / 100.0
+        if direction == "yes":
+            side       = "yes"
+            fair_value = min(0.99, mid_decimal + OB_EDGE_DECIMAL)
+        else:
+            side       = "no"
+            # NO signal means we expect YES price to DROP by OB_EDGE_DECIMAL.
+            fair_value = max(0.01, mid_decimal - OB_EDGE_DECIMAL)
+
+        # Confidence scaled by the imbalance shift that triggered this signal.
+        # Bounded to [0.60, 0.85] — OB imbalance is suggestive, not conclusive.
+        confidence = min(0.85, 0.60 + abs(book.prev_ratio - 0.5))
+
+        # Meeting tag so the concentration gate at ep_exec counts OB positions
+        # toward per-meeting limits (same derivation ep_exec / ep_arb use).
+        meeting = ""
+        if ticker.startswith(("KXFED-", "KXGDP-", "KXCPI-", "KXNFP-", "KXINFLATION-")):
+            parts = ticker.rsplit("-T", 1)
+            meeting = parts[0] if len(parts) > 1 else ""
+
         book.cooldown_until = time.monotonic() + COOLDOWN_S
 
-        log.info("ob: ORDER  %-30s  side=%s  limit=%d¢  lots=%d",
-                 ticker, side, limit_c, ORDER_LOTS)
+        # Build the signal dict. We stay schema-compatible by matching the
+        # fields SignalMessage serializes; exec will rehydrate via from_redis.
+        payload = {
+            "signal_id":      _uuid.uuid4().__str__(),
+            "schema_version": "1",
+            "msg_type":       "SIGNAL",
+            "source_node":    os.getenv("NODE_ID", "ob_depth"),
+            "ts_us":          int(time.time() * 1_000_000),
+            "ttl_ms":         SIGNAL_TTL_MS,
+            "asset_class":    "kalshi",
+            "strategy":       "ob_imbalance",
+            "category":       "imbalance",
+            "ticker":         ticker,
+            "exchange":       "kalshi",
+            "side":           side,
+            "market_price":   round(mid_decimal, 4),
+            "fair_value":     round(fair_value, 4),
+            "edge":           round(OB_EDGE_DECIMAL, 4),
+            "fee_adjusted_edge": round(OB_EDGE_DECIMAL - 0.02, 4),  # rough fee net
+            "confidence":     round(confidence, 4),
+            "suggested_size": ORDER_LOTS,
+            "kelly_fraction": 0.25,
+            "priority":       2,
+            "risk_flags":     ["OB_IMBALANCE"],
+            "model_source":   "ob_depth",
+            "meeting":        meeting,
+        }
+
+        log.info(
+            "ob: SIGNAL  %-30s  side=%s  mid=%.1f¢  fair=%.3f  edge=%.3f  conf=%.2f",
+            ticker, side, mid_cents, fair_value, OB_EDGE_DECIMAL, confidence,
+        )
+
+        if self._redis is None:
+            log.warning("ob: no Redis client — signal not published for %s", ticker)
+            return
+
         try:
-            resp = await asyncio.to_thread(
-                self._client.post, "/portfolio/orders",
-                {"action": "buy", "type": "limit", "ticker": ticker,
-                 "side": side, "count": ORDER_LOTS, price_key: limit_c},
+            await self._redis.xadd(
+                EP_SIGNALS,
+                {"payload": json.dumps(payload)},
+                maxlen=EP_SIGNALS_MAXLEN,
+                approximate=True,
             )
-            order_id = (resp or {}).get("order", {}).get("order_id")
-            if order_id:
-                log.info("ob: FILL  %s  order=%s", ticker, order_id[:12])
-                self._stats["orders_filled"] += 1
-            else:
-                log.info("ob: REJECTED  %s  resp=%s", ticker, str(resp)[:80])
-            self._stats["orders_placed"] += 1
+            self._stats["signals_published"] += 1
         except Exception as exc:
-            log.warning("ob: order error for %s: %s", ticker, exc)
+            log.warning("ob: signal publish error for %s: %s", ticker, exc)
 
     # ── WebSocket loop ────────────────────────────────────────────────────────
 
@@ -351,7 +414,7 @@ class ObDepthEngine:
                             direction = self._apply_delta(msg)
                             if direction:
                                 asyncio.get_event_loop().create_task(
-                                    self._place_order(msg.get("market_ticker", ""), direction)
+                                    self._publish_signal(msg.get("market_ticker", ""), direction)
                                 )
 
                         elif msg_type == "error":
@@ -385,9 +448,9 @@ class ObDepthEngine:
                     "halt":     self._halt,
                     "sample":   active[:5],
                 }, default=str), ex=3600)
-                log.info("ob: stats  signals=%d  orders=%d  filled=%d  markets=%d",
-                         self._stats["signals"], self._stats["orders_placed"],
-                         self._stats["orders_filled"], len(self._books))
+                log.info("ob: stats  signals=%d  published=%d  markets=%d",
+                         self._stats["signals"],
+                         self._stats["signals_published"], len(self._books))
             except Exception:
                 pass
 
