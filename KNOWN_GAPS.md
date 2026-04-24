@@ -11,6 +11,7 @@ _Updated 2026-04-24 05:10 UTC — full second-round audit across advisor, arb en
 _Updated 2026-04-24 05:20 UTC — all 5 CRITICAL items from second-round audit patched (commit 9bbabaf)._
 _Updated 2026-04-24 05:25 UTC — 9 of 10 HIGH items patched (commits 60a40e4, 8be6934). Adv #2 deferred._
 _Updated 2026-04-24 05:30 UTC — MEDIUM/LOW sweep (commit 8e7218d). 4 MEDIUM fixed or resolved as not-a-bug; 1 deferred. 3 LOW fixed; 1 already gated._
+_Updated 2026-04-24 05:45 UTC — third-round full audit complete. 5 CRITICALs patched (commits e7efb9b, 2d4cf74, dee319c). 2 subagent CRITICALs were false positives (C4 schema validation, C5 earnings NO fee — both verified as already-correct against actual code)._
 
 ## Silently broken — needs fix
 
@@ -309,6 +310,111 @@ not-a-bug). Commit `8e7218d` on 2026-04-24 ~05:30 UTC.
 3. **Advisor #1** — delta clamp. Cheap safety net against LLM weirdness.
 4. **FOMC #1** — one-line log fix.
 5. Rest of HIGH findings batched or individually.
+
+## Third-round audit (2026-04-24 ~05:45 UTC)
+
+Full module-level audit across 8 targets: ep_intel.py, strategy.py
+scanners, ep_ob_depth.py, ep_econ_release.py, ep_datasources.py,
+ep_bus.py+ep_schema.py, kalshi_bot/client.py+auth.py, and three
+supplementary feeds (polymarket, predictit, fed_sentiment). Performed
+by 8 parallel Explore subagents with critical claims spot-verified
+against live code.
+
+### CRITICAL — all 5 real findings patched
+
+- ~~**C1 — POST /portfolio/orders retried on timeout.**~~ **FIXED
+  (commit 2d4cf74).** kalshi_bot/client.py:69-100 retry loop was
+  method-agnostic; a timeout on POST after Kalshi received the order
+  would double-place on retry. Added `_NON_IDEMPOTENT_POST_PATHS`
+  tuple (currently just `/portfolio/orders`); when POST matches,
+  `effective_retries=0` and Timeout/ConnectionError raise immediately
+  so ep_exec's orphan reconciliation can reconcile instead of
+  double-placing.
+
+- ~~**C2 — Shared requests.Session across threads.**~~ **FIXED
+  (commit 2d4cf74).** kalshi_bot/client.py:61 used a single
+  `requests.Session()` for sync calls, which is not thread-safe. Since
+  sync methods are called via `asyncio.to_thread` from ep_arb, ep_exec,
+  and ep_ob_depth, the shared connection pool corrupted under load.
+  Moved to `threading.local`; each thread gets its own Session
+  lazily via `_get_session()`.
+
+- ~~**C3 — ep_ob_depth bypasses every entry gate.**~~ **FIXED
+  (commit dee319c).** The OB depth service was placing Kalshi orders
+  directly via `POST /portfolio/orders` — no ep:positions dedup, no
+  balance/exposure check, no Kelly, no halt respect, no ep:positions
+  write. Configured confidence multipliers were dead code. Refactored:
+  `_place_order` → `_publish_signal`, emits SignalMessage-shaped
+  payload to ep:signals (15s TTL); ep_exec consumes and applies all
+  standard gates. Meeting tag derived from ticker so concentration gate
+  counts OB-triggered positions.
+
+- ~~**C6 — Bracket stored when both legs fail.**~~ **FIXED (commit
+  e7efb9b).** ep_econ_release.py:308-336 added a pending Bracket to
+  self._brackets even if both YES and NO order placements failed. Now:
+  if neither leg got an order_id, skip the bracket store and log a
+  warning.
+
+- ~~**C7 — Momentum orders bypass override_edge_threshold.**~~
+  **FIXED (commit e7efb9b).** ep_econ_release.py:_add_momentum placed
+  orders without checking the operator's EV floor. Now reads
+  `override_edge_threshold` from ep:config at the top of the function,
+  uses a conservative `σ × 5¢` edge proxy (calibrated to CPI 1σ ≈ 5¢
+  move), and skips the momentum if the proxy doesn't clear the
+  operator's threshold. Fail-open on Redis error with debug log.
+
+### CRITICAL — false positives (don't re-report)
+
+- ~~**C4 — `from_redis` skips `__post_init__` validation.**~~
+  **NOT A BUG.** Python dataclass `__init__` auto-calls `__post_init__`.
+  `cls(**known)` at ep_schema.py:144 triggers validation correctly.
+  Verified with a live test: constructing SignalMessage with
+  `confidence=1.5` raises `ValueError` as expected.
+
+- ~~**C5 — scan_earnings_markets NO-side fee math inverted.**~~
+  **NOT A BUG.** `_fee_adjusted_edge(fair_value, market_price, side)` at
+  kalshi_bot/strategy.py:164 handles NO side internally: when `side="no"`,
+  it uses `(1-fair_value) × market_price × (1-fee) - fair_value × (1-market_price)`.
+  Scanner passes both fair_value and market_price in YES-space (verified).
+  Computed EV matches the correct formula for a NO bet. Subagent did
+  not read the helper's NO-branch.
+
+### HIGH findings (13 items, unpatched)
+
+| # | File:Line | Issue | Priority |
+|---|-----------|-------|----------|
+| H1 | ep_intel.py:1609-1624 | `markets_last_scan` not updated on scan failure → retry every cycle (10× normal rate) | Low-risk; retries are at most 10/2h, not catastrophic |
+| H2 | strategy.py:3176, 3260 | UNRATE / CPI coherence scanners filter strike > 3.75 / < 4.00 hardcoded — dead at current ~3.75% Fed rate | Dead scanners, not actively harmful |
+| H3 | strategy.py:1367 | Weather "less" strike_type double-inverts fair_value + price — edge sign flipped for below-threshold markets | NEEDS VERIFICATION — subagents wrong twice this round, verify before patching |
+| H4 | strategy.py:752 vs 914 | Signal.fair_value convention inconsistent between FOMC and other scanners | Documentation/consistency fix |
+| H5 | ep_bus.py:94-105 | publish_signal XADD no try/except — Redis blip drops signals silently | Safety improvement |
+| H6 | ep_bus.py:123-151 | PEL drain exits at count=100 batch boundary | Edge case on massive backlog |
+| H7 | ep_bus.py:182-198 | Consumer-group recreate at id="0" replays entire stream → possible order flood on NOGROUP recovery | Rare but catastrophic-if-it-fires |
+| H8 | ep_datasources.py:109-127 | No 429 handling on FRED | Silent stale cache on rate-limit |
+| H9 | ep_datasources.py:340-372 | Deribit midnight-UTC rollover blindness (60s/day) | Annoying but contained |
+| H10 | ep_econ_release.py:449-453 | Report-month derivation wrong for mid-month CPI release | CPI confirmation could match wrong data month |
+| H11 | ep_econ_release.py | No DST handling on 8:30 ET release times | Up to 60min drift at DST transitions |
+| H12 | ep_polymarket.py:172 vs ep_predictit.py:451 | Fee asymmetry (flat 2¢ vs 1¢) | Ranking consistency |
+| H13 | ep_polymarket.py:231-249 | Strike substring matching can mis-match series | Keyword + strike co-requirement needed |
+
+### MEDIUM (18 items, unpatched)
+
+Summarized in audit report; includes FOMC fair_value convention,
+ep_ob_depth geometry comment, ep_econ_release σ-threshold tuning,
+schema version validation, BTC cross-exchange partial-data handling,
+Fed sentiment date filter, etc. Recorded for later triage.
+
+### LOW (12 items, unpatched)
+
+Cosmetic/hygiene; client async-client-per-request (perf), weak
+private-key permission check, SR3 zombie fetcher, etc.
+
+### Verification discipline
+
+Two subagent CRITICALs were false positives (C4 schema, C5 earnings).
+Both caught by spot-checking against live code before patching. When
+agents claim CRITICAL without line-number evidence that unambiguously
+demonstrates the bug, verify before applying.
 
 ## Infrastructure gaps (separate workstream)
 
