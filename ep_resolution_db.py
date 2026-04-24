@@ -593,6 +593,20 @@ async def get_rolling_strategy_health(
         pnl  = sum(t["pnl_cents"] for t in ts)
         return {"n": n, "win_rate": round(wins / n, 3), "pnl_cents": pnl}
 
+    def _span_days(ts: list) -> Optional[float]:
+        """Wall-clock span of a trade slice in days, using exit_ts. Returns
+        None if the slice is empty or too small to span a range."""
+        if not ts or len(ts) < 2:
+            return None
+        first = ts[0].get("exit_ts")
+        last  = ts[-1].get("exit_ts")
+        if first is None or last is None:
+            return None
+        try:
+            return round((last - first) / 86400, 2)
+        except (TypeError, ValueError):
+            return None
+
     result: dict = {}
     for strat, strat_trades in by_strat.items():
         baseline = strat_trades[-baseline_n:]
@@ -615,6 +629,11 @@ async def get_rolling_strategy_health(
             "status":             status,
             "recent_n":           len(recent),
             "baseline_n":         len(baseline),
+            # Wall-clock span of the sample windows so the advisor can tell
+            # whether "recent 20 trades" is 2 days (active) or 20 days (dead).
+            # Added 2026-04-24 to address audit finding Adv #6.
+            "recent_span_days":   _span_days(recent),
+            "baseline_span_days": _span_days(baseline),
             "recent_win_rate":    r["win_rate"]   if r else None,
             "baseline_win_rate":  b["win_rate"]   if b else None,
             "recent_pnl_cents":   r["pnl_cents"]  if r else None,

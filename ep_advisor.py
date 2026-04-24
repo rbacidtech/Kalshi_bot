@@ -289,27 +289,47 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
             "yes_entry_price_gate": yes_gate,
             "near_expiry_stop_days": stop_days,
         }
-        # Auto-apply if calibration has enough data and differs from defaults
+        # Auto-apply if calibration has enough data and differs from defaults.
+        # When used_default=True, surface the reason so operators can tell
+        # whether it's data insufficiency, out-of-range, or a scanner being dead.
         if not yes_gate["used_default"]:
             calibrated_str = f"{yes_gate['calibrated']:.2f}"
             await r.hset(EP_CONFIG, "override_min_yes_entry_price", calibrated_str)
+        else:
+            print(
+                f"[ep_advisor] yes_entry_gate used default "
+                f"({yes_gate.get('default')}): {yes_gate.get('note', 'no reason given')}",
+                flush=True,
+            )
         if not stop_days["used_default"]:
             await r.hset(EP_CONFIG, "kalshi_near_expiry_no_stop_days", str(stop_days["calibrated"]))
+        else:
+            print(
+                f"[ep_advisor] near_expiry_stop_days used default "
+                f"({stop_days.get('default')}): {stop_days.get('note', 'no reason given')}",
+                flush=True,
+            )
     except Exception as _cal_exc:
         ctx["threshold_calibration"] = {"error": str(_cal_exc)[:120]}
 
     # ── Current ep:config overrides (so Claude knows what's already set) ─────
     try:
         cfg_raw = await r.hgetall(EP_CONFIG)
+        # Normalize bytes-keyed hashes to str keys up-front so downstream
+        # lookups don't need the brittle `get(k.encode(), get(k, None))`
+        # fallback. aioredis returns bytes when decode_responses=False and
+        # str when True; we want a single shape either way.
+        cfg_norm = {
+            (k.decode() if isinstance(k, bytes) else k):
+            (v.decode() if isinstance(v, bytes) else v)
+            for k, v in cfg_raw.items()
+        }
         cfg_keys = [
             "llm_scale_factor", "llm_kelly_fraction", "llm_rsi_oversold",
             "llm_rsi_overbought", "llm_z_threshold", "llm_max_contracts",
             "HALT_TRADING", "llm_notes",
         ]
-        ctx["current_config"] = {
-            k: (cfg_raw.get(k.encode(), cfg_raw.get(k, None)))
-            for k in cfg_keys
-        }
+        ctx["current_config"] = {k: cfg_norm.get(k) for k in cfg_keys}
     except Exception:
         ctx["current_config"] = {}
 

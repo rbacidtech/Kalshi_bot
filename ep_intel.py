@@ -2430,7 +2430,21 @@ async def intel_main() -> None:
             try:
                 _deribit_raw = await bus._r.get("ep:deribit:skew")
                 if _deribit_raw:
-                    _deribit_skew_pct = float(json.loads(_deribit_raw).get("skew_pct", 0))
+                    _d_payload = json.loads(_deribit_raw)
+                    # Freshness check: skew is only useful if recently fetched.
+                    # Redis TTL (10 min) caps maximum age, but 10 min is still
+                    # old for options-market sentiment; tighten to 5 min here.
+                    _d_ts_s = _d_payload.get("ts")
+                    if _d_ts_s is not None:
+                        _d_age = time.time() - float(_d_ts_s)
+                        if _d_age > 300:
+                            log.debug(
+                                "Deribit skew %.0fs old — skipping adjustment", _d_age
+                            )
+                        else:
+                            _deribit_skew_pct = float(_d_payload.get("skew_pct", 0))
+                    else:
+                        _deribit_skew_pct = float(_d_payload.get("skew_pct", 0))
             except Exception as _der_exc:
                 log.debug("Deribit skew read failed: %s", _der_exc)
 
