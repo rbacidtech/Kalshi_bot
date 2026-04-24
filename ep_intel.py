@@ -682,26 +682,32 @@ async def _release_monitor_loop(bus: RedisBus) -> None:
 # ── Macro refresh + regime classification ─────────────────────────────────────
 
 def _classify_regime(regime: dict) -> str:
-    """Return human-readable macro regime label."""
-    t10y2y        = regime.get("t10y2y", 0)
-    pce           = regime.get("pce_yoy", 0)
-    core_cpi      = regime.get("core_cpi_yoy", 0)
-    vix           = regime.get("vix", 15)
+    """Return human-readable macro regime label.
+
+    Missing values stay None rather than defaulting to a numeric value that
+    would (mis)trigger a regime clause. Previously, missing PCE defaulted to
+    0.0 which satisfied `pce < 2.0` and drove the classifier into EASING
+    purely on absent data. Each clause now short-circuits when its input
+    indicator is missing, so we fall back to NEUTRAL when coverage is thin.
+    """
+    t10y2y        = regime.get("t10y2y")
+    pce           = regime.get("pce_yoy")
+    core_cpi      = regime.get("core_cpi_yoy")
+    vix           = regime.get("vix")
     baa10y_regime = regime.get("baa10y_regime", "normal")
 
     # Stressed credit spreads override other indicators — systemic risk signal
     if baa10y_regime == "stressed":
         return "RISK_OFF"
-    if t10y2y < -0.50 and pce < 2.5:
+    if t10y2y is not None and pce is not None and t10y2y < -0.50 and pce < 2.5:
         return "EASING_STRONGLY"
-    elif t10y2y < 0 or pce < 2.0:
+    if (t10y2y is not None and t10y2y < 0) or (pce is not None and pce < 2.0):
         return "EASING"
-    elif pce > 3.0 or core_cpi > 3.5:
+    if (pce is not None and pce > 3.0) or (core_cpi is not None and core_cpi > 3.5):
         return "TIGHTENING"
-    elif vix > 30 or baa10y_regime == "elevated":
+    if (vix is not None and vix > 30) or baa10y_regime == "elevated":
         return "RISK_OFF"
-    else:
-        return "NEUTRAL"
+    return "NEUTRAL"
 
 
 async def _refresh_macro_data(bus: RedisBus) -> None:
