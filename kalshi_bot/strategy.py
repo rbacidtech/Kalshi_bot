@@ -749,7 +749,15 @@ async def scan_fomc_directional(
                 title             = market.get("title", ""),
                 category          = "fomc",
                 side              = side,
-                fair_value        = fair_yes if side == "yes" else (1 - fair_yes),
+                # fair_value: always P(YES wins) regardless of side. Matches the
+                # convention used by every other scanner (crypto, weather, GDP,
+                # coherence) AND intel's ask-adjust at ep_intel.py:2592-2598
+                # which expects fair_value in YES-space. Prior code stored
+                # `1 - fair_yes` for NO signals (P(NO wins)); when combined with
+                # the ask-adjust formula `(market_price - half_spread) - fair_value`
+                # this silently inverted edges for KXFED NO signals whenever
+                # spread_cents was set — dropping otherwise-valid NO signals.
+                fair_value        = fair_yes,
                 market_price      = price,
                 edge              = round(edge, 4),
                 fee_adjusted_edge = round(fee_edge, 4),
