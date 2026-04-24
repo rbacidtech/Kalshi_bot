@@ -16,16 +16,18 @@ from kalshi_bot.risk import RiskManager, RiskConfig
 def make_risk(
     kelly_fraction:       float = 0.25,
     max_contracts:        int   = 10,
-    max_market_exposure:  float = 0.05,
     max_total_exposure:   float = 0.30,
     daily_drawdown_limit: float = 0.10,
     max_spread_cents:     int   = 10,
     fee_cents:            int   = 7,
+    **_ignored,
 ) -> RiskManager:
+    # max_market_exposure removed from RiskConfig (2026-04-24 risk engine
+    # consolidation) — per-market cap moved to ep_exec.py against the daily
+    # bankroll anchor. Tests that still pass it via **_ignored are no-ops.
     return RiskManager(RiskConfig(
         kelly_fraction       = kelly_fraction,
         max_contracts        = max_contracts,
-        max_market_exposure  = max_market_exposure,
         max_total_exposure   = max_total_exposure,
         daily_drawdown_limit = daily_drawdown_limit,
         max_spread_cents     = max_spread_cents,
@@ -106,17 +108,6 @@ class TestKellySizing:
             confidence=1.0, side="yes",
         )
         assert contracts == 5
-
-    def test_capped_at_market_exposure(self):
-        """Result limited by max_market_exposure fraction of balance."""
-        rm = make_risk(max_contracts=10_000, max_market_exposure=0.05, kelly_fraction=1.0)
-        # max_by_cap = int(100_000 * 0.05 / 50) = 100
-        contracts = rm.size(
-            edge=0.40, market_price=0.50, balance_cents=100_000,
-            confidence=1.0, side="yes",
-        )
-        # Should be capped at 100, not the (much larger) Kelly amount
-        assert contracts <= 100
 
     def test_very_high_price_yes_side(self):
         """Market price near 1.0 → win amount near 0 → few contracts."""

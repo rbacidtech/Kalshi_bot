@@ -76,7 +76,6 @@ CONCURRENCY   = _getenv_int("KALSHI_CONCURRENCY", 10)   # fewer needed for FOMC-
 
 # ── Risk ──────────────────────────────────────────────────────────────────────
 KELLY_FRACTION        = _getenv_float("KALSHI_KELLY_FRACTION", 0.25)
-MAX_MARKET_EXPOSURE   = _getenv_float("KALSHI_MAX_MARKET_EXPOSURE", 0.05)
 MAX_TOTAL_EXPOSURE    = _getenv_float("KALSHI_MAX_TOTAL_EXPOSURE", 0.30)  # tighter: FOMC only
 DAILY_DRAWDOWN_LIMIT  = _getenv_float("KALSHI_DAILY_DRAWDOWN_LIMIT", 0.10)
 MAX_SPREAD_CENTS      = _getenv_int("KALSHI_MAX_SPREAD_CENTS", 10)        # tighter for FOMC

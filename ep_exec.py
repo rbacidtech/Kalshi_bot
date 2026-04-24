@@ -117,7 +117,11 @@ _EXIT_CANCEL_RETRY_CAP   = int(os.getenv("EXIT_CANCEL_RETRY_CAP",  "5"))
 # Balance itself constrains total deployment; no cross-market category limits.
 _MAX_LONG_PCT   = float(os.getenv("MAX_LONG_PCT",  "0.70"))  # max % of balance in YES positions
 _MAX_SHORT_PCT  = float(os.getenv("MAX_SHORT_PCT", "0.70"))  # max % of balance in NO positions
-_MAX_MARKET_PCT = float(os.getenv("MAX_MARKET_PCT","0.15"))  # max % of balance in any single market
+# Max $-at-risk on a single market as a fraction of the daily bankroll anchor.
+# Anchor = first successful balance fetch of the UTC day (Intel writes). Using
+# the anchor — not live balance — keeps the cap stable across fills/top-ups.
+# Override live via `redis-cli hset ep:config override_max_loss_per_market_pct 0.XX`.
+_MAX_LOSS_PER_MARKET_PCT = float(os.getenv("MAX_LOSS_PER_MARKET_PCT", "0.20"))
 
 # ── Long-game capital cap ─────────────────────────────────────────────────────
 # Positions settling > LONG_GAME_HORIZON_DAYS out are "long-game" bets.
@@ -565,10 +569,12 @@ async def _process_signal(
             contracts  = _cap_max
             _sig_cost  = _unit_cost * contracts
 
-        # Per-market cap includes existing exposure on this ticker for top-ups.
-        # Otherwise weather accumulation could blow past the cap across many
-        # small top-up signals on the same contract. Live-tunable via
-        # override_max_market_pct in ep:config.
+        # Per-market $-at-risk cap. For binary markets max_loss == entry cost
+        # (contract goes to 0), so _sig_cost already equals max loss. Cap is
+        # measured against the daily bankroll anchor (stable denominator) so
+        # top-ups can't ratchet as balance moves intra-day. Includes existing
+        # exposure on this ticker so weather top-ups don't blow past the cap
+        # across many small signals.
         _existing_cost = 0
         if _is_topup and _existing_pos:
             _ex_ct = int(_existing_pos.get("contracts_filled")
@@ -578,17 +584,30 @@ async def _process_signal(
                               if _existing_pos.get("side") == "no"
                               else _ex_en * _ex_ct)
         try:
-            _ov_mmp = await bus.get_config_override("override_max_market_pct")
-            _mmp = float(_ov_mmp) if _ov_mmp else _MAX_MARKET_PCT
-            if not (0.0 < _mmp <= 1.0):
-                _mmp = _MAX_MARKET_PCT
+            _ov_mlpm = await bus.get_config_override("override_max_loss_per_market_pct")
+            _mlpm = float(_ov_mlpm) if _ov_mlpm else _MAX_LOSS_PER_MARKET_PCT
+            if not (0.0 < _mlpm <= 1.0):
+                _mlpm = _MAX_LOSS_PER_MARKET_PCT
         except (ValueError, TypeError):
-            _mmp = _MAX_MARKET_PCT
-        if _sig_cost + _existing_cost > balance_cents * _mmp:
+            _mlpm = _MAX_LOSS_PER_MARKET_PCT
+        # Denominator: today's bankroll anchor. Fall back to live balance if the
+        # anchor hasn't been written yet (early boot of the day, Intel slow).
+        _anchor_cents = balance_cents
+        try:
+            _anchor_raw = await bus._r.get(
+                f"ep:bankroll_anchor:{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+            )
+            if _anchor_raw:
+                _anchor_cents = int(_anchor_raw)
+        except Exception:
+            pass
+        _cap_cents = _anchor_cents * _mlpm
+        if _sig_cost + _existing_cost > _cap_cents:
             log.info(
-                "Market limit hit (%.0f¢ + existing %.0f¢ > %.0f¢, cap=%.0f%%) — skipping %s",
-                _sig_cost, _existing_cost,
-                balance_cents * _mmp, _mmp * 100, sig.ticker,
+                "Per-market loss cap hit (%.0f¢ + existing %.0f¢ > %.0f¢, "
+                "cap=%.0f%% of anchor $%.2f) — skipping %s",
+                _sig_cost, _existing_cost, _cap_cents,
+                _mlpm * 100, _anchor_cents / 100, sig.ticker,
             )
             return _rejected("MARKET_LIMIT")
 
@@ -3702,7 +3721,6 @@ async def exec_main() -> None:
     kalshi_risk = RiskManager(RiskConfig(
         max_contracts        = cfg.MAX_CONTRACTS,
         kelly_fraction       = cfg.KELLY_FRACTION,
-        max_market_exposure  = cfg.MAX_MARKET_EXPOSURE,
         max_total_exposure   = cfg.MAX_TOTAL_EXPOSURE,
         daily_drawdown_limit = cfg.DAILY_DRAWDOWN_LIMIT,
         max_spread_cents     = cfg.MAX_SPREAD_CENTS,

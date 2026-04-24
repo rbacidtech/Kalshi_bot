@@ -59,30 +59,30 @@ def _env_defaults() -> dict[str, Any]:
         "enable_sports":       True,
         "enable_crypto_price": True,
         "enable_gdp":          True,
-        "edge_threshold":      _float("KALSHI_EDGE_THRESHOLD", 0.10),
-        "max_contracts":       _int("KALSHI_MAX_CONTRACTS", 5),
-        "poll_interval":       _int("KALSHI_POLL_INTERVAL", 120),
-        "min_confidence":      _float("KALSHI_MIN_CONFIDENCE", 0.60),
-        "kelly_fraction":      _float("KALSHI_KELLY_FRACTION", 0.25),
-        "max_market_exposure": _float("KALSHI_MAX_MARKET_EXPOSURE", 0.05),
-        "daily_drawdown_limit":_float("KALSHI_DAILY_DRAWDOWN_LIMIT", 0.10),
+        "edge_threshold":           _float("KALSHI_EDGE_THRESHOLD", 0.10),
+        "max_contracts":            _int("KALSHI_MAX_CONTRACTS", 5),
+        "poll_interval":            _int("KALSHI_POLL_INTERVAL", 120),
+        "min_confidence":           _float("KALSHI_MIN_CONFIDENCE", 0.60),
+        "kelly_fraction":           _float("KALSHI_KELLY_FRACTION", 0.25),
+        "max_loss_per_market_pct":  _float("MAX_LOSS_PER_MARKET_PCT", 0.20),
+        "daily_drawdown_limit":     _float("KALSHI_DAILY_DRAWDOWN_LIMIT", 0.10),
     }
 
 
 class BotConfig(BaseModel):
-    enable_fomc:          bool  = True
-    enable_weather:       bool  = True
-    enable_economic:      bool  = True
-    enable_sports:        bool  = True
-    enable_crypto_price:  bool  = True
-    enable_gdp:           bool  = True
-    edge_threshold:       float = Field(0.10, ge=0.05, le=0.50)
-    max_contracts:        int   = Field(5,    ge=1,    le=100)
-    poll_interval:        int   = Field(120,  ge=30,   le=3600)
-    min_confidence:       float = Field(0.60, ge=0.10, le=1.00)
-    kelly_fraction:       float = Field(0.25, ge=0.05, le=1.00)
-    max_market_exposure:  float = Field(0.05, ge=0.01, le=0.50)
-    daily_drawdown_limit: float = Field(0.10, ge=0.01, le=0.50)
+    enable_fomc:             bool  = True
+    enable_weather:          bool  = True
+    enable_economic:         bool  = True
+    enable_sports:           bool  = True
+    enable_crypto_price:     bool  = True
+    enable_gdp:              bool  = True
+    edge_threshold:          float = Field(0.10, ge=0.05, le=0.50)
+    max_contracts:           int   = Field(5,    ge=1,    le=100)
+    poll_interval:           int   = Field(120,  ge=30,   le=3600)
+    min_confidence:          float = Field(0.60, ge=0.10, le=1.00)
+    kelly_fraction:          float = Field(0.25, ge=0.05, le=1.00)
+    max_loss_per_market_pct: float = Field(0.20, ge=0.01, le=0.50)
+    daily_drawdown_limit:    float = Field(0.10, ge=0.01, le=0.50)
 
 
 @router.get("/config", response_model=BotConfig)
@@ -118,6 +118,8 @@ async def get_config(
             cfg["min_confidence"] = float(raw_live["override_min_confidence"])
         if raw_live.get("llm_kelly_fraction"):
             cfg["kelly_fraction"] = float(raw_live["llm_kelly_fraction"])
+        if raw_live.get("override_max_loss_per_market_pct"):
+            cfg["max_loss_per_market_pct"] = float(raw_live["override_max_loss_per_market_pct"])
     except Exception:
         pass
 
@@ -138,10 +140,11 @@ async def patch_config(
         await r.set(_CONFIG_KEY, body.model_dump_json())
         # Live overrides the bot reads each scan cycle
         await r.hset(_BOT_CFG_KEY, mapping={
-            "override_edge_threshold": str(body.edge_threshold),
-            "override_max_contracts":  str(body.max_contracts),
-            "override_min_confidence": str(body.min_confidence),
-            "llm_kelly_fraction":      str(body.kelly_fraction),
+            "override_edge_threshold":          str(body.edge_threshold),
+            "override_max_contracts":           str(body.max_contracts),
+            "override_min_confidence":          str(body.min_confidence),
+            "llm_kelly_fraction":               str(body.kelly_fraction),
+            "override_max_loss_per_market_pct": str(body.max_loss_per_market_pct),
         })
     except Exception:
         pass
@@ -462,7 +465,7 @@ async def ai_suggest(
         f"- min_confidence: {config.get('min_confidence', '?')} (signal confidence gate)\n"
         f"- kelly_fraction: {config.get('kelly_fraction', '?')} (sizing fraction)\n"
         f"- max_contracts: {config.get('max_contracts', '?')} (position size cap)\n"
-        f"- max_market_exposure: {config.get('max_market_exposure', '?')} (per-market %)\n"
+        f"- max_loss_per_market_pct: {config.get('max_loss_per_market_pct', '?')} (per-market $-at-risk cap vs daily anchor)\n"
         f"- daily_drawdown_limit: {config.get('daily_drawdown_limit', '?')}\n"
         f"- paper_trade: {config.get('paper_trade', '?')}\n"
         f"Active strategies: FOMC={config.get('enable_fomc')}, "

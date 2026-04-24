@@ -1565,12 +1565,14 @@ async def intel_main() -> None:
             # Only skip the network call when there are no real credentials.
             balance_cents = 100_000   # fallback ($1,000) if fetch not possible
             _portfolio_value_cents = 0
+            _fresh_balance_fetched = False
             if cfg.API_KEY_ID:
                 try:
                     bal                       = client.get("/portfolio/balance")
                     balance_cents             = bal.get("balance", 0)
                     _portfolio_value_cents    = bal.get("portfolio_value", 0)
                     _last_balance_cents       = balance_cents   # save for fallback
+                    _fresh_balance_fetched    = True
                 except Exception:
                     if _last_balance_cents is not None:
                         balance_cents = _last_balance_cents
@@ -1583,6 +1585,21 @@ async def intel_main() -> None:
                 state.set_balance(balance_cents)
                 await bus.set_balance(balance_cents, state.mode, _portfolio_value_cents)
                 metrics.update_balance(balance_cents)
+
+            # Daily bankroll anchor: stable denominator for per-market risk cap so
+            # top-ups can't ratchet on intra-day balance changes. SETNX so the
+            # first successful fetch of the UTC day wins. Gated on a real Kalshi
+            # fetch to avoid anchoring on the $1k paper fallback or a stale
+            # _last_balance_cents after a failed first-cycle fetch.
+            if _fresh_balance_fetched and balance_cents > 0:
+                try:
+                    _anchor_key = f"ep:bankroll_anchor:{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    if await bus._r.setnx(_anchor_key, balance_cents):
+                        await bus._r.expire(_anchor_key, 172_800)   # 48h cleanup
+                        log.info("Bankroll anchor set for %s: $%.2f",
+                                 _anchor_key.rsplit(":", 1)[-1], balance_cents / 100)
+                except Exception as _anchor_exc:
+                    log.warning("Bankroll anchor write failed: %s", _anchor_exc)
 
             # ── Coinbase balance (USD + BTC holdings) ─────────────────────────
             # Refresh every cycle so the dashboard shows current portfolio value.

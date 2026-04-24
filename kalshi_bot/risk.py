@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 class RiskConfig:
     max_contracts:        int   = 10
     kelly_fraction:       float = 0.25
-    max_market_exposure:  float = 0.05
     max_total_exposure:   float = 0.80
     daily_drawdown_limit: float = 0.10
     max_spread_cents:     int   = 10
@@ -279,9 +278,8 @@ class RiskManager:
         else:
             price_cents = max(int(market_price * 100), 1)
         max_by_kelly = int((balance_cents * bet_fraction) / price_cents)
-        max_by_cap   = int((balance_cents * self.cfg.max_market_exposure) / price_cents)
 
-        return min(max_by_kelly, max_by_cap, self.cfg.max_contracts)
+        return min(max_by_kelly, self.cfg.max_contracts)
 
     def approve(
         self,
@@ -307,9 +305,6 @@ class RiskManager:
         else:
             order_cost = int(market_price * 100) * contracts
         if balance_cents > 0:
-            if order_cost / balance_cents > self.cfg.max_market_exposure:
-                log.info("Rejected %s — order exceeds market exposure limit.", ticker)
-                return False
             if (open_exposure_cents + order_cost) / balance_cents > self.cfg.max_total_exposure:
                 log.info("Rejected %s — would exceed total exposure limit.", ticker)
                 return False

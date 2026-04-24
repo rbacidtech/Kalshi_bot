@@ -22,7 +22,7 @@ interface BotConfig {
   poll_interval:        number
   min_confidence:       number
   kelly_fraction:       number
-  max_market_exposure:  number
+  max_loss_per_market_pct:  number
   daily_drawdown_limit: number
 }
 
@@ -725,7 +725,7 @@ function StrategiesTab({ cfg, update, isSaving, perf }: {
 
 function RiskTab({ cfg, update, isSaving }: {
   // edge_threshold, max_contracts, min_confidence → written to ep:config hash, picked up each scan cycle
-  // kelly_fraction, max_market_exposure, daily_drawdown_limit, poll_interval → env-var only, require restart
+  // kelly_fraction, max_loss_per_market_pct, daily_drawdown_limit, poll_interval → env-var only, require restart
   cfg: BotConfig
   update: <K extends keyof BotConfig>(key: K, value: BotConfig[K]) => void
   isSaving: boolean
@@ -786,13 +786,13 @@ function RiskTab({ cfg, update, isSaving }: {
         disabled={isSaving}
       />
       <RiskSlider
-        label="Max Market Exposure"
-        description="Max % of balance deployed in any single market."
-        value={cfg.max_market_exposure}
-        display={`${(cfg.max_market_exposure * 100).toFixed(0)}%`}
+        label="Max Loss Per Market"
+        description="Max $-at-risk on any single market, as % of today's bankroll anchor (stable denominator, not live balance)."
+        value={cfg.max_loss_per_market_pct}
+        display={`${(cfg.max_loss_per_market_pct * 100).toFixed(0)}%`}
         min={0.01} max={0.50} step={0.01}
         color="text-amber-400"
-        onChange={v => update('max_market_exposure', Math.round(v * 100) / 100)}
+        onChange={v => update('max_loss_per_market_pct', Math.round(v * 100) / 100)}
         disabled={isSaving}
       />
       <RiskSlider
@@ -1034,10 +1034,13 @@ export default function ControlsPage() {
   const RESTART_REQUIRED_KEYS: (keyof BotConfig)[] = [
     'enable_fomc', 'enable_weather', 'enable_economic', 'enable_sports',
     'enable_crypto_price', 'enable_gdp',
-    'max_market_exposure', 'daily_drawdown_limit', 'poll_interval',
+    'daily_drawdown_limit', 'poll_interval',
   ]
 
-  const LIVE_KEYS: (keyof BotConfig)[] = ['edge_threshold', 'max_contracts', 'min_confidence', 'kelly_fraction']
+  const LIVE_KEYS: (keyof BotConfig)[] = [
+    'edge_threshold', 'max_contracts', 'min_confidence', 'kelly_fraction',
+    'max_loss_per_market_pct',
+  ]
 
   const dirtyRestartKeys = serverConfig
     ? RESTART_REQUIRED_KEYS.filter(k => cfg[k] !== serverConfig[k])
