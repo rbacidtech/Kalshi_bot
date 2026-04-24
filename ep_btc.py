@@ -611,7 +611,7 @@ class BTCMeanReversionStrategy:
                 edge       = (mid_bb - spot_price) / spot_price
                 conf_adj   = _sentiment_conf_adj("buy")
                 # Vol regime: extreme vol = breakdown risk, scale confidence down
-                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.65, "insufficient_data": 1.0}.get(vol_regime, 1.0)
+                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.40, "insufficient_data": 1.0}.get(vol_regime, 1.0)
                 confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj)) * _vol_mult
                 fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(
@@ -665,7 +665,7 @@ class BTCMeanReversionStrategy:
                 edge       = (spot_price - mid_bb) / spot_price
                 conf_adj   = _sentiment_conf_adj("sell")
                 # Vol regime: extreme vol = breakdown risk, scale confidence down
-                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.65, "insufficient_data": 1.0}.get(vol_regime, 1.0)
+                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.40, "insufficient_data": 1.0}.get(vol_regime, 1.0)
                 confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj)) * _vol_mult
                 fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(

@@ -376,7 +376,6 @@ def _scan_ladder_arb_core(
         series_tag:   Short tag used in model_source and log lines (e.g. "fomc", "cpi").
     """
     mono_candidates: list[tuple[float, Signal]] = []
-    butterfly_signals: list[Signal] = []
 
     for event, group in groups.items():
         priced = [(m, _extract_strike(m["ticker"]), _market_mid(m)) for m in group]
@@ -423,70 +422,12 @@ def _scan_ladder_arb_core(
                         m_high["ticker"], 1 - yes_bid_high, net_profit * 100,
                     )
 
-        # ── Butterfly convexity check ─────────────────────────────────────────
-        if len(priced) < 3:
-            continue
-
-        BUTTERFLY_THRESHOLD = 0.04
-
-        for i in range(len(priced) - 2):
-            m_a, strike_a, p_a = priced[i]
-            m_b, strike_b, p_b = priced[i + 1]
-            m_c, strike_c, p_c = priced[i + 2]
-
-            gap_lo = round(strike_b - strike_a, 4)
-            gap_hi = round(strike_c - strike_b, 4)
-            if abs(gap_lo - gap_hi) > 1e-6:
-                continue
-
-            convexity_slack = p_a + p_c - 2 * p_b
-            if convexity_slack >= -BUTTERFLY_THRESHOLD:
-                continue
-
-            bf_mid_b = (p_a + p_c) / 2.0
-            legs = [
-                (abs(p_a - bf_mid_b), m_a, strike_a, p_a),
-                (abs(p_b - bf_mid_b), m_b, strike_b, p_b),
-                (abs(p_c - bf_mid_b), m_c, strike_c, p_c),
-            ]
-            worst_dev, worst_m, worst_strike, worst_price = max(legs, key=lambda x: x[0])
-            contracts = min(max_contracts, max(1, int(worst_dev * 50)))
-
-            _bf_arb_legs = [
-                {"ticker": m_a["ticker"], "side": "yes", "price_cents": max(1, int(p_a * 100))},
-                {"ticker": m_b["ticker"], "side": "no",  "price_cents": max(1, int((1.0 - p_b) * 100))},
-                {"ticker": m_c["ticker"], "side": "yes", "price_cents": max(1, int(p_c * 100))},
-            ]
-            sig = Signal(
-                ticker            = worst_m["ticker"],
-                title             = (
-                    f"BUTTERFLY: {m_a['ticker']}/{m_b['ticker']}/{m_c['ticker']} "
-                    f"leg {worst_m['ticker']} off by {worst_dev * 100:.1f}¢"
-                ),
-                category          = "arb",
-                side              = "yes",
-                fair_value        = bf_mid_b,
-                market_price      = worst_price,
-                edge              = worst_dev,
-                fee_adjusted_edge = worst_dev * (1 - KALSHI_FEE_RATE * 2),
-                contracts         = contracts,
-                confidence        = 0.70,
-                model_source      = f"{series_tag}_butterfly_arb",
-                meeting           = event,
-                arb_legs          = _bf_arb_legs,
-            )
-            butterfly_signals.append(sig)
-            log.info(
-                "%s BUTTERFLY: %s/%s/%s P=%.2f/%.2f/%.2f slack=%.2f¢ worst=%s dev=%.2f¢",
-                series_tag.upper(),
-                m_a["ticker"], m_b["ticker"], m_c["ticker"],
-                p_a, p_b, p_c, convexity_slack * 100,
-                worst_m["ticker"], worst_dev * 100,
-            )
+    # Butterfly convexity arb removed: P(T1)+P(T3)-2*P(T2)<0 is NOT a riskless arb
+    # for binary prediction markets (unlike European options). Live data confirmed
+    # negative EV (-$5.56 realized loss, 19% win rate, Sharpe -3.37 on 21 trades).
 
     mono_candidates.sort(key=lambda x: x[0], reverse=True)
     signals = [sig for _, sig in mono_candidates]
-    signals.extend(butterfly_signals)
     return signals
 
 
@@ -3449,11 +3390,12 @@ async def scan_earnings_markets(
     max_contracts: int = 3,
 ) -> list[Signal]:
     """
-    Score KXERN bracket markets using Yahoo Finance consensus EPS estimates.
+    Score KXERN bracket markets using options-implied volatility.
 
     Ticker format: KXERN-26APR25-AAPL-A20  (A=above, B=below threshold).
-    Fair value is derived from a normal CDF over the consensus EPS vs threshold,
-    assuming 15% EPS uncertainty.
+    Fetches the ATM straddle from Yahoo Finance's nearest-expiry options chain to
+    derive the market's priced-in earnings move.  EPS sigma = |consensus| * implied_move.
+    Falls back to 15% uncertainty when the options fetch fails.
     """
     import re as _re
 
@@ -3467,32 +3409,74 @@ async def scan_earnings_markets(
 
     _ticker_re = _re.compile(r"^KXERN-\d{6}-([A-Z]+)-([AB])(\d+\.?\d*)$")
 
-    async def _fetch_consensus(symbol: str) -> Optional[float]:
+    async def _fetch_earnings_data(symbol: str) -> tuple[Optional[float], Optional[float]]:
+        """Return (consensus_eps, implied_move_fraction). Either may be None on failure."""
+        http    = _get_http_client()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        consensus: Optional[float]    = None
+        implied_move: Optional[float] = None
+
         try:
-            url  = (
-                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-                "?modules=earningsTrend"
+            # Options chain: stock price + ATM straddle for implied-move estimate
+            opts_resp = await asyncio.wait_for(
+                http.get(
+                    f"https://query1.finance.yahoo.com/v7/finance/options/{symbol}",
+                    headers=headers,
+                ),
+                timeout=6.0,
             )
-            http = _get_http_client()
-            resp = await asyncio.wait_for(
-                http.get(url, headers={"User-Agent": "Mozilla/5.0"}),
+            if opts_resp.status_code == 200:
+                chain = (
+                    opts_resp.json()
+                    .get("optionChain", {})
+                    .get("result", [{}])[0]
+                )
+                stock_price = (chain.get("quote") or {}).get("regularMarketPrice")
+                opts_list   = chain.get("options", [{}])
+                if stock_price and stock_price > 0 and opts_list:
+                    calls = opts_list[0].get("calls", [])
+                    puts  = opts_list[0].get("puts",  [])
+                    if calls and puts:
+                        atm = min(
+                            (c.get("strike", 0) for c in calls),
+                            key=lambda s: abs(s - stock_price),
+                        )
+                        call = next((c for c in calls if c.get("strike") == atm), None)
+                        put  = next((p for p in puts  if p.get("strike") == atm), None)
+                        if call and put:
+                            c_mid = (call.get("bid", 0.0) + call.get("ask", 0.0)) / 2.0
+                            p_mid = (put.get("bid",  0.0) + put.get("ask",  0.0)) / 2.0
+                            straddle = c_mid + p_mid
+                            if straddle > 0:
+                                implied_move = straddle / stock_price
+        except Exception:
+            pass
+
+        try:
+            eps_resp = await asyncio.wait_for(
+                http.get(
+                    f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+                    "?modules=earningsTrend",
+                    headers=headers,
+                ),
                 timeout=5.0,
             )
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            trend = (
-                data.get("quoteSummary", {})
+            if eps_resp.status_code == 200:
+                trend = (
+                    eps_resp.json()
+                    .get("quoteSummary", {})
                     .get("result", [{}])[0]
                     .get("earningsTrend", {})
                     .get("trend", [])
-            )
-            if not trend:
-                return None
-            raw = trend[0].get("epsTrend", {}).get("current", {}).get("raw")
-            return float(raw) if raw is not None else None
+                )
+                if trend:
+                    raw = trend[0].get("epsTrend", {}).get("current", {}).get("raw")
+                    if raw is not None:
+                        consensus = float(raw)
         except Exception:
-            return None
+            pass
+
+        return consensus, implied_move
 
     symbols = {}
     parsed  = {}
@@ -3509,23 +3493,30 @@ async def scan_earnings_markets(
         return signals
 
     unique_symbols = list(symbols.keys())
-    consensus_results = await asyncio.gather(
-        *[_fetch_consensus(sym) for sym in unique_symbols],
+    data_results = await asyncio.gather(
+        *[_fetch_earnings_data(sym) for sym in unique_symbols],
         return_exceptions=True,
     )
-    consensus_map: dict[str, Optional[float]] = {}
-    for sym, result in zip(unique_symbols, consensus_results):
-        consensus_map[sym] = None if isinstance(result, Exception) else result
+    data_map: dict[str, tuple[Optional[float], Optional[float]]] = {}
+    for sym, result in zip(unique_symbols, data_results):
+        data_map[sym] = (None, None) if isinstance(result, Exception) else result
 
     for ticker, (symbol, direction, threshold_str, market) in parsed.items():
         try:
-            consensus = consensus_map.get(symbol)
+            consensus, implied_move = data_map.get(symbol, (None, None))
             if consensus is None:
                 continue
 
             threshold = float(threshold_str)
-            sigma     = max(0.05, abs(consensus) * 0.15)
-            z         = (consensus - threshold) / sigma
+
+            if implied_move is not None and implied_move > 0:
+                sigma = max(0.02, abs(consensus) * implied_move)
+                iv_source = f"iv={implied_move:.3f}"
+            else:
+                sigma = max(0.05, abs(consensus) * 0.15)
+                iv_source = "iv=fallback"
+
+            z = (consensus - threshold) / sigma
 
             fair_value_above = 0.5 * (1 + _math.erf(z / _math.sqrt(2)))
             fair_value       = fair_value_above if direction == "A" else (1.0 - fair_value_above)
@@ -3539,7 +3530,9 @@ async def scan_earnings_markets(
             edge     = abs(fair_value - market_price)
             fee_edge = _fee_adjusted_edge(fair_value, market_price, side)
 
-            confidence = min(0.78, 0.55 + abs(z) * 0.08)
+            # Options-implied source warrants slightly higher confidence ceiling
+            conf_ceil  = 0.82 if implied_move else 0.78
+            confidence = min(conf_ceil, 0.55 + abs(z) * 0.08)
 
             if fee_edge < 0.06 or confidence < 0.58:
                 continue
@@ -3559,8 +3552,8 @@ async def scan_earnings_markets(
                 model_source      = "earnings_yfinance",
             ))
             log.info(
-                "Earnings: %s  symbol=%s  consensus=%.3f  threshold=%.3f  z=%.2f  fv=%.3f  fee_edge=%.3f",
-                ticker, symbol, consensus, threshold, z, fair_value, fee_edge,
+                "Earnings(%s): %s  consensus=%.3f  threshold=%.3f  sigma=%.3f  z=%.2f  fv=%.3f  fee_edge=%.3f",
+                iv_source, ticker, consensus, threshold, sigma, z, fair_value, fee_edge,
             )
         except Exception as exc:
             log.debug("scan_earnings_markets signal error for %s: %s", ticker, exc)
@@ -3572,57 +3565,60 @@ async def scan_earnings_markets(
 
 async def _fetch_538_polling() -> dict:
     """
-    Fetch FiveThirtyEight archived presidential polling CSV from GitHub and
-    return a dict mapping lowercase candidate name → average poll probability.
+    Fetch election win-probability forecasts from Metaculus's public API.
 
-    Filters to polls whose end_date is within the last 14 days.
-    Returns {} on any failure.
+    FiveThirtyEight was shut down by ABC in early 2025 — its GitHub CSV now
+    contains only stale historical polls.  Metaculus provides free, machine-readable
+    community probability forecasts for US election questions with no auth required.
+
+    Returns a dict mapping lowercase candidate/party keyword → probability (0–1).
+    Returns {} on any failure so the caller falls back to base election signals.
     """
-    import csv as _csv
-    import io  as _io
-
-    url = (
-        "https://raw.githubusercontent.com/fivethirtyeight/data/master/"
-        "polls/president_polls.csv"
-    )
     try:
         http = _get_http_client()
-        resp = await asyncio.wait_for(http.get(url), timeout=5.0)
+        # Search for active US election questions with binary resolution
+        url  = (
+            "https://www.metaculus.com/api2/questions/"
+            "?search=US+election&status=open&type=forecast&limit=50"
+        )
+        resp = await asyncio.wait_for(
+            http.get(url, headers={"Accept": "application/json"}),
+            timeout=8.0,
+        )
         if resp.status_code != 200:
             return {}
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=14)
-        reader = _csv.DictReader(_io.StringIO(resp.text))
+        data    = resp.json()
+        results = data.get("results") or []
+        probs: dict[str, float] = {}
 
-        totals: dict[str, list[float]] = {}
-        for row in reader:
-            end_date_str = row.get("end_date", "")
-            try:
-                end_dt = datetime.strptime(end_date_str, "%m/%d/%y").replace(tzinfo=timezone.utc)
-            except Exception:
-                try:
-                    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
-            if end_dt < cutoff:
-                continue
-
-            candidate = (row.get("answer") or row.get("candidate_name") or "").strip().lower()
-            pct_str   = row.get("pct", "")
-            if not candidate or not pct_str:
+        for q in results:
+            # community_prediction is {q1, q2, q3} for continuous; for binary it's
+            # {prediction: float} or a nested structure depending on question type.
+            cp = q.get("community_prediction") or {}
+            if isinstance(cp, dict):
+                p = cp.get("full", {}).get("q2") or cp.get("q2") or cp.get("prediction")
+            else:
+                p = None
+            if p is None:
                 continue
             try:
-                pct = float(pct_str)
-            except ValueError:
+                prob = float(p)
+            except (TypeError, ValueError):
                 continue
-            totals.setdefault(candidate, []).append(pct)
+            if not (0.0 < prob < 1.0):
+                continue
 
-        if not totals:
-            return {}
+            title = (q.get("title") or "").lower()
+            # Extract single meaningful word tokens (≥4 chars) as candidate keys
+            for word in title.split():
+                word = word.strip(".,?'\"():")
+                if len(word) >= 4 and word.isalpha():
+                    probs.setdefault(word, prob)
 
-        return {name: sum(vals) / len(vals) / 100.0 for name, vals in totals.items()}
+        return probs
     except Exception as exc:
-        log.debug("_fetch_538_polling failed: %s", exc)
+        log.debug("_fetch_538_polling (metaculus) failed: %s", exc)
         return {}
 
 
@@ -3632,13 +3628,14 @@ async def scan_election_markets_with_538(
     predictit_prices: dict,
 ) -> list:
     """
-    Wrap scan_election_markets with 538 as a third polling source.
+    Wrap scan_election_markets with a third independent probability source.
 
-    When a 538 match is found, re-weights fair_value as:
-      poly*0.35 + pi*0.15 + 538*0.50  (when all three present)
+    Source priority: Metaculus community forecasts (FiveThirtyEight shut down early 2025).
+    When a match is found, re-weights fair_value as:
+      poly*0.35 + pi*0.15 + metaculus*0.50  (when all three present)
     and boosts confidence by +0.05.
 
-    Falls back to the base scan_election_markets result if 538 data unavailable.
+    Falls back to the base scan_election_markets result if no forecast data available.
     """
     probs_538 = await _fetch_538_polling()
     base_sigs = scan_election_markets(kalshi_markets, polymarket_prices, predictit_prices)
@@ -3697,12 +3694,12 @@ async def scan_election_markets_with_538(
                     "edge":              round(new_edge,  4),
                     "fee_adjusted_edge": round(new_fee_e, 4),
                     "confidence":        round(new_conf,  3),
-                    "model_source":      model_src + f"_538={matched_538:.3f}",
+                    "model_source":      model_src + f"_metaculus={matched_538:.3f}",
                 },
             )
             updated.append(updated_sig)
             log.info(
-                "Election+538: %s  538_prob=%.3f  new_fair=%.3f  fee_edge=%.3f",
+                "Election+metaculus: %s  meta_prob=%.3f  new_fair=%.3f  fee_edge=%.3f",
                 getattr(sig, "ticker", "?"), matched_538, new_fair, new_fee_e,
             )
         except Exception as exc:
