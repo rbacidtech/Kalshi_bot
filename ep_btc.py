@@ -335,7 +335,13 @@ def _bollinger(
 
 
 def _z_score(closes: List[float], period: int = 20) -> Optional[float]:
-    """Rolling z-score of the latest close vs the trailing window."""
+    """Rolling z-score of the latest close vs the trailing window.
+
+    With the default period=20 and CANDLE_MINUTES=5, the window is 100 min
+    (not 60). The z_thresh calibration (1.8) is tied to this 100-min window;
+    changing `period` here without recalibrating the threshold will silently
+    shift signal frequency.
+    """
     if len(closes) < period:
         return None
     window = closes[-period:]
@@ -611,8 +617,12 @@ class BTCMeanReversionStrategy:
                 edge       = (mid_bb - spot_price) / spot_price
                 conf_adj   = _sentiment_conf_adj("buy")
                 # Vol regime: extreme vol = breakdown risk, scale confidence down
-                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.40, "insufficient_data": 1.0}.get(vol_regime, 1.0)
-                confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj)) * _vol_mult
+                # insufficient_data penalized to 0.5 — a sparse price buffer
+                # produces noisy z-scores; don't let them fire at full confidence.
+                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.40, "insufficient_data": 0.5}.get(vol_regime, 1.0)
+                # Floor applied AFTER vol_mult so extreme-vol regime (×0.40) + a
+                # strongly-opposed sentiment adj can't push confidence below 0.10.
+                confidence = max(0.10, min(0.99, (abs(z) / 3.0 + conf_adj) * _vol_mult))
                 fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(
                     source_node       = self.source_node,
@@ -665,8 +675,12 @@ class BTCMeanReversionStrategy:
                 edge       = (spot_price - mid_bb) / spot_price
                 conf_adj   = _sentiment_conf_adj("sell")
                 # Vol regime: extreme vol = breakdown risk, scale confidence down
-                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.40, "insufficient_data": 1.0}.get(vol_regime, 1.0)
-                confidence = max(0.10, min(1.0, abs(z) / 3.0 + conf_adj)) * _vol_mult
+                # insufficient_data penalized to 0.5 — a sparse price buffer
+                # produces noisy z-scores; don't let them fire at full confidence.
+                _vol_mult = {"low": 1.10, "normal": 1.0, "high": 0.85, "extreme": 0.40, "insufficient_data": 0.5}.get(vol_regime, 1.0)
+                # Floor applied AFTER vol_mult so extreme-vol regime (×0.40) + a
+                # strongly-opposed sentiment adj can't push confidence below 0.10.
+                confidence = max(0.10, min(0.99, (abs(z) / 3.0 + conf_adj) * _vol_mult))
                 fee_adj_edge = max(0.0, edge - 2 * COINBASE_TAKER_FEE)
                 sig = SignalMessage(
                     source_node       = self.source_node,

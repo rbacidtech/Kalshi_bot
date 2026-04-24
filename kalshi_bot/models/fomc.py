@@ -2791,6 +2791,13 @@ async def get_meeting_probs(meeting_key: str) -> MeetingProbs | None:
                         fedwatch_source = fw_source_label,
                     )
 
+            # Hard floor/ceiling on confidence before MeetingProbs write.
+            # Upstream fusion + cross-validation + macro regime can drift
+            # confidence to arbitrary values; Kelly sizing downstream scales
+            # directly with confidence, so an un-clamped 1.05 or -0.05 blows
+            # up position sizing. 0.50–0.99 is the documented operating band.
+            confidence = max(0.50, min(0.99, float(confidence)))
+
             new_probs[mk] = MeetingProbs(
                 probs        = blended,
                 fetched_at   = now,

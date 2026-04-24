@@ -17,6 +17,10 @@ _BTC_DAILY_LOSS_CAP  = 0.05   # halt BTC entries if session BTC loss > 5% of bal
 _BTC_EXPOSURE_CAP    = 0.80   # max BTC exposure as fraction of balance
 _BTC_RISK_PER_TRADE  = 0.02   # Kelly-substitute: risk 2% of balance per BTC trade
 BTC_UNIT             = 0.0001 # 1 contract = 0.0001 BTC (~$8.50 at $85k); makes sizing integer-safe
+# Follow ep_btc's fee setting so sizing matches the actual fee charged.
+# Previously hardcoded to 0.006 here — the two could drift silently.
+import os as _os
+_COINBASE_TAKER_FEE  = float(_os.getenv("COINBASE_TAKER_FEE", "0.006"))
 
 
 class UnifiedRiskEngine:
@@ -115,7 +119,7 @@ class UnifiedRiskEngine:
         """
         if not sig.btc_price or balance_cents <= 0:
             return 0
-        risk_usd          = (balance_cents / 100) * _BTC_RISK_PER_TRADE * (1 - 2 * 0.006)
+        risk_usd          = (balance_cents / 100) * _BTC_RISK_PER_TRADE * (1 - 2 * _COINBASE_TAKER_FEE)
         price_per_unit_usd = sig.btc_price * BTC_UNIT
         if price_per_unit_usd <= 0:
             return 0
