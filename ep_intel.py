@@ -1719,6 +1719,12 @@ async def intel_main() -> None:
             _src_health.log_cycle_summary()
 
             # ── Redis config overrides (dashboard writes these to ep:config) ────
+            # Per-category threshold overrides are keyed
+            # override_edge_threshold:{category} and override_min_confidence:{category}
+            # (e.g. override_edge_threshold:weather). They take precedence over the
+            # global override_edge_threshold / override_min_confidence, which in turn
+            # take precedence over the per-category code defaults in strategy.py
+            # (CATEGORY_EDGE_THRESHOLDS / CATEGORY_MIN_CONFIDENCE).
             _ov_edge   = await bus.get_config_override("override_edge_threshold")
             _ov_maxc   = await bus.get_config_override("override_max_contracts")
             _ov_conf   = await bus.get_config_override("override_min_confidence")
@@ -1726,21 +1732,43 @@ async def intel_main() -> None:
             _ov_rate   = await bus.get_config_override("CURRENT_FED_RATE")
             _ov_myep   = await bus.get_config_override("override_min_yes_entry_price")
 
+            # Global overrides (None = use per-category code defaults)
             try:
-                edge_threshold = float(_ov_edge) if _ov_edge else cfg.EDGE_THRESHOLD
+                edge_threshold = float(_ov_edge) if _ov_edge else None
             except (ValueError, TypeError):
-                log.warning("Malformed override_edge_threshold=%r — using default", _ov_edge)
-                edge_threshold = cfg.EDGE_THRESHOLD
+                log.warning("Malformed override_edge_threshold=%r — ignoring", _ov_edge)
+                edge_threshold = None
             try:
                 max_contracts = int(float(_ov_maxc)) if _ov_maxc else cfg.MAX_CONTRACTS
             except (ValueError, TypeError):
                 log.warning("Malformed override_max_contracts=%r — using default", _ov_maxc)
                 max_contracts = cfg.MAX_CONTRACTS
             try:
-                min_confidence = float(_ov_conf) if _ov_conf else cfg.MIN_CONFIDENCE
+                min_confidence = float(_ov_conf) if _ov_conf else None
             except (ValueError, TypeError):
-                log.warning("Malformed override_min_confidence=%r — using default", _ov_conf)
-                min_confidence = cfg.MIN_CONFIDENCE
+                log.warning("Malformed override_min_confidence=%r — ignoring", _ov_conf)
+                min_confidence = None
+
+            # Per-category overrides (optional — empty dict means use code defaults).
+            # Scanned from a dedicated hash so adding new categories doesn't need
+            # a code change on the read side.
+            edge_threshold_overrides: dict = {}
+            min_confidence_overrides: dict = {}
+            try:
+                _cat_edge = await bus._r.hgetall("ep:config:edge_threshold")
+                for _k, _v in (_cat_edge or {}).items():
+                    try:
+                        edge_threshold_overrides[_k.decode() if isinstance(_k, bytes) else _k] = float(_v)
+                    except (ValueError, TypeError):
+                        pass
+                _cat_conf = await bus._r.hgetall("ep:config:min_confidence")
+                for _k, _v in (_cat_conf or {}).items():
+                    try:
+                        min_confidence_overrides[_k.decode() if isinstance(_k, bytes) else _k] = float(_v)
+                    except (ValueError, TypeError):
+                        pass
+            except Exception as _cat_exc:
+                log.debug("Per-category overrides read failed: %s", _cat_exc)
             # Only override the FRED-fetched rate if the key is explicitly set
             if _ov_rate:
                 try:
@@ -1749,11 +1777,12 @@ async def intel_main() -> None:
                     log.warning("Malformed CURRENT_FED_RATE=%r — keeping FRED value", _ov_rate)
 
             # ── Vol-adjusted Kalshi edge threshold ────────────────────────────
-            # Scale edge_threshold up during high BTC realized vol — serves as a
-            # macro-uncertainty proxy (high crypto vol → require larger Kalshi edge).
-            # vol_mult / vol_regime are also used later for BTC z_thresh.
+            # Scale edge_threshold up during high BTC realized vol — macro-
+            # uncertainty proxy. Only applies when a global override is active;
+            # per-category code defaults are left alone (each category's vol
+            # sensitivity is structurally different).
             vol_mult, vol_regime = _compute_vol_mult(_btc_price_buf)
-            if vol_mult != 1.0:
+            if vol_mult != 1.0 and edge_threshold is not None:
                 _pre_vol_edge = edge_threshold
                 edge_threshold = round(edge_threshold * vol_mult, 4)
                 log.debug(
@@ -1823,22 +1852,24 @@ async def intel_main() -> None:
 
                 signals = await asyncio.wait_for(
                     fetch_signals_async(
-                        client               = client,
-                        edge_threshold       = edge_threshold,
-                        max_contracts        = max_contracts,
-                        min_confidence       = min_confidence,
-                        fred_api_key         = _fred_key,
-                        current_rate         = current_fed_rate,
-                        treasury_2y          = current_treasury_2y,
-                        enable_fomc          = True,
-                        enable_weather       = os.getenv("ENABLE_WEATHER", "true") == "true",
-                        enable_economic      = os.getenv("ENABLE_ECONOMIC", "true") == "true",
-                        enable_sports        = os.getenv("ENABLE_SPORTS", "true") == "true",
-                        enable_crypto_price  = os.getenv("ENABLE_CRYPTO_PRICE", "true") == "true",
-                        enable_gdp           = os.getenv("ENABLE_GDP", "true") == "true",
-                        markets_cache        = markets_cache,
-                        btc_spot             = btc_strategy.last_spot if btc_strategy else None,
-                        min_yes_entry_price  = _min_yep,
+                        client                   = client,
+                        edge_threshold           = edge_threshold,
+                        max_contracts            = max_contracts,
+                        min_confidence           = min_confidence,
+                        fred_api_key             = _fred_key,
+                        current_rate             = current_fed_rate,
+                        treasury_2y              = current_treasury_2y,
+                        enable_fomc              = True,
+                        enable_weather           = os.getenv("ENABLE_WEATHER", "true") == "true",
+                        enable_economic          = os.getenv("ENABLE_ECONOMIC", "true") == "true",
+                        enable_sports            = os.getenv("ENABLE_SPORTS", "true") == "true",
+                        enable_crypto_price      = os.getenv("ENABLE_CRYPTO_PRICE", "true") == "true",
+                        enable_gdp               = os.getenv("ENABLE_GDP", "true") == "true",
+                        markets_cache            = markets_cache,
+                        btc_spot                 = btc_strategy.last_spot if btc_strategy else None,
+                        min_yes_entry_price      = _min_yep,
+                        edge_threshold_overrides = edge_threshold_overrides or None,
+                        min_confidence_overrides = min_confidence_overrides or None,
                     ),
                     timeout=90.0,
                 )

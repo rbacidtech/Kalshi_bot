@@ -69,6 +69,69 @@ TAX_RESERVE_RATE  = 0.30    # 30% tax reserve on profits
 MIN_EDGE_GROSS    = 0.12    # 12¢ minimum gross edge (net ~5¢ after fees)
 MIN_LIQUIDITY_FP  = 0.0   # minimum volume_fp to consider market tradeable
 
+# ── Per-category signal floors ────────────────────────────────────────────────
+# Each strategy publishes signals with a characteristic edge distribution. A
+# single global edge_threshold / min_confidence starves strategies whose natural
+# edges sit below it. These dicts set the default per-category floors; Redis
+# keys override_edge_threshold:{category} and override_min_confidence:{category}
+# override them at runtime without a redeploy.
+CATEGORY_EDGE_THRESHOLDS: dict[str, float] = {
+    "fomc":           0.10,   # FOMC directional + coherence (medium-high edge)
+    "arb":            0.03,   # structural arb — never miss a small spread
+    "weather":        0.12,   # NWS/Open-Meteo ensemble, multi-source
+    "crypto_price":   0.08,   # Deribit-efficient; edges are small
+    "gdp":            0.10,   # GDPNow-anchored
+    "economic":       0.10,   # CPI/NFP consensus
+    "mean_reversion": 0.05,   # BTC z-score entries
+    "sports":         0.10,   # ESPN odds
+    "imbalance":      0.02,   # ob_depth fast-reaction
+    "election":       0.10,   # Polymarket-calibrated
+}
+CATEGORY_MIN_CONFIDENCE: dict[str, float] = {
+    "fomc":           0.85,
+    "arb":            0.90,
+    "weather":        0.75,   # multi-source weather caps conf at 0.88, tight-agree at 0.84
+    "crypto_price":   0.70,
+    "gdp":            0.80,
+    "economic":       0.75,
+    "mean_reversion": 0.70,
+    "sports":         0.75,
+    "imbalance":      0.60,
+    "election":       0.75,
+}
+DEFAULT_EDGE_THRESHOLD_FALLBACK = 0.10
+DEFAULT_MIN_CONFIDENCE_FALLBACK = 0.75
+
+
+def _category_edge_floor(
+    category: str,
+    per_cat_overrides: dict | None = None,
+    global_override:   float | None = None,
+) -> float:
+    """Resolve edge floor for a category.
+
+    Precedence: per-category override > global override > code default > fallback.
+    Callers pass Redis-sourced overrides; code defaults apply otherwise.
+    """
+    if per_cat_overrides and category in per_cat_overrides:
+        return per_cat_overrides[category]
+    if global_override is not None:
+        return global_override
+    return CATEGORY_EDGE_THRESHOLDS.get(category, DEFAULT_EDGE_THRESHOLD_FALLBACK)
+
+
+def _category_conf_floor(
+    category: str,
+    per_cat_overrides: dict | None = None,
+    global_override:   float | None = None,
+) -> float:
+    """Resolve confidence floor for a category (same precedence as edge)."""
+    if per_cat_overrides and category in per_cat_overrides:
+        return per_cat_overrides[category]
+    if global_override is not None:
+        return global_override
+    return CATEGORY_MIN_CONFIDENCE.get(category, DEFAULT_MIN_CONFIDENCE_FALLBACK)
+
 # ── YES price gate: model_source values that are EXEMPT ───────────────────────
 # Arb and coherence signals derive edge from relative mispricing between
 # contracts, not from the absolute price level of the YES contract.  The
@@ -3763,9 +3826,9 @@ async def scan_election_markets_with_538(
 
 async def fetch_signals_async(
     client,
-    edge_threshold:      float = MIN_EDGE_GROSS,
+    edge_threshold:      Optional[float] = None,  # global override; None = per-category defaults
     max_contracts:       int   = 5,
-    min_confidence:      float = 0.60,
+    min_confidence:      Optional[float] = None,  # global override; None = per-category defaults
     fred_api_key:        str   = "",
     current_rate:        float = 3.75,
     treasury_2y:         Optional[float] = None,
@@ -3781,6 +3844,8 @@ async def fetch_signals_async(
     macro_regime:        Optional[dict] = None,   # from ep:macro Redis hash
     release_data:        Optional[dict] = None,   # from ep:releases Redis hash
     min_yes_entry_price: Optional[float] = None,  # calibrated override from ep_advisor
+    edge_threshold_overrides: Optional[dict] = None,  # category → float (from Redis)
+    min_confidence_overrides: Optional[dict] = None,  # category → float
 ) -> list[Signal]:
     """
     Main signal-generation entry point — runs all enabled strategy scanners and
@@ -3863,7 +3928,7 @@ async def fetch_signals_async(
                 release_data=release_data,
                 min_yes_entry_price=min_yes_entry_price,
             )
-            dir_sigs = [s for s in dir_sigs if s.fee_adjusted_edge >= edge_threshold]
+            dir_sigs = [s for s in dir_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(dir_sigs)
             if dir_sigs:
                 log.info("FOMC directional: %d signals", len(dir_sigs))
@@ -3889,7 +3954,7 @@ async def fetch_signals_async(
     if enable_weather:
         try:
             weather_sigs = await scan_weather_markets(all_markets, max_contracts)
-            weather_sigs = [s for s in weather_sigs if s.fee_adjusted_edge >= edge_threshold]
+            weather_sigs = [s for s in weather_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(weather_sigs)
             if weather_sigs:
                 log.info("Weather: %d signals", len(weather_sigs))
@@ -3900,7 +3965,7 @@ async def fetch_signals_async(
     if enable_economic and fred_api_key:
         try:
             econ_sigs = await scan_economic_markets(all_markets, fred_api_key, max_contracts)
-            econ_sigs = [s for s in econ_sigs if s.fee_adjusted_edge >= edge_threshold]
+            econ_sigs = [s for s in econ_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(econ_sigs)
             if econ_sigs:
                 log.info("Economic: %d signals", len(econ_sigs))
@@ -3911,7 +3976,7 @@ async def fetch_signals_async(
     if enable_sports:
         try:
             sports_sigs = await scan_sports_markets(all_markets, max_contracts)
-            sports_sigs = [s for s in sports_sigs if s.fee_adjusted_edge >= edge_threshold]
+            sports_sigs = [s for s in sports_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(sports_sigs)
             if sports_sigs:
                 log.info("Sports: %d signals", len(sports_sigs))
@@ -3925,7 +3990,7 @@ async def fetch_signals_async(
             if eth_spot is None:
                 eth_spot = await _fetch_eth_spot()
             crypto_sigs = scan_crypto_price_markets(all_markets, btc_spot, eth_spot, max_contracts)
-            crypto_sigs = [s for s in crypto_sigs if s.fee_adjusted_edge >= edge_threshold]
+            crypto_sigs = [s for s in crypto_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(crypto_sigs)
             if crypto_sigs:
                 log.info("Crypto price: %d signals", len(crypto_sigs))
@@ -3936,7 +4001,7 @@ async def fetch_signals_async(
     if enable_gdp:
         try:
             gdp_sigs = await scan_gdp_markets(all_markets, fred_api_key, max_contracts, macro_regime=macro_regime)
-            gdp_sigs = [s for s in gdp_sigs if s.fee_adjusted_edge >= edge_threshold]
+            gdp_sigs = [s for s in gdp_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(gdp_sigs)
             if gdp_sigs:
                 log.info("GDP: %d signals", len(gdp_sigs))
@@ -3969,7 +4034,7 @@ async def fetch_signals_async(
                 coherence_sigs = await scan_cross_series_coherence(
                     fomc_markets, _gdp_markets, _gdpnow_pct, max_contracts
                 )
-                coherence_sigs = [s for s in coherence_sigs if s.fee_adjusted_edge >= edge_threshold]
+                coherence_sigs = [s for s in coherence_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
                 all_signals.extend(coherence_sigs)
                 if coherence_sigs:
                     log.info("Cross-series coherence: %d signals", len(coherence_sigs))
@@ -3985,7 +4050,7 @@ async def fetch_signals_async(
                 if _t:
                     _prices_snap[_t] = _market_mid(_m)
             cm_coherence_sigs = scan_cross_meeting_coherence(fomc_markets, _prices_snap)
-            cm_coherence_sigs = [s for s in cm_coherence_sigs if s.fee_adjusted_edge >= edge_threshold]
+            cm_coherence_sigs = [s for s in cm_coherence_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(cm_coherence_sigs)
             if cm_coherence_sigs:
                 log.info("Cross-meeting coherence: %d signals", len(cm_coherence_sigs))
@@ -3996,7 +4061,7 @@ async def fetch_signals_async(
     if enable_fomc:
         try:
             rate_path_sigs = await scan_rate_path_value(fomc_markets, max_contracts)
-            rate_path_sigs = [s for s in rate_path_sigs if s.fee_adjusted_edge >= edge_threshold]
+            rate_path_sigs = [s for s in rate_path_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(rate_path_sigs)
             if rate_path_sigs:
                 log.info("Rate-path calendar spread: %d signals", len(rate_path_sigs))
@@ -4047,8 +4112,14 @@ async def fetch_signals_async(
     except Exception as exc:
         log.warning("Earnings scan failed: %s", exc)
 
-    # Filter by min confidence (caller-supplied; override_min_confidence in ep:config)
-    all_signals = [s for s in all_signals if s.confidence >= min_confidence]
+    # Filter by per-category confidence floor — CATEGORY_MIN_CONFIDENCE defaults,
+    # overridden by min_confidence_overrides[category] (Redis) or min_confidence (global).
+    all_signals = [
+        s for s in all_signals
+        if s.confidence >= _category_conf_floor(
+            s.category, min_confidence_overrides, min_confidence,
+        )
+    ]
 
     # Sort by fee-adjusted edge × confidence
     all_signals.sort(key=lambda s: s.fee_adjusted_edge * s.confidence, reverse=True)
