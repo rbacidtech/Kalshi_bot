@@ -1404,8 +1404,15 @@ async def _sync_positions_with_kalshi(
                 patch["contracts"] = k_qty
             if r_side != k_side:
                 patch["side"] = k_side
-            if abs(r_entry - k_entry) > 2:
-                patch["entry_cents"] = k_entry
+            # Overwrite entry_cents only when Redis has no sensible value.
+            # Kalshi's total_traded_dollars / contracts mixes in closed-and-
+            # reopened fill history (e.g. a ticker that went NO→YES), so the
+            # derived "avg price" is not the current-position cost basis. Our
+            # add_contracts tracks a weighted YES-equivalent entry correctly;
+            # don't clobber it with Kalshi's aggregate when we have it.
+            if r_side != k_side or r_qty == 0 or not (1 <= r_entry <= 99):
+                if abs(r_entry - k_entry) > 2:
+                    patch["entry_cents"] = k_entry
             # Backfill meeting if the existing record has it empty (prior-version
             # sync wrote meeting="" and those positions silently bypass the
             # meeting-concentration gate).
