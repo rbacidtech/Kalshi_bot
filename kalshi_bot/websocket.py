@@ -312,11 +312,15 @@ class KalshiWebSocket:
 
         spread = max(ask_yes - yes_price, 0)
 
+        # last_price is set only by _handle_trade on an actual matched trade.
+        # Previously this path also wrote last_price=yes_price, which made
+        # "last_price" track the current best bid on every book event — for
+        # illiquid markets with a bid far from fair value, that misled the
+        # exit loop (ep_exec reads last_price as the exit-decision price).
         self.state.update_market(
             ticker,
             yes_price  = yes_price,
             no_price   = no_price,
-            last_price = yes_price,
             spread     = spread,
         )
 

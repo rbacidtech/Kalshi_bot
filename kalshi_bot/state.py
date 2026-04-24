@@ -28,7 +28,7 @@ class MarketState:
     title:         str
     yes_price:     int    = 50    # cents
     no_price:      int    = 50    # cents
-    last_price:    int    = 50    # cents (last trade)
+    last_price:    int    = 0     # cents (last matched trade; 0 = no trades yet)
     spread:        int    = 0     # cents
     volume:        int    = 0
     fair_value:    float  = 0.0   # FedWatch-derived

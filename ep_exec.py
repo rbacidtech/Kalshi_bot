@@ -1802,7 +1802,15 @@ async def _exit_checker(
 
                 # BTC prices in Redis are raw USD; normalise to cents-per-BTC_UNIT
                 # so move_cents and entry_cents are in the same units.
-                raw_price = price_data.get("last_price") or price_data.get("yes_price")
+                # For Kalshi, prefer yes_price (live best YES bid from the book)
+                # over last_price — a stale last-trade cents figure on an
+                # illiquid market can be far from current fair value and would
+                # trigger spurious exits. last_price remains the fallback for
+                # BTC (where it carries the Coinbase spot mark).
+                if ticker == "BTC-USD":
+                    raw_price = price_data.get("last_price") or price_data.get("yes_price")
+                else:
+                    raw_price = price_data.get("yes_price") or price_data.get("last_price")
                 if not raw_price:
                     log.debug("No price available for exit check %s — skipping", ticker)
                     continue
@@ -1926,11 +1934,17 @@ async def _exit_checker(
 
                         if 0 < hours_remaining < hours_before_close * 2 and tranche_done == 0:
                             if hours_remaining >= hours_before_close and contracts > 1:
-                                # TRANCHE 1 — partial exit (half contracts)
-                                half      = contracts // 2
-                                remaining = contracts - half
+                                # TRANCHE 1 — place a sell-limit for half contracts.
+                                # Track the order in Redis via pending_exit so
+                                # fill_poll can monitor fills and decrement the
+                                # parent position atomically. The previous
+                                # implementation decremented contracts
+                                # optimistically before fill; if Kalshi canceled
+                                # or partially filled, the remaining count on
+                                # the exchange became orphaned.
+                                half = contracts // 2
                                 try:
-                                    executor._exit_position(
+                                    _t1_oid = executor._exit_position(
                                         ticker, {**pos, "contracts": half},
                                         current_cents,
                                         f"pre_expiry_t1 ({hours_remaining:.1f}h)",
@@ -1938,26 +1952,53 @@ async def _exit_checker(
                                 except Exception as _t1_exc:
                                     log.warning("T1 _exit_position failed for %s: %s", ticker, _t1_exc)
                                     continue
-                                await positions.update_fields(ticker, {
-                                    "contracts":    remaining,
-                                    "tranche_done": 1,
-                                })
-                                pnl_t1 = move_cents * half
-                                log.info(
-                                    "TRANCHE 1: %s  half=%d  remaining=%d  pnl=%+d¢",
-                                    ticker, half, remaining, pnl_t1,
-                                )
-                                _t1_fee = cfg.FEE_CENTS * half if asset_class == "kalshi" else 0
-                                await bus.publish_execution(ExecutionReport(
-                                    ticker        = ticker,
-                                    asset_class   = asset_class,
-                                    side          = "no" if side == "yes" else "yes",
-                                    contracts     = half,
-                                    fill_price    = current_cents / 100,
-                                    status        = "filled",
-                                    mode          = "paper" if cfg.PAPER_TRADE else "live",
-                                    edge_captured = (pnl_t1 - _t1_fee) / 100,
-                                ))
+                                if not _t1_oid:
+                                    log.warning("T1 exit order rejected by Kalshi for %s — retrying next cycle", ticker)
+                                    continue
+
+                                if _t1_oid == "paper" or cfg.PAPER_TRADE:
+                                    # Paper fills instantly — decrement immediately.
+                                    _t1_new_ct = max(0, contracts - half)
+                                    await positions.update_fields(ticker, {
+                                        "contracts":        _t1_new_ct,
+                                        "contracts_filled": _t1_new_ct,
+                                        "tranche_done":     1,
+                                    })
+                                    _t1_pnl = move_cents * half
+                                    _t1_fee = cfg.FEE_CENTS * half if asset_class == "kalshi" else 0
+                                    await bus.publish_execution(ExecutionReport(
+                                        ticker        = ticker,
+                                        asset_class   = asset_class,
+                                        side          = "no" if side == "yes" else "yes",
+                                        contracts     = half,
+                                        fill_price    = current_cents / 100,
+                                        status        = "filled",
+                                        mode          = "paper",
+                                        edge_captured = (_t1_pnl - _t1_fee) / 100,
+                                    ))
+                                    log.info(
+                                        "TRANCHE 1 (paper): %s  half=%d  remaining=%d  pnl=%+d¢",
+                                        ticker, half, _t1_new_ct, _t1_pnl,
+                                    )
+                                else:
+                                    _t1_offer = (current_cents if side == "yes"
+                                                 else (100 - current_cents))
+                                    await positions.update_fields(ticker, {
+                                        "pending_exit":          True,
+                                        "exit_order_id":         _t1_oid,
+                                        "exit_order_placed_at":  datetime.now(timezone.utc).isoformat(),
+                                        "exit_offer_cents":      _t1_offer,
+                                        "exit_reason":           f"pre_expiry_t1 ({hours_remaining:.1f}h)",
+                                        "exit_widen_count":      0,
+                                        "exit_cancel_count":     0,
+                                        "exit_retry_after_ts":   0,
+                                        "exit_order_contracts":  half,   # partial — fill_poll decrements
+                                        "tranche_done":          1,
+                                    })
+                                    log.info(
+                                        "TRANCHE 1 queued: %s  half=%d (of %d)  order=%.8s",
+                                        ticker, half, contracts, _t1_oid,
+                                    )
                                 continue   # don't trigger full-exit logic
                             else:
                                 # Single contract or already past t2 — full exit now
@@ -2286,6 +2327,7 @@ return cnt
                                 "exit_widen_count":     0,
                                 "exit_cancel_count":    0,
                                 "exit_retry_after_ts":  0,
+                                "exit_order_contracts": 0,   # 0 = full exit (not a tranche)
                             })
                             log.info(
                                 "Exit order resting: %s  offer=%d¢  order_id=%.8s",
@@ -2371,6 +2413,7 @@ return cnt
                                         "exit_widen_count":     0,
                                         "exit_cancel_count":    0,
                                         "exit_retry_after_ts":  0,
+                                        "exit_order_contracts": 0,   # full exit
                                     })
                             else:
                                 log.warning(
@@ -2475,37 +2518,63 @@ async def _fill_poll_loop(
                     _e_fill_count = float(_e_order.get("fill_count_fp", 0) or 0)
                     _e_total      = float(_e_order.get("initial_count_fp", 1) or 1)
 
+                    # Partial-exit detection: if the exit ORDER's initial count
+                    # was less than the position's holding, this is a tranche
+                    # (pre_expiry_t1). A fill/cancel must decrement instead of
+                    # closing, otherwise any unsold remainder becomes orphaned
+                    # on Kalshi while Redis wipes the whole record.
+                    _pos_ct_pf  = int(pos.get("contracts_filled") or pos.get("contracts", 0))
+                    _is_partial_exit = int(_e_total) < _pos_ct_pf and _pos_ct_pf > 0
+
                     if _e_status == "filled" or _e_fill_count >= _e_total:
-                        executor._positions.pop(ticker, None)
-                        await positions.close(ticker)
-                        log.info("EXIT FILLED ✓ %s  order_id=%.8s", ticker, exit_oid)
+                        _lf_fill       = int(_e_fill_count)
+                        _lf_side       = pos.get("side", "yes")
+                        _lf_entry      = int(pos.get("entry_cents", 50))
+                        _lf_reason     = pos.get("exit_reason", "live_exit_filled")
+                        _lf_price_key  = ("yes_price_dollars" if _lf_side == "yes"
+                                          else "no_price_dollars")
+                        _lf_raw        = _e_order.get(_lf_price_key)
+                        _lf_cents      = (int(float(_lf_raw) * 100) if _lf_raw is not None
+                                          else int(pos.get("exit_offer_cents", 50)))
+                        _lf_move       = (_lf_cents - _lf_entry if _lf_side in ("yes", "buy")
+                                          else _lf_entry - _lf_cents)
+                        _lf_pnl        = _lf_move * _lf_fill
+                        _lf_fee        = cfg.FEE_CENTS * _lf_fill
+                        _lf_exec_id    = pos.get("exec_id", "")
 
-                        # ── Record trade outcome for Kelly calibration ────────────
-                        _lf_contracts = int(_e_fill_count or
-                                            pos.get("contracts_filled") or
-                                            pos.get("contracts", 1))
-                        _lf_side      = pos.get("side", "yes")
-                        _lf_entry     = int(pos.get("entry_cents", 50))
-                        _lf_reason    = pos.get("exit_reason", "live_exit_filled")
-                        # Prefer actual fill price from exchange; fall back to offer
-                        _lf_price_key = ("yes_price_dollars" if _lf_side == "yes"
-                                         else "no_price_dollars")
-                        _lf_raw       = _e_order.get(_lf_price_key)
-                        _lf_cents     = (int(float(_lf_raw) * 100) if _lf_raw is not None
-                                         else int(pos.get("exit_offer_cents", 50)))
-                        _lf_move  = (_lf_cents - _lf_entry if _lf_side in ("yes", "buy")
-                                     else _lf_entry - _lf_cents)
-                        _lf_pnl   = _lf_move * _lf_contracts
+                        if _is_partial_exit:
+                            # Decrement and keep the position open for the rest.
+                            _new_ct = max(0, _pos_ct_pf - _lf_fill)
+                            await positions.update_fields(ticker, {
+                                "contracts":            _new_ct,
+                                "contracts_filled":     _new_ct,
+                                "pending_exit":         False,
+                                "exit_order_id":        "",
+                                "exit_order_contracts": 0,
+                                "exit_widen_count":     0,
+                                "exit_cancel_count":    0,
+                                "exit_retry_after_ts":  0,
+                                # keep tranche_done set; t2 fires next cycle
+                            })
+                            if executor is not None and ticker in executor._positions:
+                                executor._positions[ticker]["contracts"] = _new_ct
+                                executor._positions[ticker].pop("pending_exit", None)
+                            log.info(
+                                "PARTIAL EXIT FILLED ✓ %s  sold=%d remaining=%d  order=%.8s  reason=%s",
+                                ticker, _lf_fill, _new_ct, exit_oid, _lf_reason,
+                            )
+                        else:
+                            executor._positions.pop(ticker, None)
+                            await positions.close(ticker)
+                            log.info("EXIT FILLED ✓ %s  order_id=%.8s", ticker, exit_oid)
 
-
-                        _lf_exec_id = pos.get("exec_id", "")
                         if _lf_exec_id:
                             try:
                                 _audit_writer().write("position_history", {
                                     "entry_exec_id":      _lf_exec_id,
                                     "ticker":             ticker,
                                     "side":               _lf_side,
-                                    "contracts":          _lf_contracts,
+                                    "contracts":          _lf_fill,
                                     "entry_cents":        _lf_entry,
                                     "exit_cents":         _lf_cents,
                                     "realized_pnl_cents": _lf_pnl,
@@ -2518,12 +2587,11 @@ async def _fill_poll_loop(
 
                         if bus is not None:
                             try:
-                                _lf_fee = cfg.FEE_CENTS * _lf_contracts
                                 await bus.publish_execution(ExecutionReport(
                                     ticker        = ticker,
                                     asset_class   = pos.get("asset_class", "kalshi"),
                                     side          = "no" if _lf_side == "yes" else "yes",
-                                    contracts     = _lf_contracts,
+                                    contracts     = _lf_fill,
                                     fill_price    = _lf_cents / 100,
                                     status        = "filled",
                                     mode          = "live",
@@ -2537,7 +2605,7 @@ async def _fill_poll_loop(
                             await telegram.send_exit(
                                 ticker        = ticker,
                                 side          = _lf_side,
-                                contracts     = _lf_contracts,
+                                contracts     = _lf_fill,
                                 current_cents = _lf_cents,
                                 reason        = _lf_reason,
                                 pnl_cents     = _lf_pnl,
@@ -2549,23 +2617,49 @@ async def _fill_poll_loop(
 
                     elif _e_status == "canceled":
                         if _e_fill_count > 0:
-                            # Partially filled then canceled — accept partial fill and close
-                            executor._positions.pop(ticker, None)
-                            await positions.close(ticker)
-                            log.warning(
-                                "Exit order partially filled + canceled: %s order_id=%.8s "
-                                "fill=%d/%d — closing position",
-                                ticker, exit_oid, int(_e_fill_count), int(_e_total),
-                            )
+                            # Partially filled then canceled. If the order was a
+                            # tranche (partial) exit, decrement by filled count
+                            # and keep the position open for the remainder.
+                            # Otherwise (full-count exit that partially filled),
+                            # close the position with what filled.
+                            _pc_fill = int(_e_fill_count)
+                            if _is_partial_exit:
+                                _new_ct = max(0, _pos_ct_pf - _pc_fill)
+                                await positions.update_fields(ticker, {
+                                    "contracts":            _new_ct,
+                                    "contracts_filled":     _new_ct,
+                                    "pending_exit":         False,
+                                    "exit_order_id":        "",
+                                    "exit_order_contracts": 0,
+                                    "exit_widen_count":     0,
+                                    "exit_cancel_count":    0,
+                                    "exit_retry_after_ts":  0,
+                                })
+                                if executor is not None and ticker in executor._positions:
+                                    executor._positions[ticker]["contracts"] = _new_ct
+                                    executor._positions[ticker].pop("pending_exit", None)
+                                log.warning(
+                                    "PARTIAL EXIT PARTIAL+CANCELED: %s  sold=%d remaining=%d  order=%.8s",
+                                    ticker, _pc_fill, _new_ct, exit_oid,
+                                )
+                            else:
+                                executor._positions.pop(ticker, None)
+                                await positions.close(ticker)
+                                log.warning(
+                                    "Exit order partially filled + canceled: %s order_id=%.8s "
+                                    "fill=%d/%d — closing position",
+                                    ticker, exit_oid, _pc_fill, int(_e_total),
+                                )
                         else:
                             # Canceled with 0 fills — Kalshi rejected the limit price
                             # (likely stale price too far from market). Keep the position
                             # and retry next exit_checker cycle with fresh price data.
                             _cancel_count = int(pos.get("exit_cancel_count", 0)) + 1
                             _updates = {
-                                "pending_exit":       False,
-                                "exit_order_id":      "",
-                                "exit_cancel_count":  _cancel_count,
+                                "pending_exit":         False,
+                                "exit_order_id":        "",
+                                "exit_order_contracts": 0,
+                                "exit_cancel_count":    _cancel_count,
                             }
                             # After 5 consecutive 0-fill cancels, back off for 10 min
                             # so the exit_checker doesn't respawn the same bad limit
@@ -2606,10 +2700,11 @@ async def _fill_poll_loop(
                             except Exception:
                                 pass
                             await positions.update_fields(ticker, {
-                                "pending_exit":        False,
-                                "exit_order_id":       "",
-                                "exit_widen_count":    0,
-                                "exit_retry_after_ts": time.time() + _EXIT_RETRY_BACKOFF_S,
+                                "pending_exit":         False,
+                                "exit_order_id":        "",
+                                "exit_widen_count":     0,
+                                "exit_order_contracts": 0,
+                                "exit_retry_after_ts":  time.time() + _EXIT_RETRY_BACKOFF_S,
                             })
                             if executor is not None and ticker in executor._positions:
                                 executor._positions[ticker].pop("pending_exit", None)
@@ -2632,12 +2727,16 @@ async def _fill_poll_loop(
                         if _age_min < _EXIT_TIF_STEP_MINUTES:
                             continue
 
-                        # Escalate: cancel resting limit, place a new one 2¢ more aggressive
+                        # Escalate: cancel resting limit, place a new one 2¢ more aggressive.
+                        # exit_order_contracts is set for partial (tranche) exits so the
+                        # widened order re-places the same count — not the full position.
                         cur_offer   = int(pos.get("exit_offer_cents", 50))
                         new_offer   = max(1, cur_offer - _EXIT_TIF_WIDEN_CENTS)
                         pos_side    = pos.get("side", "yes")
                         price_field = "yes_price" if pos_side == "yes" else "no_price"
-                        _cts        = int(pos.get("contracts_filled") or pos.get("contracts", 1))
+                        _cts        = int(pos.get("exit_order_contracts")
+                                          or pos.get("contracts_filled")
+                                          or pos.get("contracts", 1))
 
                         try:
                             await asyncio.to_thread(
