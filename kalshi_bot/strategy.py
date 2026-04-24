@@ -1063,6 +1063,52 @@ async def fetch_open_meteo(
         return None
 
 
+async def fetch_open_meteo_ecmwf(
+    lat: float, lon: float, tz: str, target: _date
+) -> Optional[dict]:
+    """
+    Fetch ECMWF IFS model forecast from Open-Meteo.
+    ECMWF generally outperforms GFS beyond day 3 and is the gold-standard
+    global NWP model. Returns same dict shape as fetch_open_meteo().
+    """
+    try:
+        http = _get_http_client()
+        params = {
+            "latitude":           lat,
+            "longitude":          lon,
+            "daily":              "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max",
+            "temperature_unit":   "fahrenheit",
+            "precipitation_unit": "inch",
+            "timezone":           tz,
+            "forecast_days":      8,
+            "models":             "ecmwf_ifs04",
+        }
+        resp = await http.get("https://api.open-meteo.com/v1/forecast", params=params)
+        if resp.status_code != 200:
+            log.warning("Open-Meteo ECMWF %d for %.4f,%.4f", resp.status_code, lat, lon)
+            return None
+        daily = resp.json().get("daily", {})
+        dates = daily.get("time", [])
+        target_str = target.isoformat()
+        if target_str not in dates:
+            return None
+        idx = dates.index(target_str)
+        def _v(key):
+            vals = daily.get(key, [])
+            return vals[idx] if idx < len(vals) else None
+        return {
+            "high":       _v("temperature_2m_max"),
+            "low":        _v("temperature_2m_min"),
+            "precip":     _v("precipitation_sum"),
+            "precip_pct": _v("precipitation_probability_max"),
+            "days_ahead": (_date.today() - target).days * -1,
+            "source":     "ecmwf",
+        }
+    except Exception as exc:
+        log.warning("Open-Meteo ECMWF fetch failed for %.4f,%.4f: %s", lat, lon, exc)
+        return None
+
+
 async def fetch_noaa_forecast(wfo: str, x: int, y: int) -> Optional[dict]:
     """
     Fetch NOAA NWS daily (non-hourly) forecast.
@@ -1077,6 +1123,25 @@ async def fetch_noaa_forecast(wfo: str, x: int, y: int) -> Optional[dict]:
         log.warning("NOAA daily %d for %s/%d,%d", resp.status_code, wfo, x, y)
     except Exception as exc:
         log.warning("NOAA daily fetch failed for %s/%d,%d: %s", wfo, x, y, exc)
+    return None
+
+
+async def fetch_noaa_hourly(wfo: str, x: int, y: int) -> Optional[dict]:
+    """
+    Fetch NOAA NWS hourly forecast (up to ~156 hours / 6.5 days ahead).
+    Deriving daily high/low from hourly periods is more precise than the
+    NWS daily summary, which only reports the representative period temp.
+    Returns raw NWS JSON or None.
+    """
+    try:
+        http = _get_http_client()
+        url  = f"https://api.weather.gov/gridpoints/{wfo}/{x},{y}/forecast/hourly"
+        resp = await http.get(url, headers={"User-Agent": "KalshiBot/1.0 (prediction-market-research)"})
+        if resp.status_code == 200:
+            return resp.json()
+        log.warning("NOAA hourly %d for %s/%d,%d", resp.status_code, wfo, x, y)
+    except Exception as exc:
+        log.warning("NOAA hourly fetch failed for %s/%d,%d: %s", wfo, x, y, exc)
     return None
 
 
@@ -1105,6 +1170,39 @@ def _parse_nws_daily(forecast_data: dict, target: _date) -> Optional[dict]:
         if high is None and low is None:
             return None
         return {"high": high, "low": low, "precip_pct": precip_pct, "source": "noaa_nws"}
+    except Exception:
+        return None
+
+
+def _parse_nws_hourly(hourly_data: dict, target: _date) -> Optional[dict]:
+    """
+    Derive daily high/low from NWS hourly forecast periods for the target date.
+    Scanning all hours of the target day yields more accurate extremes than
+    the NWS daily summary temperature (which is a single representative period).
+    """
+    try:
+        periods = hourly_data["properties"]["periods"]
+        target_str = target.isoformat()
+        temps: list[float] = []
+        precip_probs: list[float] = []
+        for p in periods:
+            if target_str not in p.get("startTime", ""):
+                continue
+            temp = p.get("temperature")
+            if temp is not None:
+                unit = p.get("temperatureUnit", "F")
+                temps.append(float(temp) if unit != "C" else float(temp) * 9 / 5 + 32)
+            pp = p.get("probabilityOfPrecipitation", {})
+            if pp and pp.get("value") is not None:
+                precip_probs.append(float(pp["value"]))
+        if not temps:
+            return None
+        return {
+            "high":       max(temps),
+            "low":        min(temps),
+            "precip_pct": max(precip_probs) if precip_probs else None,
+            "source":     "noaa_hourly",
+        }
     except Exception:
         return None
 
@@ -1187,18 +1285,32 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         _close_dt = datetime(target.year, target.month, target.day, 23, 59, 59, tzinfo=timezone.utc)
         signal_close_time = _close_dt.isoformat()
 
-        # ── Fetch forecasts ───────────────────────────────────────────────────
-        om   = await fetch_open_meteo(cfg["lat"], cfg["lon"], cfg["tz"], target)
-        nws_raw = await fetch_noaa_forecast(cfg["wfo"], cfg["x"], cfg["y"])
-        nws  = _parse_nws_daily(nws_raw, target) if nws_raw else None
+        # ── Fetch all four forecast sources in parallel ───────────────────────
+        # GFS (Open-Meteo default), ECMWF (Open-Meteo), NWS daily, NWS hourly
+        _results = await asyncio.gather(
+            fetch_open_meteo(cfg["lat"], cfg["lon"], cfg["tz"], target),
+            fetch_open_meteo_ecmwf(cfg["lat"], cfg["lon"], cfg["tz"], target),
+            fetch_noaa_forecast(cfg["wfo"], cfg["x"], cfg["y"]),
+            fetch_noaa_hourly(cfg["wfo"], cfg["x"], cfg["y"]),
+            return_exceptions=True,
+        )
+        om_gfs, om_ecmwf, _nws_daily_raw, _nws_hourly_raw = (
+            None if isinstance(r, Exception) else r for r in _results
+        )
+        nws       = _parse_nws_daily(_nws_daily_raw, target)  if _nws_daily_raw  else None
+        nws_hrly  = _parse_nws_hourly(_nws_hourly_raw, target) if _nws_hourly_raw else None
 
         # Require at least one source
-        if om is None and nws is None:
+        if om_gfs is None and om_ecmwf is None and nws is None and nws_hrly is None:
             log.warning("Weather: no forecast data for %s (target=%s)", ticker, target)
             continue
 
+        # Convenience: pick best Open-Meteo result (ECMWF preferred when available)
+        om = om_ecmwf if om_ecmwf is not None else om_gfs
+
         fair_value: Optional[float] = None
-        source_tag = []
+        source_tag:  list[str]   = []
+        raw_temps:   list[float] = []
         strike_type = "greater"  # default; overwritten for temp markets below
 
         if cfg["type"] in ("high_temp", "low_temp"):
@@ -1216,28 +1328,45 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
             # strike_type: "greater" → YES if temp > threshold; "less" → YES if temp < threshold
             strike_type = market.get("strike_type", "greater")
 
-            # Gather temperature estimates from all available sources
-            temp_estimates = []
-            if om:
-                t = om["high"] if cfg["type"] == "high_temp" else om["low"]
+            # Gather temperature estimates from all available sources.
+            # Weights: ECMWF > NWS hourly > GFS > NWS daily (accuracy ranking).
+            temp_weighted: list[tuple[float, float]] = []  # (temp, weight)
+            _temp_key = "high" if cfg["type"] == "high_temp" else "low"
+            if om_gfs:
+                t = om_gfs.get(_temp_key)
                 if t is not None:
-                    temp_estimates.append(t)
-                    source_tag.append("open_meteo")
-            if nws:
-                t = nws.get("high") if cfg["type"] == "high_temp" else nws.get("low")
+                    temp_weighted.append((t, 1.0))
+                    source_tag.append("gfs")
+            if om_ecmwf:
+                t = om_ecmwf.get(_temp_key)
                 if t is not None:
-                    temp_estimates.append(t)
+                    temp_weighted.append((t, 1.3))
+                    source_tag.append("ecmwf")
+            if nws_hrly:
+                t = nws_hrly.get(_temp_key)
+                if t is not None:
+                    temp_weighted.append((t, 1.2))
+                    source_tag.append("noaa_hourly")
+            elif nws:
+                # Only use NWS daily if hourly isn't available for this day
+                t = nws.get(_temp_key)
+                if t is not None:
+                    temp_weighted.append((t, 0.9))
                     source_tag.append("noaa_nws")
 
-            if not temp_estimates:
+            if not temp_weighted:
                 continue
 
-            # Blend estimates (simple mean); use spread as additional uncertainty
-            mean_temp = sum(temp_estimates) / len(temp_estimates)
-            spread    = max(temp_estimates) - min(temp_estimates) if len(temp_estimates) > 1 else 0.0
+            raw_temps = [t for t, _ in temp_weighted]
+            total_w   = sum(w for _, w in temp_weighted)
+            mean_temp = sum(t * w for t, w in temp_weighted) / total_w
+            spread    = max(raw_temps) - min(raw_temps) if len(raw_temps) > 1 else 0.0
 
-            # Effective sigma: calibrated horizon + source disagreement
-            base_sigma    = max(2.5, min(5.5, 2.5 + max(0, days_ahead - 1) * 1.0))
+            # Effective sigma: calibrated horizon + inter-model disagreement.
+            # Models agreeing tightly (spread < 1.5°F) earns a 15% sigma reduction.
+            base_sigma = max(2.0, min(5.5, 2.0 + max(0, days_ahead - 1) * 0.85))
+            if spread < 1.5 and len(raw_temps) >= 2:
+                base_sigma *= 0.85
             effective_sig = _math.sqrt(base_sigma ** 2 + (spread / 2) ** 2)
             z             = (threshold - mean_temp) / effective_sig
             p_above       = 0.5 * (1.0 - _math.erf(z / _math.sqrt(2)))
@@ -1247,16 +1376,30 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
             tm = re.search(r"(\d+\.?\d*)\s*inch", title, re.IGNORECASE)
             threshold = float(tm.group(1)) if tm else 0.10
 
-            # Gather precip data from available sources
-            f_sum     = om["precip"]     if om else None
-            f_pct_om  = om["precip_pct"] if om else None
-            f_pct_nws = nws.get("precip_pct") if nws else None
-            f_pct     = f_pct_om if f_pct_om is not None else f_pct_nws
+            # Gather precip probability from all available sources and average
+            precip_pcts: list[float] = []
+            f_sum = None
+            if om_gfs and om_gfs.get("precip_pct") is not None:
+                precip_pcts.append(om_gfs["precip_pct"])
+                source_tag.append("gfs")
+                if om_gfs.get("precip") is not None:
+                    f_sum = om_gfs["precip"]
+            if om_ecmwf and om_ecmwf.get("precip_pct") is not None:
+                precip_pcts.append(om_ecmwf["precip_pct"])
+                source_tag.append("ecmwf")
+                if f_sum is None and om_ecmwf.get("precip") is not None:
+                    f_sum = om_ecmwf["precip"]
+            if nws_hrly and nws_hrly.get("precip_pct") is not None:
+                precip_pcts.append(nws_hrly["precip_pct"])
+                source_tag.append("noaa_hourly")
+            elif nws and nws.get("precip_pct") is not None:
+                precip_pcts.append(nws["precip_pct"])
+                source_tag.append("noaa_nws")
 
-            if f_pct is None:
+            if not precip_pcts:
                 continue
 
-            source_tag.append("open_meteo" if f_pct_om is not None else "noaa_nws")
+            f_pct = sum(precip_pcts) / len(precip_pcts)
             fv = _precip_prob_above(f_sum, f_pct, threshold)
             if fv is None:
                 continue
@@ -1286,12 +1429,21 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         if fee_edge < MIN_EDGE_GROSS * 0.5:
             continue
 
-        # Confidence: higher for near-term + multi-source agreement.
-        # Same-day weather forecasts are highly reliable — boost to FOMC tier.
-        multi_source = len(source_tag) > 1
-        conf = 0.82 if (days_ahead <= 1 and multi_source) else \
-               0.76 if (days_ahead <= 1 or multi_source) else \
-               0.68
+        # Confidence tiers based on source count and inter-model spread.
+        # 3+ sources strongly agreeing → near-FOMC tier confidence.
+        n_src        = len(set(source_tag))
+        model_spread = (max(raw_temps) - min(raw_temps)) if (
+            cfg["type"] in ("high_temp", "low_temp") and len(raw_temps) > 1
+        ) else 0.0
+        tight_agree  = n_src >= 3 and model_spread < 2.0
+        multi_source = n_src >= 2
+        conf = (
+            0.88 if (tight_agree and days_ahead <= 2) else
+            0.84 if tight_agree else
+            0.80 if (multi_source and days_ahead <= 1) else
+            0.76 if multi_source else
+            0.65
+        )
 
         # Multiplier raised 60→90: weather markets are daily (high capital velocity),
         # comparable to FOMC directional at 80 but with extra credit for daily turnover.
@@ -1312,9 +1464,11 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         ))
         log.info(
             "Weather signal: %s  %s  fv=%.2f  market=%.2f  edge=%.2f  "
-            "conf=%.2f  src=%s  days=%d",
+            "conf=%.2f  src=%s  n=%d  spread=%.1f°F  days=%d",
             ticker, side, fair_value, price, edge, conf,
-            "+".join(sorted(set(source_tag))), days_ahead,
+            "+".join(sorted(set(source_tag))), len(set(source_tag)),
+            (max(raw_temps) - min(raw_temps)) if len(raw_temps) > 1 else 0.0,
+            days_ahead,
         )
 
     signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
