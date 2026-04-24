@@ -3,6 +3,7 @@ import { Outlet, useLocation } from 'react-router-dom'
 import Sidebar from './Sidebar'
 import Topbar from './Topbar'
 import { Toaster } from './Toast'
+import { useEdgePulseWS } from '../hooks/useEdgePulseWS'
 
 /** Map route pathnames to human-readable titles. */
 const ROUTE_TITLES: Record<string, string> = {
@@ -29,6 +30,7 @@ export default function Layout() {
   const pageTitle                       = ROUTE_TITLES[pathname] ?? ''
   const isMobile                        = useIsMobile()
   const [sidebarOpen, setSidebarOpen]   = useState(false)
+  const { connected: wsConnected }      = useEdgePulseWS()
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-surface-0">
@@ -57,6 +59,7 @@ export default function Layout() {
           title={pageTitle}
           sidebarOpen={sidebarOpen}
           onToggleSidebar={() => setSidebarOpen(o => !o)}
+          wsConnected={wsConnected}
         />
         <main className="flex-1 overflow-y-auto px-4 py-4 md:px-6 md:py-6 animate-fadeIn">
           <Outlet />

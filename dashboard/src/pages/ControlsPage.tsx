@@ -979,7 +979,7 @@ export default function ControlsPage() {
   const { data: statusData } = useQuery<BotStatus>({
     queryKey:       ['bot-status'],
     queryFn:        () => controls.getStatus().then(r => r.data),
-    refetchInterval: 15_000,
+    refetchInterval: 60_000,
   })
 
   const [cfg, setCfg]               = useState<BotConfig | null>(null)

@@ -5,9 +5,10 @@ interface TopbarProps {
   title?:           string
   sidebarOpen?:     boolean
   onToggleSidebar?: () => void
+  wsConnected?:     boolean
 }
 
-export default function Topbar({ title = '', sidebarOpen, onToggleSidebar }: TopbarProps) {
+export default function Topbar({ title = '', sidebarOpen, onToggleSidebar, wsConnected = false }: TopbarProps) {
   const { user, logout } = useAuth()
 
   return (
@@ -28,11 +29,11 @@ export default function Topbar({ title = '', sidebarOpen, onToggleSidebar }: Top
 
       {/* Right: live indicator + user + logout */}
       <div className="flex items-center gap-4">
-        {/* Live indicator */}
-        <div className="flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-success animate-pulse2 inline-block" />
-          <span className="text-success text-xs font-semibold tracking-widest uppercase">
-            Live
+        {/* Live / Poll indicator */}
+        <div className="flex items-center gap-1.5" title={wsConnected ? 'Real-time WebSocket' : 'Polling fallback'}>
+          <span className={`w-2 h-2 rounded-full inline-block ${wsConnected ? 'bg-success animate-pulse2' : 'bg-amber-400'}`} />
+          <span className={`text-xs font-semibold tracking-widest uppercase ${wsConnected ? 'text-success' : 'text-amber-400'}`}>
+            {wsConnected ? 'Live' : 'Poll'}
           </span>
         </div>
 

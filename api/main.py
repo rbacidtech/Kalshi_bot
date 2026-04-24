@@ -29,6 +29,7 @@ from api.routers.advisor import router as advisor_router
 from api.routers.notifications import router as notifications_router
 from api.routers.performance import router as performance_router
 from api.routers.subscriptions import router as subscriptions_router
+from api.routers.ws import router as ws_router
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(controls_router)
     app.include_router(notifications_router)
     app.include_router(performance_router)
+    app.include_router(ws_router)
 
     # ── Global exception handlers ─────────────────────────────────────────────
     @app.exception_handler(status.HTTP_422_UNPROCESSABLE_ENTITY)

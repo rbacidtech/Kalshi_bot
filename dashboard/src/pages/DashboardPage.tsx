@@ -456,7 +456,7 @@ export default function DashboardPage() {
   const { data, isLoading, isError } = useQuery<PortfolioResponse>({
     queryKey: ['portfolio'],
     queryFn: () => positions.portfolio().then(r => r.data),
-    refetchInterval: 30_000,
+    refetchInterval: 60_000,
   })
 
   const { data: cbData } = useQuery<CoinbaseBalance>({
@@ -497,14 +497,14 @@ export default function DashboardPage() {
   const { data: activityData } = useQuery<{ events: ActivityEvent[] }>({
     queryKey: ['activity'],
     queryFn: () => controls.activity(20).then(r => r.data),
-    refetchInterval: 15_000,
+    refetchInterval: 60_000,
     enabled: !!user?.is_admin,
   })
 
   const { data: botStatus } = useQuery<{ session_pnl?: number; balance_cents?: number }>({
     queryKey: ['bot-status'],
     queryFn: () => controls.getStatus().then(r => r.data),
-    refetchInterval: 15_000,
+    refetchInterval: 60_000,
     enabled: !!user?.is_admin,
   })
 
