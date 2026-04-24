@@ -448,7 +448,14 @@ async def generate_predictit_signals(
                     "market_price":      round(market_p, 4),
                     "fair_value":        round(fair_v,   4),
                     "edge":              round(edge,     4),
-                    "fee_adjusted_edge": round(edge - 0.01, 4),
+                    # Fee proxy aligned with ep_polymarket.py (2¢ flat). Using a
+                    # shared value so divergence signals from both feeds rank
+                    # consistently against each other at the exec-side filter.
+                    # Kalshi actual fee ≈ 7% of net winnings (variable); 2¢ is
+                    # a reasonable flat approximation for typical mid-priced
+                    # contracts. Was 1¢ — caused PredictIt signals to appear
+                    # 1¢ "cheaper" than Polymarket for identical edge.
+                    "fee_adjusted_edge": round(max(0.0, edge - 0.02), 4),
                     # Confidence: 0.65 (MEDIUM) to 0.75 (HIGH)
                     "confidence":  0.75,
                     "suggested_size": 1,

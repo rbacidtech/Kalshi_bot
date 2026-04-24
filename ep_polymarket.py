@@ -234,9 +234,16 @@ class PolymarketFeed:
             if stripped.endswith("."):
                 stripped += "0"                            # "3." → "3.0"
             strike_strs = list(dict.fromkeys([strike_2dec, stripped]))  # dedup, order preserved
+            # Word-boundary match: "3.5" matches "grow 3.5%" but not "13.5" or
+            # "3.512". The current substring check was strong against "3"→"3.75"
+            # collisions but not against prefix/suffix number collisions.
+            strike_patterns = [
+                re.compile(r'(?<![\d.])' + re.escape(ss) + r'(?!\d)')
+                for ss in strike_strs
+            ]
             strike_candidates = [
                 pm for pm in candidates
-                if any(ss in pm.question for ss in strike_strs)
+                if any(pat.search(pm.question) for pat in strike_patterns)
             ]
             if strike_candidates:
                 candidates = strike_candidates
