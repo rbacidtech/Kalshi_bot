@@ -566,8 +566,9 @@ async def _process_signal(
             _sig_cost  = _unit_cost * contracts
 
         # Per-market cap includes existing exposure on this ticker for top-ups.
-        # Otherwise weather accumulation could blow past 15% of balance across
-        # many small top-up signals on the same contract.
+        # Otherwise weather accumulation could blow past the cap across many
+        # small top-up signals on the same contract. Live-tunable via
+        # override_max_market_pct in ep:config.
         _existing_cost = 0
         if _is_topup and _existing_pos:
             _ex_ct = int(_existing_pos.get("contracts_filled")
@@ -576,11 +577,18 @@ async def _process_signal(
             _existing_cost = ((100 - _ex_en) * _ex_ct
                               if _existing_pos.get("side") == "no"
                               else _ex_en * _ex_ct)
-        if _sig_cost + _existing_cost > balance_cents * _MAX_MARKET_PCT:
+        try:
+            _ov_mmp = await bus.get_config_override("override_max_market_pct")
+            _mmp = float(_ov_mmp) if _ov_mmp else _MAX_MARKET_PCT
+            if not (0.0 < _mmp <= 1.0):
+                _mmp = _MAX_MARKET_PCT
+        except (ValueError, TypeError):
+            _mmp = _MAX_MARKET_PCT
+        if _sig_cost + _existing_cost > balance_cents * _mmp:
             log.info(
-                "Market limit hit (%.0f¢ + existing %.0f¢ > %.0f¢) — skipping %s",
+                "Market limit hit (%.0f¢ + existing %.0f¢ > %.0f¢, cap=%.0f%%) — skipping %s",
                 _sig_cost, _existing_cost,
-                balance_cents * _MAX_MARKET_PCT, sig.ticker,
+                balance_cents * _mmp, _mmp * 100, sig.ticker,
             )
             return _rejected("MARKET_LIMIT")
 
