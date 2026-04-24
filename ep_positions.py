@@ -105,6 +105,54 @@ class PositionStore:
         """Return all open positions keyed by ticker."""
         return await self._bus.get_all_positions()
 
+    async def add_contracts(
+        self,
+        ticker:           str,
+        added_contracts:  int,
+        added_entry_cents: int,
+    ) -> bool:
+        """Merge a top-up fill into an existing position.
+
+        Increments contracts/contracts_filled and recomputes the YES-price
+        weighted-average entry_cents so P&L attribution stays correct for
+        the aggregate position. Resets high_water_pnl and tranche_done so
+        exit logic treats the merged total as a fresh position, and clears
+        pending_topup so the next top-up signal can proceed.
+
+        Returns True on success, False if the position is missing or the
+        top-up count is non-positive.
+        """
+        if added_contracts <= 0:
+            return False
+        all_pos = await self._bus.get_all_positions()
+        pos = all_pos.get(ticker)
+        if pos is None:
+            return False
+        old_ct = int(pos.get("contracts", 0))
+        old_fl = int(pos.get("contracts_filled", 0))
+        old_en = int(pos.get("entry_cents", 0))
+        if old_ct <= 0:
+            return False
+        new_ct = old_ct + added_contracts
+        new_fl = old_fl + added_contracts
+        new_en = int(round(
+            (old_en * old_ct + added_entry_cents * added_contracts) / new_ct
+        ))
+        pos.update({
+            "contracts":        new_ct,
+            "contracts_filled": new_fl,
+            "entry_cents":      new_en,
+            "high_water_pnl":   0,
+            "tranche_done":     0,
+            "pending_topup":    None,
+        })
+        await self._bus.set_position(ticker, pos)
+        log.info(
+            "Position topped up: %s  +%d → %d contracts  avg_entry=%d¢ (was %d¢)",
+            ticker, added_contracts, new_ct, new_en, old_en,
+        )
+        return True
+
     async def update_fields(self, ticker: str, updates: dict) -> None:
         """
         Merge `updates` into an existing position without closing it.

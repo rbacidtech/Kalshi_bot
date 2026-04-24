@@ -258,17 +258,50 @@ async def _process_signal(
             reject_reason = "EXPIRED",
         )
 
-    # ── Dedup on Redis positions ──────────────────────────────────────────────
+    # ── Dedup on Redis positions (with weather top-up carve-out) ──────────────
+    # Weather signals fire repeatedly as forecast data refreshes; each refresh
+    # that keeps the same side at a favourable price is a compounding entry,
+    # not a duplicate. Allow top-ups when the existing position is stable
+    # (confirmed, same side, no pending exit/topup, not an arb leg).
+    _is_topup = False
+    _existing_pos: Optional[dict] = None
     if await positions.exists(sig.ticker):
-        log.debug("Skipping %s — already in Redis positions.", sig.ticker)
-        return ExecutionReport(
-            signal_id     = sig.signal_id,
-            ticker        = sig.ticker,
-            asset_class   = sig.asset_class,
-            side          = sig.side,
-            mode          = "paper" if cfg.PAPER_TRADE else "live",
-            status        = "duplicate",
-            reject_reason = "DUPLICATE",
+        _all_pos_dedup = await positions.get_all()
+        _existing_pos = _all_pos_dedup.get(sig.ticker)
+        _is_weather_sig = (
+            sig.asset_class == "kalshi"
+            and (sig.category == "weather" or _is_weather_ticker(sig.ticker))
+        )
+        _can_topup = (
+            _is_weather_sig
+            and _existing_pos is not None
+            and _existing_pos.get("side") == sig.side
+            and bool(_existing_pos.get("fill_confirmed", False))
+            and not _existing_pos.get("pending", False)
+            and not _existing_pos.get("pending_exit", False)
+            and not _existing_pos.get("pending_topup")
+            and not _existing_pos.get("arb_id")
+            and int(_existing_pos.get("contracts", 0)) > 0
+        )
+        if not _can_topup:
+            log.debug("Skipping %s — already in Redis positions.", sig.ticker)
+            return ExecutionReport(
+                signal_id     = sig.signal_id,
+                ticker        = sig.ticker,
+                asset_class   = sig.asset_class,
+                side          = sig.side,
+                mode          = "paper" if cfg.PAPER_TRADE else "live",
+                status        = "duplicate",
+                reject_reason = "DUPLICATE",
+            )
+        _is_topup = True
+        log.info(
+            "Weather top-up candidate: %s  existing=%d×%s@%d¢  new_signal edge=%.3f",
+            sig.ticker,
+            int(_existing_pos.get("contracts", 0)),
+            _existing_pos.get("side", ""),
+            int(_existing_pos.get("entry_cents", 0)),
+            sig.edge,
         )
 
     # ── Entry-failure cooldown ────────────────────────────────────────────────
@@ -532,9 +565,23 @@ async def _process_signal(
             contracts  = _cap_max
             _sig_cost  = _unit_cost * contracts
 
-        if _sig_cost > balance_cents * _MAX_MARKET_PCT:
-            log.info("Market limit hit (%.0f¢ > %.0f¢) — skipping %s",
-                     _sig_cost, balance_cents * _MAX_MARKET_PCT, sig.ticker)
+        # Per-market cap includes existing exposure on this ticker for top-ups.
+        # Otherwise weather accumulation could blow past 15% of balance across
+        # many small top-up signals on the same contract.
+        _existing_cost = 0
+        if _is_topup and _existing_pos:
+            _ex_ct = int(_existing_pos.get("contracts_filled")
+                         or _existing_pos.get("contracts", 0))
+            _ex_en = int(_existing_pos.get("entry_cents", 50))
+            _existing_cost = ((100 - _ex_en) * _ex_ct
+                              if _existing_pos.get("side") == "no"
+                              else _ex_en * _ex_ct)
+        if _sig_cost + _existing_cost > balance_cents * _MAX_MARKET_PCT:
+            log.info(
+                "Market limit hit (%.0f¢ + existing %.0f¢ > %.0f¢) — skipping %s",
+                _sig_cost, _existing_cost,
+                balance_cents * _MAX_MARKET_PCT, sig.ticker,
+            )
             return _rejected("MARKET_LIMIT")
 
     # ── Long-game capital cap ─────────────────────────────────────────────────
@@ -790,11 +837,13 @@ async def _process_signal(
             _arb_legs_in_progress -= _leg_ticker_set
         executed = _arb_ok
     elif sig.asset_class == "kalshi":
-        if sig.ticker in executor._positions:
+        if sig.ticker in executor._positions and not _is_topup:
             # Executor has an in-memory entry but Redis does not — Redis was wiped.
             # Always restore from executor so dedup blocks re-entry on future cycles.
             # Never clear a live executor entry: if the position is wrong, fill_poll
             # will cancel it; clearing here only triggers immediate re-entry.
+            # (Top-ups intentionally keep the executor entry — they bypass its
+            # dedup with topup=True and merge into Redis via add_contracts.)
             ex_pos = executor._positions[sig.ticker]
 
             # Exception: if the executor entry has no order_id and is not
@@ -841,7 +890,9 @@ async def _process_signal(
                 return _rejected("EXECUTOR_DEDUP")
         exec_signal           = message_to_kalshi_signal(sig)
         exec_signal.contracts = contracts
-        order_id              = await asyncio.to_thread(executor.execute, exec_signal)
+        order_id              = await asyncio.to_thread(
+            executor.execute, exec_signal, _is_topup,
+        )
         executed              = bool(order_id)
         # ── Circuit breaker accounting ────────────────────────────────────────
         if executed:
@@ -874,7 +925,9 @@ async def _process_signal(
     if not executed:
         # For arb-legs path the pending primary position was already removed inside
         # the branch above; for other paths remove it here.
-        if not sig.arb_legs:
+        # For top-ups the original confirmed position must NOT be removed — the
+        # top-up order failure has no impact on the existing fill.
+        if not sig.arb_legs and not _is_topup:
             await positions.close(sig.ticker)       # remove the pending entry
         _entry_failed_cooldown[sig.ticker] = time.time()
         log.warning(
@@ -912,11 +965,29 @@ async def _process_signal(
         )
 
     # ── Confirm position (remove pending flag, store order_id) ───────────────
-    confirm_fields: dict = {"pending": False}
-    if sig.asset_class == "kalshi":
-        confirm_fields["order_id"]      = order_id        # UUID or "paper"
-        confirm_fields["fill_confirmed"] = False           # poll loop updates this
-    await positions.update_fields(sig.ticker, confirm_fields)
+    if _is_topup and sig.asset_class == "kalshi":
+        # Top-up: don't touch the main order_id / fill_confirmed of the parent
+        # position. Store the top-up order in pending_topup; fill_poll polls
+        # it and merges filled contracts via positions.add_contracts.
+        _topup_entry = int(sig.market_price * 100)  # YES-equivalent convention
+        if order_id == "paper":
+            # Paper mode fills instantly — merge now, no polling needed.
+            await positions.add_contracts(sig.ticker, contracts, _topup_entry)
+        else:
+            await positions.update_fields(sig.ticker, {
+                "pending_topup": {
+                    "order_id":    order_id,
+                    "contracts":   contracts,
+                    "entry_cents": _topup_entry,
+                    "placed_at":   datetime.now(timezone.utc).isoformat(),
+                },
+            })
+    else:
+        confirm_fields: dict = {"pending": False}
+        if sig.asset_class == "kalshi":
+            confirm_fields["order_id"]      = order_id        # UUID or "paper"
+            confirm_fields["fill_confirmed"] = False           # poll loop updates this
+        await positions.update_fields(sig.ticker, confirm_fields)
 
     # For NO contracts the actual outlay is the NO price, not the YES price.
     # market_price is always the YES mid; NO cost = (1 - market_price).
@@ -2611,6 +2682,104 @@ async def _fill_poll_loop(
 
                 except Exception as _ep_exc:
                     log.debug("Exit poll error for %s: %s", ticker, _ep_exc)
+
+            # ── Top-up fill polling: merge add-to-position orders ──────────────
+            # Weather top-ups write pending_topup = {order_id, contracts, ...}
+            # onto the parent position rather than overwriting order_id.  Poll
+            # each one; on fill, merge via positions.add_contracts.  On cancel,
+            # accept any partial fill and clear pending_topup.  Resting orders
+            # older than _RESTING_ORDER_MAX_HOURS are canceled — weather markets
+            # close within 24-48h, a stale top-up at an off-market limit is
+            # worthless and blocks further top-ups on this position.
+            for ticker, pos in all_pos.items():
+                _topup = pos.get("pending_topup")
+                if not isinstance(_topup, dict):
+                    continue
+                _t_oid = _topup.get("order_id", "")
+                if not _t_oid or _t_oid == "paper":
+                    continue
+                _t_req_ct = int(_topup.get("contracts", 0))
+                _t_entry  = int(_topup.get("entry_cents", 50))
+                try:
+                    _t_resp = await asyncio.to_thread(
+                        client.get, f"/portfolio/orders/{_t_oid}"
+                    )
+                    _t_order = _t_resp.get("order", {})
+                    _t_status     = _t_order.get("status", "")
+                    _t_fill_count = float(_t_order.get("fill_count_fp", 0) or 0)
+                    _t_total      = float(_t_order.get("initial_count_fp", _t_req_ct or 1) or 1)
+
+                    if _t_status == "filled" or _t_fill_count >= _t_total:
+                        _add = int(_t_fill_count) or _t_req_ct
+                        ok = await positions.add_contracts(ticker, _add, _t_entry)
+                        log.info(
+                            "TOPUP FILLED ✓ %s  +%d @ %d¢  order=%.8s  merged=%s",
+                            ticker, _add, _t_entry, _t_oid, ok,
+                        )
+                        if bus is not None and ok:
+                            try:
+                                _tu_fee = cfg.FEE_CENTS * _add
+                                _tu_cost = (
+                                    (100 - _t_entry) * _add if pos.get("side") == "no"
+                                    else _t_entry * _add
+                                )
+                                await bus.publish_execution(ExecutionReport(
+                                    ticker        = ticker,
+                                    asset_class   = "kalshi",
+                                    side          = pos.get("side", "yes"),
+                                    contracts     = _add,
+                                    fill_price    = _t_entry / 100,
+                                    status        = "filled",
+                                    mode          = "live",
+                                    cost_cents    = _tu_cost,
+                                    fee_cents     = _tu_fee,
+                                    edge_captured = 0.0,
+                                ))
+                            except Exception as _tu_rpt:
+                                log.warning("TOPUP ExecutionReport failed %s: %s",
+                                            ticker, _tu_rpt)
+
+                    elif _t_status == "canceled":
+                        if _t_fill_count > 0:
+                            _add = int(_t_fill_count)
+                            await positions.add_contracts(ticker, _add, _t_entry)
+                            log.warning(
+                                "TOPUP partial+canceled: %s  +%d @ %d¢  order=%.8s",
+                                ticker, _add, _t_entry, _t_oid,
+                            )
+                        else:
+                            await positions.update_fields(ticker, {"pending_topup": None})
+                            log.info("TOPUP canceled (0 fills): %s  order=%.8s",
+                                     ticker, _t_oid)
+
+                    else:
+                        # Resting — cancel if older than _RESTING_ORDER_MAX_HOURS.
+                        _tu_placed = _topup.get("placed_at", "")
+                        if _tu_placed:
+                            try:
+                                _tu_dt = datetime.fromisoformat(
+                                    _tu_placed.replace("Z", "+00:00")
+                                )
+                                _tu_age = (
+                                    datetime.now(timezone.utc) - _tu_dt
+                                ).total_seconds() / 3600
+                                if _tu_age > _RESTING_ORDER_MAX_HOURS:
+                                    try:
+                                        await asyncio.to_thread(
+                                            client._request, "DELETE",
+                                            f"/portfolio/orders/{_t_oid}",
+                                        )
+                                    except Exception:
+                                        pass
+                                    await positions.update_fields(ticker, {"pending_topup": None})
+                                    log.warning(
+                                        "TOPUP timeout: %s  age=%.1fh  order=%.8s — canceled",
+                                        ticker, _tu_age, _t_oid,
+                                    )
+                            except (ValueError, TypeError):
+                                pass
+                except Exception as _tu_exc:
+                    log.debug("Topup poll error for %s: %s", ticker, _tu_exc)
 
             # ── Entry fill polling: confirm resting entry orders ───────────────
             for ticker, pos in all_pos.items():

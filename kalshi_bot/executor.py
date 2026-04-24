@@ -135,16 +135,22 @@ class Executor:
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
-    def execute(self, signal: Signal) -> str:
+    def execute(self, signal: Signal, topup: bool = False) -> str:
         """
         Enter a new position.  Returns the Kalshi order_id on success (truthy),
         "paper" for paper-mode entries, or "" on skip/failure (falsy).
         Callers can use the return value directly in a boolean check.
+
+        topup=True: caller is adding to an existing position (weather only —
+        gated upstream in ep_exec). Bypass the _positions dedup and do NOT
+        overwrite the tracked position; the caller is responsible for merging
+        filled contracts into the Redis record via positions.add_contracts
+        once fill_poll confirms the top-up order fills.
         """
         if signal.ticker in self._held:
             log.debug("Skipping %s — already entered this cycle.", signal.ticker)
             return ""
-        if signal.ticker in self._positions:
+        if not topup and signal.ticker in self._positions:
             log.debug("Skipping %s — already in positions.", signal.ticker)
             return ""
         # NOTE: the Redis-based UnifiedRiskEngine applies MAX_TOTAL_EXPOSURE
@@ -157,7 +163,7 @@ class Executor:
         else:
             order_id = self._live_entry(signal)
 
-        if order_id:
+        if order_id and not topup:
             # Track position for exit management
             self._positions[signal.ticker] = {
                 "side":          signal.side,
