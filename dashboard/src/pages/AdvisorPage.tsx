@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   Brain, AlertTriangle, CheckCircle, Info, TrendingUp, TrendingDown,
-  Minus, RefreshCw, Zap, Clock,
+  Minus, RefreshCw, Zap, Clock, HelpCircle,
 } from 'lucide-react'
 import { advisor } from '../lib/api'
 
@@ -139,10 +139,10 @@ function AlertRow({ a }: { a: AdvisorAlert }) {
 }
 
 const HEALTH_STYLES = {
-  degrading:        { ring: 'ring-rose-500/40',   badge: 'bg-rose-500/15 text-rose-400',   icon: <TrendingDown size={11} /> },
-  improving:        { ring: 'ring-emerald-500/40', badge: 'bg-emerald-500/15 text-emerald-400', icon: <TrendingUp size={11} /> },
-  stable:           { ring: 'ring-slate-600/40',   badge: 'bg-slate-700/50 text-slate-400',     icon: <Minus size={11} /> },
-  insufficient_data:{ ring: 'ring-slate-700/30',   badge: 'bg-slate-800/60 text-slate-500',     icon: <Minus size={11} /> },
+  degrading:        { ring: 'ring-rose-500/40',              badge: 'bg-rose-500/15 text-rose-400',            icon: <TrendingDown size={11} /> },
+  improving:        { ring: 'ring-emerald-500/40',           badge: 'bg-emerald-500/15 text-emerald-400',      icon: <TrendingUp size={11} /> },
+  stable:           { ring: 'ring-slate-600/40',             badge: 'bg-slate-700/50 text-slate-400',          icon: <Minus size={11} /> },
+  insufficient_data:{ ring: 'ring-slate-600/20 ring-dashed', badge: 'bg-slate-800/40 text-slate-600 opacity-70', icon: <HelpCircle size={11} /> },
 }
 
 function StrategyHealthCard({ name, h }: { name: string; h: StrategyHealth }) {

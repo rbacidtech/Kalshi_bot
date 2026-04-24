@@ -48,6 +48,7 @@ interface BotStatus {
   session_pnl?:      number
   last_balance_at?:  string | null
   health?:           string
+  exec_health?:      string | null
   uptime_seconds?:   number
   node_id?:          string
   sources?:          Record<string, SourceHealth>
@@ -196,10 +197,11 @@ function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) => void 
 
 // ── Node health pill ─────────────────────────────────────────────────────────
 
-function NodeCard({ label, node, lastCycleAt }: {
+function NodeCard({ label, node, lastCycleAt, health }: {
   label: string
   node?: NodeStatus
   lastCycleAt?: string | null
+  health?: string | null
 }) {
   // Use ep:system heartbeat if available, else fall back to last_cycle_at for intel
   const ts   = node?.last_heartbeat_at ?? lastCycleAt
@@ -209,6 +211,12 @@ function NodeCard({ label, node, lastCycleAt }: {
   const dot  = alive ? 'bg-emerald-400' : 'bg-rose-500'
   const ring = alive ? 'border-emerald-500/30' : 'border-rose-500/30'
   const text = alive ? 'text-emerald-400' : 'text-rose-400'
+
+  const healthColor = !health || health === 'ok' || health === 'healthy'
+    ? null
+    : health === 'critical' || health.includes('error')
+      ? 'text-rose-400 bg-rose-500/10 border-rose-500/20'
+      : 'text-amber-400 bg-amber-500/10 border-amber-500/20'
 
   return (
     <div className={`rounded-xl border bg-surface-2 p-3 flex items-center gap-3 ${ring}`}>
@@ -223,7 +231,14 @@ function NodeCard({ label, node, lastCycleAt }: {
           {node && !node.alive && ` · ${node.age_s.toFixed(0)}s stale`}
         </p>
       </div>
-      <span className={`text-[10px] font-bold ${text}`}>{alive ? 'UP' : 'DOWN'}</span>
+      <div className="flex flex-col items-end gap-1">
+        <span className={`text-[10px] font-bold ${text}`}>{alive ? 'UP' : 'DOWN'}</span>
+        {healthColor && health && (
+          <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border capitalize ${healthColor}`}>
+            {health}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
@@ -337,8 +352,8 @@ function StatusTab({ status, onHalt, onResume }: {
 
       {/* ── Two-node heartbeat row ─────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-3">
-        <NodeCard label="Intel Node" node={intelNode} lastCycleAt={status?.last_cycle_at} />
-        <NodeCard label="Exec Node"  node={execNode} />
+        <NodeCard label="Intel Node" node={intelNode} lastCycleAt={status?.last_cycle_at} health={status?.health} />
+        <NodeCard label="Exec Node"  node={execNode}  health={status?.exec_health} />
       </div>
 
       {/* ── Main metrics card ──────────────────────────────────────────────── */}
@@ -543,8 +558,11 @@ function StrategiesTab({ cfg, update, isSaving, perf }: {
                   <p className="text-sm font-semibold text-slate-200">{s.label}</p>
                   <p className="text-xs text-slate-500 mt-1 leading-snug">{s.description}</p>
                   {(() => {
+                    if (!perf) return null
                     const pnl = stratPnl(s.key, perf)
-                    if (pnl === null) return null
+                    if (pnl === null) return (
+                      <p className="text-xs tabular-nums mt-1.5 text-slate-600">— no trades (30d)</p>
+                    )
                     return (
                       <p className={`text-xs font-semibold tabular-nums mt-1.5 ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {pnl >= 0 ? '+' : ''}${(pnl / 100).toFixed(2)} (30d)
@@ -581,12 +599,12 @@ function RiskTab({ cfg, update, isSaving }: {
         <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-emerald-500/20 bg-emerald-500/8">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
           <span className="text-emerald-400 font-medium">Live (next cycle):</span>
-          <span className="text-slate-400">Edge · Contracts · Confidence</span>
+          <span className="text-slate-400">Edge · Contracts · Confidence · Kelly</span>
         </div>
         <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-amber-500/20 bg-amber-500/8">
           <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
           <span className="text-amber-400 font-medium">Restart required:</span>
-          <span className="text-slate-400">Kelly · Exposure · Drawdown · Poll</span>
+          <span className="text-slate-400">Exposure · Drawdown · Poll</span>
         </div>
       </div>
 
@@ -689,6 +707,8 @@ function AdvisorTab({ cfg }: { cfg: BotConfig }) {
       )
       if (res.data.ok) {
         setSuggestion(res.data.suggestion)
+      } else if (res.data.reason === 'no_api_key') {
+        setError('ANTHROPIC_API_KEY is not configured on this server. Add it to the environment to enable AI suggestions.')
       } else {
         setError(res.data.suggestion ?? 'Unknown error')
       }
@@ -877,10 +897,10 @@ export default function ControlsPage() {
   const RESTART_REQUIRED_KEYS: (keyof BotConfig)[] = [
     'enable_fomc', 'enable_weather', 'enable_economic', 'enable_sports',
     'enable_crypto_price', 'enable_gdp',
-    'kelly_fraction', 'max_market_exposure', 'daily_drawdown_limit', 'poll_interval',
+    'max_market_exposure', 'daily_drawdown_limit', 'poll_interval',
   ]
 
-  const LIVE_KEYS: (keyof BotConfig)[] = ['edge_threshold', 'max_contracts', 'min_confidence']
+  const LIVE_KEYS: (keyof BotConfig)[] = ['edge_threshold', 'max_contracts', 'min_confidence', 'kelly_fraction']
 
   const dirtyRestartKeys = serverConfig
     ? RESTART_REQUIRED_KEYS.filter(k => cfg[k] !== serverConfig[k])

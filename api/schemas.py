@@ -155,6 +155,10 @@ class PositionResponse(BaseModel):
     entered_at: Optional[str]
     close_time: Optional[str]
     unrealized_pnl_cents: Optional[int]  # computed by API layer, may be None
+    model_source: Optional[str] = None
+    confidence: Optional[float] = None
+    outcome: Optional[str] = None
+    meeting: Optional[str] = None
 
 
 class PortfolioResponse(BaseModel):

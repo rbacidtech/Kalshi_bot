@@ -106,6 +106,7 @@ async def get_positions(
             else:
                 missing_price_count += 1
 
+            raw_conf = p.get("confidence")
             positions.append(PositionResponse(
                 ticker            = ticker,
                 side              = PositionSide(side),
@@ -116,6 +117,10 @@ async def get_positions(
                 entered_at        = p.get("entered_at"),
                 close_time        = p.get("close_time"),
                 unrealized_pnl_cents = pnl,
+                model_source      = p.get("model_source"),
+                confidence        = float(raw_conf) if raw_conf is not None else None,
+                outcome           = p.get("outcome"),
+                meeting           = p.get("meeting"),
             ))
 
         # Balance from Redis (intel node publishes each cycle)

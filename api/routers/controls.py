@@ -442,6 +442,9 @@ async def ai_suggest(
     import os
     import anthropic
 
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return {"suggestion": None, "ok": False, "reason": "no_api_key"}
+
     config   = body.get("config", {})
     question = body.get("question", "Review my current settings and suggest improvements.")
     perf     = body.get("performance", {})
