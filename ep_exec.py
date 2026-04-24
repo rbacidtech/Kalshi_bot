@@ -600,6 +600,7 @@ async def _process_signal(
         outcome      = sig.outcome or "",
         close_time   = sig.close_time or "",
         model_source = sig.model_source or "",
+        confidence   = sig.confidence,
         pending      = True,
     )
 
@@ -692,6 +693,7 @@ async def _process_signal(
                     outcome      = sig.outcome or "",
                     close_time   = sig.close_time or "",
                     model_source = sig.model_source or "",
+                    confidence   = sig.confidence,
                     pending      = False,
                 )
                 await positions.update_fields(_leg_ticker, {
@@ -807,6 +809,7 @@ async def _process_signal(
                     outcome      = ex_pos.get("outcome", ""),
                     close_time   = ex_pos.get("close_time", ""),
                     model_source = ex_pos.get("model_source", ""),
+                    confidence   = float(ex_pos.get("confidence", 0.0)),
                     pending      = False,
                 )
                 await positions.update_fields(sig.ticker, {
@@ -982,6 +985,7 @@ async def _process_signal(
                     outcome      = sig.outcome or "",
                     close_time   = sig.close_time or "",
                     model_source = sig.model_source or "",
+                    confidence   = sig.confidence,
                 )
                 await positions.update_fields(sig.arb_partner, {
                     "order_id":       partner_order_id,
@@ -3384,6 +3388,7 @@ async def exec_main() -> None:
                     outcome      = _pos.get("outcome", ""),
                     close_time   = _pos.get("close_time", ""),
                     model_source = _pos.get("model_source", ""),
+                    confidence   = float(_pos.get("confidence", 0.0)),
                     pending      = False,
                 )
             log.info("Startup: synced %d disk positions → Redis", len(executor._positions))

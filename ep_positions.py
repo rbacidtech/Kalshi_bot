@@ -33,6 +33,7 @@ class PositionStore:
         outcome:      str = "",
         close_time:   str = "",
         model_source: str = "",
+        confidence:   float = 0.0,
         pending:      bool = False,
     ) -> None:
         """Open a new position in Redis.
@@ -79,6 +80,7 @@ class PositionStore:
             "outcome":           outcome,
             "close_time":        close_time,
             "model_source":      model_source,
+            "confidence":        confidence,
             "entered_at":        datetime.now(timezone.utc).isoformat(),
             "pending":           pending,
         }
