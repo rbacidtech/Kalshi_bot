@@ -19,6 +19,7 @@ import csv
 import json
 import logging
 import datetime
+import time
 from datetime import timezone
 from pathlib import Path
 
@@ -267,12 +268,25 @@ class Executor:
             price_cents = int(leg["price_cents"])
 
             if self.paper:
-                order_id = self._arb_paper_leg(ticker, side, price_cents, contracts_per_leg, i)
+                order_id   = self._arb_paper_leg(ticker, side, price_cents, contracts_per_leg, i)
+                fill_count = contracts_per_leg
             else:
                 order_id = self._arb_live_leg(ticker, side, price_cents, contracts_per_leg, i)
+                fill_count = 0
+                if order_id:
+                    # Wait for confirmed fill before proceeding to the next leg.
+                    # An unfilled resting order on leg N means leg N+1 would be naked
+                    # exposure, not arb. Abort and roll back if not filled in time.
+                    fill_status, fill_count = self._poll_fill_sync(order_id)
+                    if fill_status != "filled":
+                        log.warning(
+                            "[ARB ENTRY] Leg %d/%d fill %s (%s %s) — rolling back %d earlier leg(s)",
+                            i + 1, len(legs), fill_status, ticker, side, len(placed),
+                        )
+                        order_id = ""  # treat as failure → trigger rollback below
 
             if not order_id:
-                # This leg failed.  Best-effort cancel already-placed legs.
+                # This leg failed or didn't fill.  Best-effort cancel already-placed legs.
                 log.warning(
                     "[ARB ENTRY] Leg %d/%d FAILED (%s %s) — attempting to cancel %d earlier leg(s)",
                     i + 1, len(legs), ticker, side, len(placed),
@@ -291,8 +305,8 @@ class Executor:
 
             placed.append((ticker, side, order_id))
             log.info(
-                "[ARB ENTRY] Leg %d/%d OK  %-38s  side=%-3s  price=%d¢  order_id=%s",
-                i + 1, len(legs), ticker[:38], side, price_cents, order_id,
+                "[ARB ENTRY] Leg %d/%d FILLED  %-38s  side=%-3s  price=%d¢  filled=%d  order_id=%s",
+                i + 1, len(legs), ticker[:38], side, price_cents, fill_count, order_id,
             )
 
             # Write CSV entry for this leg immediately after placement so the
@@ -383,6 +397,47 @@ class Executor:
         except Exception as exc:
             log.error("Arb leg %d FAILED for %s %s: %s", leg_index + 1, ticker, side, exc)
             return ""
+
+    def _poll_fill_sync(
+        self,
+        order_id: str,
+        timeout_s: float = 10.0,
+        poll_interval_s: float = 0.4,
+    ) -> tuple[str, int]:
+        """
+        Synchronous fill poll for a single arb leg.
+
+        Polls GET /portfolio/orders/{order_id} until the order is filled,
+        cancelled, or the timeout expires. If the order times out while still
+        resting we cancel it and return "timeout" so the caller can roll back.
+
+        Returns:
+            (status, fill_count) where status ∈ {"filled", "cancelled", "timeout"}
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                resp        = self.client.get(f"/portfolio/orders/{order_id}")
+                order       = resp.get("order", {})
+                status      = order.get("status", "")
+                fill_count  = float(order.get("fill_count_fp",   0) or 0)
+                total_count = float(order.get("initial_count_fp", 1) or 1)
+
+                if status == "filled" or fill_count >= total_count:
+                    return "filled", int(fill_count)
+                if status in ("canceled", "cancelled", "expired"):
+                    return "cancelled", int(fill_count)
+            except Exception as exc:
+                log.warning("Order poll error for %s: %s", order_id, exc)
+            time.sleep(poll_interval_s)
+
+        # Timeout — cancel the resting order before returning
+        log.warning("Leg fill timeout (%ss) — cancelling %s", timeout_s, order_id)
+        try:
+            self.client._request("DELETE", f"/portfolio/orders/{order_id}")
+        except Exception as exc:
+            log.error("Cancel of timed-out leg %s failed: %s", order_id, exc)
+        return "timeout", 0
 
     def _arb_cancel_placed(self, placed: list) -> list:
         """

@@ -354,6 +354,138 @@ def _extract_strike(ticker: str) -> Optional[float]:
     return float(match.group(1)) if match else None
 
 
+def _scan_ladder_arb_core(
+    groups: dict[str, list[dict]],
+    max_contracts: int,
+    series_tag: str = "fomc",
+) -> list[Signal]:
+    """
+    Shared monotonicity + butterfly arb core for any threshold-ladder series.
+
+    Invariant: for any series measuring P(metric > X), the CDF must be strictly
+    decreasing as X increases. Violations (lower strike priced below higher strike)
+    and convexity violations (butterfly) are both tradeable.
+
+    Args:
+        groups:       Markets grouped by event_ticker (e.g. one FOMC meeting, or one CPI release).
+        max_contracts: Per-signal contract cap.
+        series_tag:   Short tag used in model_source and log lines (e.g. "fomc", "cpi").
+    """
+    mono_candidates: list[tuple[float, Signal]] = []
+    butterfly_signals: list[Signal] = []
+
+    for event, group in groups.items():
+        priced = [(m, _extract_strike(m["ticker"]), _market_mid(m)) for m in group]
+        priced = [(m, s, p) for m, s, p in priced if s is not None and p > 0.01]
+        if len(priced) < 2:
+            continue
+        priced.sort(key=lambda x: x[1])  # ascending strike
+
+        # ── Monotonicity check ────────────────────────────────────────────────
+        for i in range(len(priced) - 1):
+            m_low, strike_low, price_low   = priced[i]
+            m_high, strike_high, price_high = priced[i + 1]
+
+            yes_ask_low  = float(m_low.get("yes_ask_dollars") or price_low + 0.02)
+            yes_bid_high = float(m_high.get("yes_bid_dollars") or price_high - 0.02)
+
+            if yes_ask_low < yes_bid_high - 0.01:
+                arb_profit = yes_bid_high - yes_ask_low
+                fee_cost   = arb_profit * KALSHI_FEE_RATE * 2
+                net_profit = arb_profit - fee_cost
+
+                if net_profit >= MIN_EDGE_GROSS * 0.5:
+                    contracts  = min(max_contracts, max(1, int(net_profit * 50)))
+                    edge_cents = yes_bid_high - yes_ask_low
+                    sig = Signal(
+                        ticker            = m_low["ticker"],
+                        title             = f"ARB: Buy {m_low['ticker']} YES + Buy {m_high['ticker']} NO",
+                        category          = "arb",
+                        side              = "yes",
+                        fair_value        = yes_bid_high,
+                        market_price      = yes_ask_low,
+                        edge              = arb_profit,
+                        fee_adjusted_edge = net_profit,
+                        contracts         = contracts,
+                        confidence        = 0.95,
+                        model_source      = f"{series_tag}_monotonicity_arb",
+                        arb_partner       = m_high["ticker"],
+                        meeting           = event,
+                    )
+                    mono_candidates.append((edge_cents, sig))
+                    log.info(
+                        "%s ARB: Buy %s YES@%.2f + Buy %s NO@%.2f → net %.2f¢",
+                        series_tag.upper(), m_low["ticker"], yes_ask_low,
+                        m_high["ticker"], 1 - yes_bid_high, net_profit * 100,
+                    )
+
+        # ── Butterfly convexity check ─────────────────────────────────────────
+        if len(priced) < 3:
+            continue
+
+        BUTTERFLY_THRESHOLD = 0.04
+
+        for i in range(len(priced) - 2):
+            m_a, strike_a, p_a = priced[i]
+            m_b, strike_b, p_b = priced[i + 1]
+            m_c, strike_c, p_c = priced[i + 2]
+
+            gap_lo = round(strike_b - strike_a, 4)
+            gap_hi = round(strike_c - strike_b, 4)
+            if abs(gap_lo - gap_hi) > 1e-6:
+                continue
+
+            convexity_slack = p_a + p_c - 2 * p_b
+            if convexity_slack >= -BUTTERFLY_THRESHOLD:
+                continue
+
+            bf_mid_b = (p_a + p_c) / 2.0
+            legs = [
+                (abs(p_a - bf_mid_b), m_a, strike_a, p_a),
+                (abs(p_b - bf_mid_b), m_b, strike_b, p_b),
+                (abs(p_c - bf_mid_b), m_c, strike_c, p_c),
+            ]
+            worst_dev, worst_m, worst_strike, worst_price = max(legs, key=lambda x: x[0])
+            contracts = min(max_contracts, max(1, int(worst_dev * 50)))
+
+            _bf_arb_legs = [
+                {"ticker": m_a["ticker"], "side": "yes", "price_cents": max(1, int(p_a * 100))},
+                {"ticker": m_b["ticker"], "side": "no",  "price_cents": max(1, int((1.0 - p_b) * 100))},
+                {"ticker": m_c["ticker"], "side": "yes", "price_cents": max(1, int(p_c * 100))},
+            ]
+            sig = Signal(
+                ticker            = worst_m["ticker"],
+                title             = (
+                    f"BUTTERFLY: {m_a['ticker']}/{m_b['ticker']}/{m_c['ticker']} "
+                    f"leg {worst_m['ticker']} off by {worst_dev * 100:.1f}¢"
+                ),
+                category          = "arb",
+                side              = "yes",
+                fair_value        = bf_mid_b,
+                market_price      = worst_price,
+                edge              = worst_dev,
+                fee_adjusted_edge = worst_dev * (1 - KALSHI_FEE_RATE * 2),
+                contracts         = contracts,
+                confidence        = 0.70,
+                model_source      = f"{series_tag}_butterfly_arb",
+                meeting           = event,
+                arb_legs          = _bf_arb_legs,
+            )
+            butterfly_signals.append(sig)
+            log.info(
+                "%s BUTTERFLY: %s/%s/%s P=%.2f/%.2f/%.2f slack=%.2f¢ worst=%s dev=%.2f¢",
+                series_tag.upper(),
+                m_a["ticker"], m_b["ticker"], m_c["ticker"],
+                p_a, p_b, p_c, convexity_slack * 100,
+                worst_m["ticker"], worst_dev * 100,
+            )
+
+    mono_candidates.sort(key=lambda x: x[0], reverse=True)
+    signals = [sig for _, sig in mono_candidates]
+    signals.extend(butterfly_signals)
+    return signals
+
+
 def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
     """
     Detect monotonicity violations in FOMC T-level contracts.
@@ -375,163 +507,31 @@ def scan_fomc_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
     P(A) + P(C) >= 2*P(B). A violation signals that the middle strike is overpriced
     relative to the wings and a 3-leg spread can capture the mispricing.
     """
-    # ── Collect per-meeting candidate violations ───────────────────────────────
-    mono_candidates: list[tuple[float, Signal]] = []   # (edge_cents, signal)
-    butterfly_signals: list[Signal] = []
+    return _scan_ladder_arb_core(_group_fomc_by_meeting(markets), max_contracts, series_tag="fomc")
 
-    groups = _group_fomc_by_meeting(markets)
 
-    for event, group in groups.items():
-        # Build (market, strike, mid_price) list filtered to priced markets only
-        priced = [(m, _extract_strike(m["ticker"]), _market_mid(m)) for m in group]
-        priced = [(m, s, p) for m, s, p in priced if s is not None and p > 0.01]
-        if len(priced) < 2:
-            continue
-        priced.sort(key=lambda x: x[1])  # ascending strike
+# Economic series prefixes that have threshold-ladder markets (same CDF invariant as FOMC)
+_ECONOMIC_LADDER_PREFIXES = ("KXCPI", "KXUNRATE", "KXGDP", "KXNFP", "KXPCE", "KXGDPQ")
 
-        # ── Enhancement 1: monotonicity check with edge-ranked collection ─────
-        for i in range(len(priced) - 1):
-            m_low, strike_low, price_low   = priced[i]
-            m_high, strike_high, price_high = priced[i + 1]
 
-            yes_ask_low  = float(m_low.get("yes_ask_dollars") or price_low + 0.02)
-            yes_bid_high = float(m_high.get("yes_bid_dollars") or price_high - 0.02)
+def scan_economic_ladder_arb(markets: list[dict], max_contracts: int) -> list[Signal]:
+    """
+    Monotonicity + butterfly arb for economic threshold-ladder series.
 
-            # Arb exists if: buying lower YES + buying higher NO costs < $1
-            # = yes_ask_low + (1 - yes_bid_high) < 1.0
-            # = yes_ask_low < yes_bid_high
-            if yes_ask_low < yes_bid_high - 0.01:  # 1¢ buffer for fees
-                arb_profit = yes_bid_high - yes_ask_low
-                fee_cost   = arb_profit * KALSHI_FEE_RATE * 2  # fees on both legs
-                net_profit = arb_profit - fee_cost
-
-                if net_profit >= MIN_EDGE_GROSS * 0.5:  # lower bar for pure arb
-                    contracts  = min(max_contracts, max(1, int(net_profit * 50)))
-                    edge_cents = yes_bid_high - yes_ask_low  # dollars earned per $1 risk
-                    sig = Signal(
-                        ticker            = m_low["ticker"],
-                        title             = f"ARB: Buy {m_low['ticker']} YES + Buy {m_high['ticker']} NO",
-                        category          = "arb",
-                        side              = "yes",
-                        fair_value        = yes_bid_high,
-                        market_price      = yes_ask_low,
-                        edge              = arb_profit,
-                        fee_adjusted_edge = net_profit,
-                        contracts         = contracts,
-                        confidence        = 0.95,
-                        model_source      = "monotonicity_arb",
-                        arb_partner       = m_high["ticker"],
-                        meeting           = event,
-                    )
-                    mono_candidates.append((edge_cents, sig))
-                    log.info(
-                        "FOMC ARB: Buy %s YES@%.2f + Buy %s NO@%.2f → net %.2f¢ edge=%.2f¢",
-                        m_low["ticker"], yes_ask_low,
-                        m_high["ticker"], 1 - yes_bid_high,
-                        net_profit * 100, edge_cents * 100,
-                    )
-
-        # ── Enhancement 2: butterfly spread convexity check ───────────────────
-        # Requires at least 3 equally-spaced strikes
-        if len(priced) < 3:
-            continue
-
-        BUTTERFLY_THRESHOLD = 0.04  # minimum violation magnitude to generate a signal
-
-        for i in range(len(priced) - 2):
-            m_a, strike_a, p_a = priced[i]
-            m_b, strike_b, p_b = priced[i + 1]
-            m_c, strike_c, p_c = priced[i + 2]
-
-            # Only check when strikes are equally spaced (within floating-point tolerance)
-            gap_lo = round(strike_b - strike_a, 4)
-            gap_hi = round(strike_c - strike_b, 4)
-            if abs(gap_lo - gap_hi) > 1e-6:
-                continue
-
-            # Convexity: P(A) + P(C) >= 2*P(B)
-            convexity_slack = p_a + p_c - 2 * p_b
-            if convexity_slack >= -BUTTERFLY_THRESHOLD:
-                continue  # no violation
-
-            # Butterfly midpoint for each leg
-            bf_mid_b = (p_a + p_c) / 2.0  # fair value of B implied by wings
-
-            # Deviation of each leg from its butterfly-implied fair value
-            # A and C legs are the wings — their implied fair values from butterfly
-            # symmetry around B are: fair_A = p_b + (p_b - p_c)/... but the
-            # most tractable approach is to flag the leg that deviates most from
-            # the smoothed butterfly midpoint.
-            # For a 3-point butterfly: fair midpoint of B = (P(A)+P(C))/2
-            dev_a = abs(p_a - bf_mid_b)  # wing A deviation from B-implied mid
-            dev_b = abs(p_b - bf_mid_b)  # center deviation (always the inflated leg)
-            dev_c = abs(p_c - bf_mid_b)  # wing C deviation from B-implied mid
-
-            # The most mispriced leg is the one whose price deviates furthest
-            # from the butterfly midpoint
-            legs = [(dev_a, m_a, strike_a, p_a),
-                    (dev_b, m_b, strike_b, p_b),
-                    (dev_c, m_c, strike_c, p_c)]
-            worst_dev, worst_m, worst_strike, worst_price = max(legs, key=lambda x: x[0])
-
-            contracts = min(max_contracts, max(1, int(worst_dev * 50)))
-
-            # Build the full 3-leg arb leg list.
-            # P(A) + P(C) < 2*P(B): middle B is overpriced relative to wings.
-            # Trade: buy wing A YES + sell middle B YES (= buy B NO) + buy wing C YES.
-            # price_cents for NO leg is (100 - yes_mid * 100) since NO costs (1 - yes_price).
-            _bf_arb_legs = [
-                {
-                    "ticker":      m_a["ticker"],
-                    "side":        "yes",
-                    "price_cents": max(1, int(p_a * 100)),
-                },
-                {
-                    "ticker":      m_b["ticker"],
-                    "side":        "no",                          # selling the overpriced middle
-                    "price_cents": max(1, int((1.0 - p_b) * 100)),
-                },
-                {
-                    "ticker":      m_c["ticker"],
-                    "side":        "yes",
-                    "price_cents": max(1, int(p_c * 100)),
-                },
-            ]
-
-            sig = Signal(
-                ticker            = worst_m["ticker"],
-                title             = (
-                    f"BUTTERFLY: {m_a['ticker']}/{m_b['ticker']}/{m_c['ticker']} "
-                    f"leg {worst_m['ticker']} off by {worst_dev * 100:.1f}¢"
-                ),
-                category          = "arb",
-                side              = "yes",
-                fair_value        = bf_mid_b,
-                market_price      = worst_price,
-                edge              = worst_dev,
-                fee_adjusted_edge = worst_dev * (1 - KALSHI_FEE_RATE * 2),
-                contracts         = contracts,
-                confidence        = 0.70,
-                model_source      = "fomc_butterfly_arb",
-                meeting           = event,
-                arb_legs          = _bf_arb_legs,
-            )
-            butterfly_signals.append(sig)
-            log.info(
-                "FOMC BUTTERFLY: %s/%s/%s P=%.2f/%.2f/%.2f slack=%.2f¢ worst=%s dev=%.2f¢",
-                m_a["ticker"], m_b["ticker"], m_c["ticker"],
-                p_a, p_b, p_c,
-                convexity_slack * 100,
-                worst_m["ticker"], worst_dev * 100,
-            )
-
-    # ── Rank monotonicity violations by edge descending (Enhancement 1) ───────
-    mono_candidates.sort(key=lambda x: x[0], reverse=True)
-    signals = [sig for _, sig in mono_candidates]
-
-    # Append butterfly signals after ranked monotonicity arbs
-    signals.extend(butterfly_signals)
-
+    Same invariant as FOMC: P(metric > T1) >= P(metric > T2) when T1 < T2.
+    Applies to KXCPI, KXUNRATE, KXGDP, KXNFP, KXPCE, KXGDPQ.
+    Markets in each series are grouped by event_ticker (the release date).
+    """
+    eco_markets = [
+        m for m in markets
+        if any(m.get("ticker", "").startswith(p) for p in _ECONOMIC_LADDER_PREFIXES)
+    ]
+    if not eco_markets:
+        return []
+    groups = _group_fomc_by_meeting(eco_markets)   # groups by event_ticker — works for any series
+    signals = _scan_ladder_arb_core(groups, max_contracts, series_tag="econ")
+    if signals:
+        log.info("Economic ladder arb: %d signals across %d groups", len(signals), len(groups))
     return signals
 
 
@@ -2155,8 +2155,22 @@ async def fetch_espn_odds(sport: str, league: str) -> Optional[list]:
     return None
 
 
+def _ml_to_prob(ml: float) -> float:
+    """Convert American moneyline to implied probability (before vig removal)."""
+    if ml < 0:
+        return abs(ml) / (100.0 + abs(ml))
+    return 100.0 / (100.0 + abs(ml))
+
+
 def _parse_espn_win_prob(event: dict) -> Optional[dict]:
-    """Extract win probability from ESPN event data."""
+    """
+    Extract win probability from ESPN event data.
+
+    Priority order (ESPN public API availability):
+      1. competitions[0].predictor — in-game win probability (most accurate when live)
+      2. competitions[0].odds[0].{home|away}TeamOdds.winPercentage — pre-game model
+      3. competitions[0].odds[0].{home|away}TeamOdds.moneyLine — convert to probability
+    """
     try:
         competitions = event.get("competitions", [])
         if not competitions:
@@ -2166,24 +2180,42 @@ def _parse_espn_win_prob(event: dict) -> Optional[dict]:
         if len(competitors) < 2:
             return None
 
-        probs = {}
-        for c in competitors:
-            team = c.get("team", {}).get("shortDisplayName", "?")
-            # ESPN sometimes includes odds
-            odds = comp.get("odds", [{}])
-            if odds and odds[0].get("homeTeamOdds"):
-                if c.get("homeAway") == "home":
-                    ml = odds[0]["homeTeamOdds"].get("moneyLine")
-                    if ml:
-                        prob = abs(ml) / (100 + abs(ml)) if ml < 0 else 100 / (100 + abs(ml))
-                        probs[team] = prob
-                else:
-                    ml = odds[0]["awayTeamOdds"].get("moneyLine")
-                    if ml:
-                        prob = abs(ml) / (100 + abs(ml)) if ml < 0 else 100 / (100 + abs(ml))
-                        probs[team] = prob
+        # Build team name lookup: homeAway → shortDisplayName
+        home_team = next((c.get("team", {}).get("shortDisplayName", "Home")
+                         for c in competitors if c.get("homeAway") == "home"), "Home")
+        away_team = next((c.get("team", {}).get("shortDisplayName", "Away")
+                         for c in competitors if c.get("homeAway") == "away"), "Away")
 
-        return probs if probs else None
+        # ── Source 1: predictor (in-game, most reliable) ──────────────────────
+        predictor = comp.get("predictor", {})
+        home_wp = predictor.get("homeWinPercentage") or predictor.get("homeTeam", {}).get("gameProjection")
+        if home_wp is not None:
+            home_p = float(home_wp) / 100.0 if float(home_wp) > 1.0 else float(home_wp)
+            if 0.01 < home_p < 0.99:
+                return {home_team: home_p, away_team: 1.0 - home_p}
+
+        # ── Source 2: odds.winPercentage ──────────────────────────────────────
+        odds = comp.get("odds", [])
+        if odds:
+            home_wp_pct = odds[0].get("homeTeamOdds", {}).get("winPercentage")
+            if home_wp_pct is not None:
+                home_p = float(home_wp_pct) / 100.0 if float(home_wp_pct) > 1.0 else float(home_wp_pct)
+                if 0.01 < home_p < 0.99:
+                    return {home_team: home_p, away_team: 1.0 - home_p}
+
+            # ── Source 3: moneyline → probability ─────────────────────────────
+            home_ml = odds[0].get("homeTeamOdds", {}).get("moneyLine")
+            away_ml = odds[0].get("awayTeamOdds", {}).get("moneyLine")
+            if home_ml and away_ml:
+                raw_home = _ml_to_prob(float(home_ml))
+                raw_away = _ml_to_prob(float(away_ml))
+                total    = raw_home + raw_away
+                if total > 0.01:
+                    home_p = raw_home / total   # remove vig
+                    if 0.01 < home_p < 0.99:
+                        return {home_team: home_p, away_team: 1.0 - home_p}
+
+        return None
     except Exception:
         return None
 
@@ -2284,7 +2316,7 @@ _FOMC_MEETING_ORDER = ["JUN", "JUL", "SEP", "OCT", "DEC", "JAN"]
 def scan_cross_meeting_coherence(
     markets_data: list[dict],
     prices_data:  dict,
-) -> "list":
+) -> list[Signal]:
     """
     Detect Bayesian coherence violations across KXFED meeting dates.
 
@@ -2296,12 +2328,8 @@ def scan_cross_meeting_coherence(
     this is a coherence violation — signal YES on the earlier meeting (underpriced)
     OR NO on the later meeting (overpriced).
 
-    Returns list[SignalMessage].
+    Returns list[Signal].
     """
-    # Lazy import to avoid circular dependency at module load time.
-    # ep_schema is a top-level module; kalshi_bot.strategy is a sub-package module.
-    # The import works fine at call time once ep_config has bootstrapped sys.path.
-    from ep_schema import SignalMessage  # noqa: PLC0415
 
     min_edge_cents = 8   # minimum gap in cents to generate a signal
     min_fv_gap     = 0.06  # fair_value - market_price must exceed this
@@ -2375,20 +2403,18 @@ def scan_cross_meeting_coherence(
                 fee_e = _fee_adjusted_edge(early_fair, early_price, "yes")
                 if fee_e > 0:
                     try:
-                        sig = SignalMessage(
-                            asset_class       = "kalshi",
-                            strategy          = "cross_meeting_coherence",
+                        _et = early_mkt.get("ticker", "")
+                        sig = Signal(
+                            ticker            = _et,
+                            title             = early_mkt.get("title", _et),
                             category          = "fomc",
-                            ticker            = early_mkt.get("ticker", ""),
-                            exchange          = "kalshi",
                             side              = "yes",
                             market_price      = round(early_price, 4),
                             fair_value        = round(early_fair,  4),
                             edge              = round(early_edge,  4),
                             fee_adjusted_edge = round(fee_e,       4),
+                            contracts         = 1,
                             confidence        = 0.70,
-                            suggested_size    = 1,
-                            kelly_fraction    = 0.02,
                             model_source      = f"cross_meeting_coherence_{early_mon}_vs_{late_mon}",
                             meeting           = early_mkt.get("event_ticker", ""),
                         )
@@ -2396,8 +2422,7 @@ def scan_cross_meeting_coherence(
                         log.info(
                             "Cross-meeting coherence: YES %s  early=%s@%.3f  late=%s@%.3f  "
                             "gap=%.3f  edge=%.3f",
-                            early_mkt.get("ticker", ""), early_mon, early_price,
-                            late_mon, late_price, gap, early_edge,
+                            _et, early_mon, early_price, late_mon, late_price, gap, early_edge,
                         )
                     except Exception as exc:
                         log.debug("cross_meeting_coherence signal build failed: %s", exc)
@@ -2410,20 +2435,18 @@ def scan_cross_meeting_coherence(
                 fee_e = _fee_adjusted_edge(late_fair, late_price, "no")
                 if fee_e > 0:
                     try:
-                        sig = SignalMessage(
-                            asset_class       = "kalshi",
-                            strategy          = "cross_meeting_coherence",
+                        _lt = late_mkt.get("ticker", "")
+                        sig = Signal(
+                            ticker            = _lt,
+                            title             = late_mkt.get("title", _lt),
                             category          = "fomc",
-                            ticker            = late_mkt.get("ticker", ""),
-                            exchange          = "kalshi",
                             side              = "no",
                             market_price      = round(late_price, 4),
                             fair_value        = round(late_fair,  4),
                             edge              = round(late_edge,  4),
                             fee_adjusted_edge = round(fee_e,      4),
+                            contracts         = 1,
                             confidence        = 0.70,
-                            suggested_size    = 1,
-                            kelly_fraction    = 0.02,
                             model_source      = f"cross_meeting_coherence_{early_mon}_vs_{late_mon}",
                             meeting           = late_mkt.get("event_ticker", ""),
                         )
@@ -2431,8 +2454,7 @@ def scan_cross_meeting_coherence(
                         log.info(
                             "Cross-meeting coherence: NO  %s  early=%s@%.3f  late=%s@%.3f  "
                             "gap=%.3f  edge=%.3f",
-                            late_mkt.get("ticker", ""), early_mon, early_price,
-                            late_mon, late_price, gap, late_edge,
+                            _lt, early_mon, early_price, late_mon, late_price, gap, late_edge,
                         )
                     except Exception as exc:
                         log.debug("cross_meeting_coherence signal build failed: %s", exc)
@@ -3012,6 +3034,162 @@ async def scan_rate_path_value(
     return signals
 
 
+# ── YES+NO same-market book arb ───────────────────────────────────────────────
+
+def scan_book_arb(markets: list[dict], min_profit_cents: int = 7) -> list[Signal]:
+    """
+    Scan all open markets for YES+NO pairs where buying both sides locks in a
+    guaranteed profit after Kalshi's 7% fee.
+
+    In a normal market: yes_ask + no_ask ≥ $1.00 (spread > 0).
+    Mispricing occurs on illiquid markets when stale resting sell orders create
+    yes_ask + no_ask < $0.93, i.e. the total cost is below the fee-adjusted payout.
+
+    Guaranteed net profit (worst case):
+      net_yes = (1 - yes_ask) * 0.93 - no_ask
+      net_no  = (1 - no_ask)  * 0.93 - yes_ask
+      locked  = min(net_yes, net_no)
+
+    Only generates signals when locked > min_profit_cents / 100.
+    """
+    signals: list[Signal] = []
+    min_profit = min_profit_cents / 100.0
+
+    for market in markets:
+        if market.get("status", "") != "open":
+            continue
+
+        yes_ask = float(market.get("yes_ask_dollars") or 0)
+        yes_bid = float(market.get("yes_bid_dollars") or 0)
+
+        if yes_ask <= 0.01 or yes_bid <= 0 or yes_ask >= 0.99:
+            continue
+
+        no_ask = 1.0 - yes_bid   # binary market identity: no_ask = 1 - yes_bid
+
+        if no_ask <= 0.01 or no_ask >= 0.99:
+            continue
+
+        net_yes = (1.0 - yes_ask) * (1.0 - 0.07) - no_ask
+        net_no  = (1.0 - no_ask)  * (1.0 - 0.07) - yes_ask
+        locked  = min(net_yes, net_no)
+
+        if locked < min_profit:
+            continue
+
+        ticker = market.get("ticker", "")
+        title  = market.get("title", ticker)
+
+        signals.append(Signal(
+            ticker            = ticker,
+            title             = title,
+            category          = "arb",
+            side              = "yes",
+            fair_value        = 0.5,
+            market_price      = round((yes_ask + no_ask) / 2, 4),
+            edge              = round(locked, 4),
+            fee_adjusted_edge = round(locked, 4),
+            contracts         = 1,
+            confidence        = 0.95,
+            model_source      = "book_arb_yes_no",
+            arb_legs          = [
+                {"ticker": ticker, "side": "yes", "price_cents": int(yes_ask * 100)},
+                {"ticker": ticker, "side": "no",  "price_cents": int(no_ask  * 100)},
+            ],
+        ))
+        log.info(
+            "Book arb: %s  yes_ask=%.2f  no_ask=%.2f  total=%.2f  locked=%.4f",
+            ticker, yes_ask, no_ask, yes_ask + no_ask, locked,
+        )
+
+    signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+    if signals:
+        log.info("Book arb scanner: %d opportunities found", len(signals))
+    return signals
+
+
+# ── Near-resolution decay entry ───────────────────────────────────────────────
+
+def scan_near_resolution(markets: list[dict], max_contracts: int = 2) -> list[Signal]:
+    """
+    Scan for markets priced >95¢ that expire within 6 hours.
+
+    These markets represent nearly-certain outcomes. The remaining premium decays
+    to zero at resolution. Edge comes from the gap between current ask price and the
+    guaranteed $1.00 payout, minus the Kalshi fee on the win.
+
+    Fee-adjusted edge: (1 - yes_ask) * 0.93 - (1 - yes_ask) = -(yes_ask * 0.07)
+    ... that's always negative. The real edge is: time-decay of the remaining premium.
+
+    Actually the bet is:
+      Pay yes_ask, receive $1.00 at resolution if YES.
+      Net payout after fee: (1 - yes_ask) * 0.93
+      Edge = (1 - yes_ask) * 0.93 - (some small residual uncertainty term)
+
+    We only enter when:
+      - yes_ask < 0.98 (not already fully priced, some premium left)
+      - yes_ask > 0.90 (high confidence market, not directional)
+      - hours_to_close < 6.0
+      - market volume >= 50 (enough liquidity to fill)
+    """
+    signals: list[Signal] = []
+    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+    for market in markets:
+        if market.get("status", "") != "open":
+            continue
+
+        close_raw = market.get("close_time") or market.get("expiration_time")
+        if not close_raw:
+            continue
+        try:
+            close_dt = datetime.fromisoformat(close_raw.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        hours_left = (close_dt - now_utc).total_seconds() / 3600.0
+        if hours_left < 0 or hours_left > 6.0:
+            continue
+
+        yes_ask = float(market.get("yes_ask_dollars") or 0)
+        yes_bid = float(market.get("yes_bid_dollars") or 0)
+        vol     = _market_volume(market)
+
+        if yes_ask <= 0.90 or yes_ask >= 0.98 or yes_bid <= 0:
+            continue
+        if vol < 50:
+            continue
+
+        # fair_value = 1.0 (near-certain YES within hours); use _fee_adjusted_edge
+        fee_edge = _fee_adjusted_edge(1.0, yes_ask, "yes")
+        if fee_edge < 0.005:   # at least 0.5¢ net EV
+            continue
+
+        ticker = market.get("ticker", "")
+        title  = market.get("title", ticker)
+        signals.append(Signal(
+            ticker            = ticker,
+            title             = title,
+            category          = "arb",
+            side              = "yes",
+            fair_value        = 1.0,
+            market_price      = yes_ask,
+            edge              = round(1.0 - yes_ask, 4),
+            fee_adjusted_edge = round(fee_edge, 4),
+            contracts         = max(1, min(max_contracts, max(1, int(fee_edge * 50)))),
+            confidence        = min(0.95, 0.90 + (6.0 - hours_left) / 60.0),
+            model_source      = "near_resolution_decay",
+            close_time        = close_raw,
+        ))
+        log.info(
+            "Near-resolution: %s  yes_ask=%.2f  hours=%.1f  net_payout=%.3f",
+            ticker, yes_ask, hours_left, fee_edge,
+        )
+
+    signals.sort(key=lambda s: s.fee_adjusted_edge, reverse=True)
+    return signals
+
+
 # ── Main fetch_signals function ───────────────────────────────────────────────
 
 async def fetch_signals_async(
@@ -3074,6 +3252,20 @@ async def fetch_signals_async(
 
     all_signals: list[Signal] = []
 
+    # 0a. YES+NO same-market book arb (runs on all markets, no feature flag needed)
+    try:
+        book_arb_sigs = scan_book_arb(all_markets)
+        all_signals.extend(book_arb_sigs)
+    except Exception as exc:
+        log.warning("Book arb scan failed: %s", exc)
+
+    # 0b. Near-resolution decay entry (<6h to expiry, >90¢)
+    try:
+        near_res_sigs = scan_near_resolution(all_markets, max_contracts=2)
+        all_signals.extend(near_res_sigs)
+    except Exception as exc:
+        log.warning("Near-resolution scan failed: %s", exc)
+
     # 1. FOMC pure arbitrage (highest confidence, no model needed)
     if enable_fomc:
         try:
@@ -3083,6 +3275,14 @@ async def fetch_signals_async(
                 log.info("FOMC ARB: %d opportunities", len(arb_sigs))
         except Exception as exc:
             log.warning("FOMC arb scan failed: %s", exc)
+
+    # 1b. Economic ladder arb (same invariant as FOMC, applied to CPI/jobs/unemployment/GDP)
+    if enable_economic:
+        try:
+            eco_arb_sigs = scan_economic_ladder_arb(all_markets, max_contracts)
+            all_signals.extend(eco_arb_sigs)
+        except Exception as exc:
+            log.warning("Economic ladder arb scan failed: %s", exc)
 
     # 2. FOMC directional (FRED rate anchor)
     if enable_fomc:
@@ -3207,7 +3407,23 @@ async def fetch_signals_async(
         except Exception as exc:
             log.warning("Cross-series coherence scan failed: %s", exc)
 
-    # 9. Rate-path calendar spread value
+    # 9a. Cross-meeting Bayesian coherence (forward-path monotonicity across FOMC dates)
+    if enable_fomc:
+        try:
+            _prices_snap = {}   # mid prices keyed by ticker — use market data already loaded
+            for _m in fomc_markets:
+                _t = _m.get("ticker", "")
+                if _t:
+                    _prices_snap[_t] = _market_mid(_m)
+            cm_coherence_sigs = scan_cross_meeting_coherence(fomc_markets, _prices_snap)
+            cm_coherence_sigs = [s for s in cm_coherence_sigs if s.fee_adjusted_edge >= edge_threshold * 0.7]
+            all_signals.extend(cm_coherence_sigs)
+            if cm_coherence_sigs:
+                log.info("Cross-meeting coherence: %d signals", len(cm_coherence_sigs))
+        except Exception as exc:
+            log.warning("Cross-meeting coherence scan failed: %s", exc)
+
+    # 9b. Rate-path calendar spread value
     if enable_fomc:
         try:
             rate_path_sigs = await scan_rate_path_value(fomc_markets, max_contracts)
