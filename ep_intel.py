@@ -2226,9 +2226,15 @@ async def intel_main() -> None:
                         _today_str, _blackout_hours, _ANNOUNCE_HOUR, _bl_count,
                     )
 
+            # Weather signals for tickers we already hold are kept as top-up
+            # candidates — Exec evaluates them against the parent position
+            # (same side, fill_confirmed, no pending_exit/topup) and merges
+            # fills via positions.add_contracts. Intel-side dedup would
+            # otherwise starve the top-up path.
             new_signals = [
                 s for s in signals
                 if s.ticker not in current_positions
+                or (getattr(s, "category", "") == "weather")
                 or (
                     getattr(s, "arb_partner", None)
                     and s.arb_partner not in current_positions
