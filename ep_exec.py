@@ -1821,8 +1821,18 @@ async def _exit_checker(
                     except Exception:
                         pass
 
+                # ── Arb-leg guard: exempt locked arb positions from P&L exits ──
+                # Arb legs (butterfly, monotonicity, book_arb) have paired hedges.
+                # Stopping out one leg individually converts a locked profit into
+                # naked directional exposure — the opposite of what arb means.
+                # Only pre-expiry exits and immediate_exit are allowed; those close
+                # the full position at settlement, which is when arb profits realise.
+                _is_arb_leg = bool(pos.get("arb_id")) or (
+                    "_arb" in (pos.get("model_source") or "")
+                )
+
                 # ── Trailing stop ─────────────────────────────────────────────
-                if exit_reason is None:
+                if exit_reason is None and not _is_arb_leg:
                     trailing_stop_cents = _tiered_trailing_stop(trailing_stop_base, _hours_to_close)
                     if (hwm_pnl >= trailing_stop_cents
                             and (hwm_pnl - move_cents) >= trailing_stop_cents):
@@ -1897,11 +1907,11 @@ async def _exit_checker(
                 if exit_reason is None and ticker in _cutloss_tickers:
                     exit_reason = f"cut_loss_intel (signal_reversed, pnl={move_cents:+d}¢)"
 
-                # ── Take-profit / stop-loss ───────────────────────────────────
+                # ── Take-profit / stop-loss (skipped for arb legs) ───────────
                 _effective_tp = _tiered_take_profit(take_profit_cents, _hours_to_close)
-                if exit_reason is None and move_cents >= _effective_tp:
+                if exit_reason is None and not _is_arb_leg and move_cents >= _effective_tp:
                     exit_reason = f"take_profit (+{move_cents}¢, tp={_effective_tp}¢)"
-                elif exit_reason is None and move_cents <= -stop_loss_cents:
+                elif exit_reason is None and not _is_arb_leg and move_cents <= -stop_loss_cents:
                     # Suppress stop-loss within N days of resolution on Kalshi
                     # contracts — prediction markets resolve to 0 or 100¢, so
                     # a correct directional bet should hold through noise.
@@ -2086,6 +2096,25 @@ return cnt
                                 "Exit order resting: %s  offer=%d¢  order_id=%.8s",
                                 ticker, _offer, _exit_order_id,
                             )
+                            # Mark arb siblings for immediate_exit on the next cycle.
+                            # The arb-group sweep below is skipped for live resting orders,
+                            # so we set the flag here; fill_poll confirms this leg's fill
+                            # while the next exit_checker cycle closes the siblings.
+                            _pending_arb_id = pos.get("arb_id")
+                            if _pending_arb_id:
+                                for _sib_t, _sib_p in list(current_positions.items()):
+                                    if _sib_t == ticker or _sib_p.get("arb_id") != _pending_arb_id:
+                                        continue
+                                    if not _sib_p.get("immediate_exit"):
+                                        await positions.update_fields(_sib_t, {
+                                            "immediate_exit":        True,
+                                            "immediate_exit_reason": f"arb_sibling_exiting ({ticker})",
+                                        })
+                                        log.info(
+                                            "[ARB-ATOM] Sibling %s flagged immediate_exit "
+                                            "(primary %s exit resting)",
+                                            _sib_t, ticker,
+                                        )
                             continue  # skip positions.close and arb-group exit below
 
                     # ── Arb-group atomicity: when any leg of a butterfly stops out,

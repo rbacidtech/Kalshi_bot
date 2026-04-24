@@ -590,6 +590,9 @@ class Executor:
 
             exit_reason = None
 
+            # Arb legs must not be stopped out individually — their hedge is the other leg.
+            _is_arb_leg = bool(pos.get("arb_id")) or ("_arb" in (pos.get("model_source") or ""))
+
             # Hours-before-close check using pre-built map
             close_time_str = close_time_map.get(ticker)
             if close_time_str:
@@ -609,19 +612,19 @@ class Executor:
                 except Exception as exc:
                     log.debug('close_time parse error: %s', exc)
 
-            # Take profit
+            # Take profit / stop loss — skipped for arb legs
             fv_cents  = int(pos.get("fair_value", 0.80) * 100)
             tp_target = max(self.take_profit_cents, int((fv_cents - entry_cents) * 0.50))
             sl_pct   = 0.50 if entry_cents < 30 else 0.30 if entry_cents < 60 else 0.20
             sl_cents = max(self.stop_loss_cents, int(entry_cents * sl_pct))
-            if exit_reason is None and move_cents >= tp_target:
+            if exit_reason is None and not _is_arb_leg and move_cents >= tp_target:
                 exit_reason = f"take profit (+{move_cents}¢ of {tp_target}¢ target)"
 
-            elif exit_reason is None and move_cents <= -sl_cents:
+            elif exit_reason is None and not _is_arb_leg and move_cents <= -sl_cents:
                 exit_reason = f"stop loss ({move_cents}¢ of -{sl_cents}¢ threshold)"
 
-            # Model reversal: updated fair value now favors the other side
-            elif exit_reason is None and ticker in fv_map:
+            # Model reversal — also skipped for arb legs (no model drives them)
+            elif exit_reason is None and not _is_arb_leg and ticker in fv_map:
                 updated_fv = fv_map[ticker].fair_value
                 original_fv = pos["fair_value"]
                 if side == "yes" and updated_fv < (original_fv - 0.10):
