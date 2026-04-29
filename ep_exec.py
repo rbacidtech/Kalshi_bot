@@ -1542,24 +1542,27 @@ async def _sync_positions_with_kalshi(
                 (_exit_cents - _res_entry) * _res_qty if _res_side in ("yes", "buy")
                 else (_res_entry - _exit_cents) * _res_qty
             )
-            # Postgres position_history (deduped by entry_exec_id via ON CONFLICT DO NOTHING)
-            if _res_exec_id:
-                try:
-                    _audit_writer().write("position_history", {
-                        "entry_exec_id":      _res_exec_id,
-                        "ticker":             ticker,
-                        "side":               _res_side,
-                        "contracts":          _res_qty,
-                        "entry_cents":        _res_entry,
-                        "exit_cents":         _exit_cents,
-                        "realized_pnl_cents": _res_pnl,
-                        "exit_reason":        f"market_resolved_{_res_result}",
-                        "entered_at":         pos.get("entered_at"),
-                        "exited_at":          datetime.now(timezone.utc).isoformat(),
-                    })
-                except Exception as exc:
-                    log.error("Position sync: position_history write failed for %s "
-                              "(exec_id=%s): %s", ticker, _res_exec_id, exc)
+            # Postgres position_history. Write even when exec_id is missing —
+            # the entry_exec_id column was made nullable on 2026-04-29 and
+            # `strategy` is now the fallback attribution path for the
+            # terminal_trades view's COALESCE.
+            try:
+                _audit_writer().write("position_history", {
+                    "entry_exec_id":      _res_exec_id or None,
+                    "ticker":             ticker,
+                    "side":               _res_side,
+                    "contracts":          _res_qty,
+                    "entry_cents":        _res_entry,
+                    "exit_cents":         _exit_cents,
+                    "realized_pnl_cents": _res_pnl,
+                    "exit_reason":        f"market_resolved_{_res_result}",
+                    "entered_at":         pos.get("entered_at"),
+                    "exited_at":          datetime.now(timezone.utc).isoformat(),
+                    "strategy":           pos.get("model_source") or "unknown",
+                })
+            except Exception as exc:
+                log.error("Position sync: position_history write failed for %s "
+                          "(exec_id=%s): %s", ticker, _res_exec_id, exc)
             # CSV (for get_performance_summary / ep_resolution_db)
             try:
                 from kalshi_bot.strategy import Signal as _KSig
@@ -2559,24 +2562,28 @@ return cnt
                         mode          = "paper" if cfg.PAPER_TRADE else "live",
                     )
 
-                    # Write to Postgres position_history for Kelly calibration
+                    # Write to Postgres position_history for Kelly calibration.
+                    # Pre-2026-04-29 this was gated on `if _exec_id:` and lost
+                    # ~93% of fills (top-up positions, arb legs, adopted
+                    # positions). entry_exec_id is now nullable; strategy is
+                    # the fallback attribution path.
                     _exec_id = pos.get("exec_id", "")
-                    if _exec_id:
-                        try:
-                            _audit_writer().write("position_history", {
-                                "entry_exec_id":     _exec_id,
-                                "ticker":            ticker,
-                                "side":              side,
-                                "contracts":         contracts,
-                                "entry_cents":       entry_cents,
-                                "exit_cents":        current_cents,
-                                "realized_pnl_cents": pnl_cents,
-                                "exit_reason":       exit_reason,
-                                "entered_at":        pos.get("entered_at"),
-                                "exited_at":         datetime.now(timezone.utc).isoformat(),
-                            })
-                        except Exception:
-                            pass
+                    try:
+                        _audit_writer().write("position_history", {
+                            "entry_exec_id":     _exec_id or None,
+                            "ticker":            ticker,
+                            "side":              side,
+                            "contracts":         contracts,
+                            "entry_cents":       entry_cents,
+                            "exit_cents":        current_cents,
+                            "realized_pnl_cents": pnl_cents,
+                            "exit_reason":       exit_reason,
+                            "entered_at":        pos.get("entered_at"),
+                            "exited_at":         datetime.now(timezone.utc).isoformat(),
+                            "strategy":          pos.get("model_source") or "unknown",
+                        })
+                    except Exception:
+                        pass
 
         except asyncio.CancelledError:
             raise
@@ -2678,22 +2685,22 @@ async def _fill_poll_loop(
                             await positions.close(ticker)
                             log.info("EXIT FILLED ✓ %s  order_id=%.8s", ticker, exit_oid)
 
-                        if _lf_exec_id:
-                            try:
-                                _audit_writer().write("position_history", {
-                                    "entry_exec_id":      _lf_exec_id,
-                                    "ticker":             ticker,
-                                    "side":               _lf_side,
-                                    "contracts":          _lf_fill,
-                                    "entry_cents":        _lf_entry,
-                                    "exit_cents":         _lf_cents,
-                                    "realized_pnl_cents": _lf_pnl,
-                                    "exit_reason":        _lf_reason,
-                                    "entered_at":         pos.get("entered_at"),
-                                    "exited_at":          datetime.now(timezone.utc).isoformat(),
-                                })
-                            except Exception:
-                                pass
+                        try:
+                            _audit_writer().write("position_history", {
+                                "entry_exec_id":      _lf_exec_id or None,
+                                "ticker":             ticker,
+                                "side":               _lf_side,
+                                "contracts":          _lf_fill,
+                                "entry_cents":        _lf_entry,
+                                "exit_cents":         _lf_cents,
+                                "realized_pnl_cents": _lf_pnl,
+                                "exit_reason":        _lf_reason,
+                                "entered_at":         pos.get("entered_at"),
+                                "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                "strategy":           pos.get("model_source") or "unknown",
+                            })
+                        except Exception:
+                            pass
 
                         if bus is not None:
                             try:
@@ -3114,22 +3121,22 @@ async def _fill_poll_loop(
                             ticker, order_id,
                         )
                         _exec_id = pos.get("exec_id", "")
-                        if _exec_id:
-                            try:
-                                _audit_writer().write("position_history", {
-                                    "entry_exec_id":      _exec_id,
-                                    "ticker":             ticker,
-                                    "side":               pos.get("side", ""),
-                                    "contracts":          pos.get("contracts", 0),
-                                    "entry_cents":        pos.get("entry_cents", 0),
-                                    "exit_cents":         pos.get("entry_cents", 0),
-                                    "realized_pnl_cents": 0,
-                                    "exit_reason":        "cancel_external",
-                                    "entered_at":         pos.get("entered_at"),
-                                    "exited_at":          datetime.now(timezone.utc).isoformat(),
-                                })
-                            except Exception:
-                                pass
+                        try:
+                            _audit_writer().write("position_history", {
+                                "entry_exec_id":      _exec_id or None,
+                                "ticker":             ticker,
+                                "side":               pos.get("side", ""),
+                                "contracts":          pos.get("contracts", 0),
+                                "entry_cents":        pos.get("entry_cents", 0),
+                                "exit_cents":         pos.get("entry_cents", 0),
+                                "realized_pnl_cents": 0,
+                                "exit_reason":        "cancel_external",
+                                "entered_at":         pos.get("entered_at"),
+                                "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                "strategy":           pos.get("model_source") or "unknown",
+                            })
+                        except Exception:
+                            pass
                         # Pop from in-memory dict first so exit_checker can't fire
                         # in the window between Redis delete and executor pop.
                         if executor is not None:
@@ -3163,22 +3170,22 @@ async def _fill_poll_loop(
                                             ticker, _del_exc,
                                         )
                                     _exec_id = pos.get("exec_id", "")
-                                    if _exec_id:
-                                        try:
-                                            _audit_writer().write("position_history", {
-                                                "entry_exec_id":      _exec_id,
-                                                "ticker":             ticker,
-                                                "side":               pos.get("side", ""),
-                                                "contracts":          pos.get("contracts", 0),
-                                                "entry_cents":        pos.get("entry_cents", 0),
-                                                "exit_cents":         pos.get("entry_cents", 0),
-                                                "realized_pnl_cents": 0,
-                                                "exit_reason":        f"cancel_timeout_{_age_h:.1f}h",
-                                                "entered_at":         pos.get("entered_at"),
-                                                "exited_at":          datetime.now(timezone.utc).isoformat(),
-                                            })
-                                        except Exception:
-                                            pass
+                                    try:
+                                        _audit_writer().write("position_history", {
+                                            "entry_exec_id":      _exec_id or None,
+                                            "ticker":             ticker,
+                                            "side":               pos.get("side", ""),
+                                            "contracts":          pos.get("contracts", 0),
+                                            "entry_cents":        pos.get("entry_cents", 0),
+                                            "exit_cents":         pos.get("entry_cents", 0),
+                                            "realized_pnl_cents": 0,
+                                            "exit_reason":        f"cancel_timeout_{_age_h:.1f}h",
+                                            "entered_at":         pos.get("entered_at"),
+                                            "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                            "strategy":           pos.get("model_source") or "unknown",
+                                        })
+                                    except Exception:
+                                        pass
                                     if executor is not None:
                                         executor._positions.pop(ticker, None)
                                     await positions.close(ticker)

@@ -71,10 +71,13 @@ CREATE TABLE IF NOT EXISTS llm_decisions (
 CREATE INDEX IF NOT EXISTS idx_llm_decided ON llm_decisions (decided_at DESC);
 
 -- Position lifecycle (one row per closed position — used for Kelly calibration)
--- entry_exec_id links back to the fill row in executions (no FK — same async reason as signal_id)
+-- entry_exec_id links back to the fill row in executions (no FK — same async reason
+-- as signal_id; nullable since 2026-04-29 to allow rows for adopted/top-up/arb-leg
+-- positions whose entry didn't go through the standard signal pipeline).
+-- strategy is the fallback attribution when entry_exec_id is NULL or doesn't match.
 CREATE TABLE IF NOT EXISTS position_history (
     hist_id              BIGSERIAL PRIMARY KEY,
-    entry_exec_id        UUID NOT NULL,
+    entry_exec_id        UUID,                          -- nullable since 2026-04-29
     ticker               TEXT NOT NULL,
     side                 TEXT NOT NULL,
     contracts            INTEGER NOT NULL,
@@ -83,39 +86,47 @@ CREATE TABLE IF NOT EXISTS position_history (
     realized_pnl_cents   BIGINT NOT NULL,
     exit_reason          TEXT,
     entered_at           TIMESTAMPTZ,
-    exited_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+    exited_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    strategy             TEXT                           -- added 2026-04-29
 );
-CREATE INDEX IF NOT EXISTS idx_poshistory_exec    ON position_history (entry_exec_id);
-CREATE INDEX IF NOT EXISTS idx_poshistory_exited  ON position_history (exited_at DESC);
-CREATE INDEX IF NOT EXISTS idx_poshistory_ticker  ON position_history (ticker, exited_at DESC);
+CREATE INDEX IF NOT EXISTS idx_poshistory_exec     ON position_history (entry_exec_id);
+CREATE INDEX IF NOT EXISTS idx_poshistory_exited   ON position_history (exited_at DESC);
+CREATE INDEX IF NOT EXISTS idx_poshistory_ticker   ON position_history (ticker, exited_at DESC);
+CREATE INDEX IF NOT EXISTS idx_poshistory_strategy ON position_history (strategy, exited_at DESC);
 
 -- Terminal-trades view: join signal metadata → fill → outcome for Kelly recalibration.
 -- "Terminal" exits (resolution, pre-expiry) give clean empirical win rates per edge bucket.
-CREATE OR REPLACE VIEW terminal_trades AS
+-- LEFT JOIN since 2026-04-29: includes position_history rows whose entry_exec_id is
+-- NULL or doesn't match an executions row. strategy falls back to position_history.strategy
+-- via COALESCE so kelly calibration sees per-strategy data even for adopted / arb-leg
+-- positions that bypass the standard signal pipeline.
+DROP VIEW IF EXISTS terminal_trades;
+CREATE VIEW terminal_trades AS
 SELECT
-    s.signal_id,
-    s.strategy,
-    s.asset_class,
-    s.ticker,
+    e.signal_id,
+    COALESCE(s.strategy, ph.strategy, 'unknown')              AS strategy,
+    COALESCE(s.asset_class, 'kalshi')                         AS asset_class,
+    ph.ticker,
     s.emitted_at,
-    s.edge                          AS stated_edge,
-    s.confidence                    AS stated_confidence,
-    s.market_price                  AS entry_price,
-    e.fill_price                    AS actual_entry,
+    s.edge                                                    AS stated_edge,
+    s.confidence                                              AS stated_confidence,
+    s.market_price                                            AS entry_price,
+    COALESCE(e.fill_price, ph.entry_cents::numeric / 100.0)   AS actual_entry,
     ph.contracts,
-    ph.exit_cents / 100.0           AS actual_exit,
+    ph.exit_cents::numeric / 100.0                            AS actual_exit,
     ph.realized_pnl_cents,
     ph.exit_reason,
     ph.exited_at,
     CASE WHEN ph.exit_reason IN ('resolution', 'pre_expiry_full', 'near_certain_resolve')
-         THEN true ELSE false END   AS is_terminal,
+         THEN true ELSE false END                             AS is_terminal,
     -- Return as a fraction of entry cost (positive = win, negative = loss)
-    (ph.exit_cents - (e.fill_price * 100)) / NULLIF(e.fill_price * 100, 0) AS return_frac
-FROM signals s
-JOIN executions e USING (signal_id)
-JOIN position_history ph ON ph.entry_exec_id = e.exec_id
-WHERE e.status = 'filled'
-  AND ph.exited_at IS NOT NULL;
+    (ph.exit_cents::numeric - COALESCE(e.fill_price * 100, ph.entry_cents::numeric)) /
+        NULLIF(COALESCE(e.fill_price * 100, ph.entry_cents::numeric), 0) AS return_frac
+FROM position_history ph
+LEFT JOIN executions e ON e.exec_id = ph.entry_exec_id
+LEFT JOIN signals    s ON s.signal_id = e.signal_id
+WHERE ph.exited_at IS NOT NULL
+  AND (e.status IS NULL OR e.status = 'filled');
 
 -- Market snapshot: every market Intel sees every 120 s scan cycle.
 -- This is the backtest dataset — all open Kalshi markets, bid/ask/mid/spread/volume,

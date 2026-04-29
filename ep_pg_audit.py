@@ -241,7 +241,7 @@ class PgAuditWriter:
             except Exception:
                 exited_at = datetime.now(timezone.utc)
             records.append((
-                r.get("entry_exec_id"),
+                r.get("entry_exec_id"),    # nullable since 2026-04-29 schema relaxation
                 r.get("ticker", ""),
                 r.get("side", ""),
                 r.get("contracts", 0),
@@ -251,14 +251,17 @@ class PgAuditWriter:
                 r.get("exit_reason"),
                 entered_at,
                 exited_at or datetime.now(timezone.utc),
+                r.get("strategy"),         # added 2026-04-29 — used by terminal_trades
+                                            # view's COALESCE when entry_exec_id is NULL
+                                            # or doesn't match an executions row
             ))
         async with self._pool.acquire() as conn:
             await conn.executemany(
                 """
                 INSERT INTO position_history
                     (entry_exec_id, ticker, side, contracts, entry_cents, exit_cents,
-                     realized_pnl_cents, exit_reason, entered_at, exited_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                     realized_pnl_cents, exit_reason, entered_at, exited_at, strategy)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                 ON CONFLICT DO NOTHING
                 """,
                 records,
