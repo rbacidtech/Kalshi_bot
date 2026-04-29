@@ -18,7 +18,7 @@ import os
 import statistics
 import time
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional
 
 from ep_config import cfg, NODE_ID, REDIS_URL, EP_PRICES, log, sd_notify
@@ -616,6 +616,24 @@ async def _release_monitor_loop(bus: RedisBus) -> None:
             _src_health.mark_ok("bls_cpi")
         if _rel_existing.get("NFP"):
             _src_health.mark_ok("bls_nfp")
+    except Exception:
+        pass
+
+    # Calendar fallback: ep:releases is only written during an active
+    # release-window poll, so a fresh Redis (or a deploy that missed the
+    # window) leaves BLS sources at last_success=0 → status=stale/age=None
+    # for the rest of the month. Seed from the most recent past calendar entry.
+    try:
+        _today = datetime.now(timezone.utc).date()
+        for _src_name, _series in (("bls_cpi", "CPI"), ("bls_nfp", "NFP")):
+            _most_recent = max(
+                (date(_today.year, _m, _d)
+                 for (_m, _d, _t, _) in _RELEASE_CALENDAR_2026
+                 if _t == _series and date(_today.year, _m, _d) <= _today),
+                default=None,
+            )
+            if _most_recent and (_today - _most_recent).days <= 35:
+                _src_health.mark_ok(_src_name)
     except Exception:
         pass
 
