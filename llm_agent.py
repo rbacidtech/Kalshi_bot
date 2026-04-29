@@ -251,6 +251,16 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
             })
 
             if rep.get("status") == "filled":
+                # Filter out synthesized exit reports. Exits at ep_exec.py:2493
+                # (and similar paths) reuse `edge_captured` to store dollar realized
+                # PnL, while entries store per-contract decimal edge. Summing them
+                # together produces incoherent values that can swing the advisor's
+                # `recent_pnl_edge` by thousands while real PnL is small. Entry
+                # fills always carry signal_id and cost_cents>0; synthesized exits
+                # leave both empty.
+                _is_entry = bool(rep.get("signal_id")) and rep.get("cost_cents", 0) > 0
+                if not _is_entry:
+                    continue
                 fills        += 1
                 edge          = float(rep.get("edge_captured", 0))
                 pnl_edge_sum += edge
