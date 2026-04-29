@@ -128,7 +128,7 @@ Adjustment rules:
   llm_rsi_oversold, llm_rsi_overbought, llm_z_threshold, llm_max_contracts
 - confidence < 0.80 → set adjustment to null (operator decides)
 - HALT_TRADING="1" requires confidence ≥ 0.95; never suggest "0" (only operators un-halt)
-- Reduce llm_kelly_fraction only when a strategy has ≥ 5 recent trades AND is degrading AND recent_pnl_cents ≤ 0
+- Reduce llm_kelly_fraction only when a strategy has ≥ 5 recent trades AND is degrading AND recent_pnl_cents ≤ 0 AND days_since_last_trade ≤ 3 (a strategy that has not entered a new position in days is dormant; its historical performance is not actionable — disable it via a different mechanism instead of trimming kelly)
 - Never suggest llm_kelly_fraction > 0.35 or llm_scale_factor > 1.5
 
 Strategy health interpretation:
