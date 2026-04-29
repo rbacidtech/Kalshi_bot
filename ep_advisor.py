@@ -138,6 +138,7 @@ Strategy health interpretation:
 - FOMC win rates are typically 10-25% (large asymmetric payoffs); 0% recent ≠ broken
 - avg_pnl_cents is more reliable than win_rate for FOMC strategies
 - fomc > 60% of total exposure is NORMAL for this bot; do NOT raise critical for this alone
+- weather > 60% of total exposure is the typical state of this bot since the weather scanner became the primary profitable strategy; do NOT trim kelly purely for weather concentration if the strategy is profitable (recent_pnl_cents > 0)
 
 Data quality (data_quality field in context):
 - Each source has status: "ok", "stale", "missing", or "error"

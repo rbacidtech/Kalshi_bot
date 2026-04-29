@@ -690,6 +690,12 @@ def get_concentration_metrics(positions: dict) -> dict:
             return "arb"
         if "gdp" in src:
             return "gdp"
+        # Weather sources: NOAA, GFS, Open-Meteo (used by gfs+noaa_hourly,
+        # noaa_nws+open_meteo, open_meteo). Without this branch, KXHIGHCHI/
+        # KXHIGHNY/KXTEMP* positions fall through to "other" and dominate
+        # the bogus-name category in concentration warnings.
+        if "noaa" in src or "gfs" in src or "open_meteo" in src:
+            return "weather"
         series = (ticker.split("-")[0] if "-" in ticker else ticker).upper()
         if series.startswith("KXFED"):
             return "fomc"
@@ -697,6 +703,8 @@ def get_concentration_metrics(positions: dict) -> dict:
             return "btc"
         if series.startswith("KXGDP"):
             return "gdp"
+        if series.startswith("KXHIGH") or series.startswith("KXTEMP"):
+            return "weather"
         return "other"
 
     total_exp: int = 0
