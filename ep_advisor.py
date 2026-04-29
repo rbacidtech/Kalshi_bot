@@ -128,7 +128,7 @@ Adjustment rules:
   llm_rsi_oversold, llm_rsi_overbought, llm_z_threshold, llm_max_contracts
 - confidence < 0.80 → set adjustment to null (operator decides)
 - HALT_TRADING="1" requires confidence ≥ 0.95; never suggest "0" (only operators un-halt)
-- Reduce llm_kelly_fraction only when a strategy has ≥ 5 recent trades AND is degrading AND recent_pnl_cents ≤ 0 AND days_since_last_trade ≤ 3 (a strategy that has not entered a new position in days is dormant; its historical performance is not actionable — disable it via a different mechanism instead of trimming kelly)
+- Do NOT reduce llm_kelly_fraction unless at least one specific strategy satisfies ALL FOUR conditions: (a) recent_n ≥ 5, (b) status="degrading", (c) recent_pnl_cents ≤ 0, (d) days_since_last_trade ≤ 3. If no strategy satisfies all four, the adjustment for llm_kelly_fraction MUST be null. Concentration warnings, dormant-strategy decay, and category-mix concerns are NOT sufficient on their own — those should be flagged as alerts, not used to justify a kelly trim.
 - Never suggest llm_kelly_fraction > 0.35 or llm_scale_factor > 1.5
 
 Strategy health interpretation:
@@ -138,7 +138,7 @@ Strategy health interpretation:
 - FOMC win rates are typically 10-25% (large asymmetric payoffs); 0% recent ≠ broken
 - avg_pnl_cents is more reliable than win_rate for FOMC strategies
 - fomc > 60% of total exposure is NORMAL for this bot; do NOT raise critical for this alone
-- weather > 60% of total exposure is the typical state of this bot since the weather scanner became the primary profitable strategy; do NOT trim kelly purely for weather concentration if the strategy is profitable (recent_pnl_cents > 0)
+- weather > 60% of total exposure is the typical state of this bot since the weather scanner became the primary profitable strategy; concentration in the weather category is NOT a reason to trim kelly when weather strategies are profitable — it is at most a "concentration" alert
 
 Data quality (data_quality field in context):
 - Each source has status: "ok", "stale", "missing", or "error"
