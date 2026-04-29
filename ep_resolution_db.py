@@ -625,18 +625,21 @@ async def get_rolling_strategy_health(
             else:
                 status = "stable"
 
-        # Days since the strategy's most recent closed trade. Used by the
-        # advisor's _check_escalation to skip dormant strategies — historical
-        # trade performance shouldn't drive current escalation if the scanner
-        # has stopped firing (e.g., disabled in code but old trades still in
-        # the rolling window).
+        # Days since the strategy's most recent ENTRY (i.e. signal that fired
+        # and got executed). Used by the advisor's _check_escalation to skip
+        # dormant strategies — historical trade performance shouldn't drive
+        # current escalation if the scanner stopped firing (e.g., disabled in
+        # code but old trades' exits are still streaming as positions close).
+        # Must use entry_ts not exit_ts: a disabled scanner can still produce
+        # recent exit_ts values for hours/days as old positions resolve.
         days_since_last_trade: Optional[float] = None
         if recent:
-            last_exit = recent[-1].get("exit_ts")
-            if last_exit is not None:
+            entry_timestamps = [t.get("entry_ts") for t in recent if t.get("entry_ts")]
+            if entry_timestamps:
+                last_entry = max(entry_timestamps)
                 try:
                     days_since_last_trade = round(
-                        (now - last_exit).total_seconds() / 86400, 2
+                        (now - last_entry).total_seconds() / 86400, 2
                     )
                 except (TypeError, AttributeError):
                     pass
