@@ -1083,7 +1083,7 @@ def _extract_om_target(resp_json: dict, target: _date) -> Optional[dict]:
     def _v(key):
         vals = daily.get(key, [])
         return vals[idx] if idx < len(vals) else None
-    return {
+    out = {
         "high":       _v("temperature_2m_max"),
         "low":        _v("temperature_2m_min"),
         "precip":     _v("precipitation_sum"),
@@ -1091,6 +1091,12 @@ def _extract_om_target(resp_json: dict, target: _date) -> Optional[dict]:
         "days_ahead": (_date.today() - target).days * -1,
         "source":     "open_meteo",
     }
+    # Treat all-None forecast as no-data (observed for ecmwf_ifs04 in 2026-04
+    # before the model name fix). Returning None lets ep:health correctly
+    # mark_fail instead of silently flagging the source ok with empty values.
+    if out["high"] is None and out["low"] is None and out["precip"] is None:
+        return None
+    return out
 
 
 async def fetch_open_meteo(
@@ -1156,7 +1162,11 @@ async def fetch_open_meteo_ecmwf(
             "precipitation_unit": "inch",
             "timezone":           tz,
             "forecast_days":      8,
-            "models":             "ecmwf_ifs04",
+            # Open-Meteo's ifs04 (0.4° grid) silently returns all-None values
+            # as of 2026-04. ifs025 is the current production 0.25° grid and
+            # returns valid data; switch matches Open-Meteo's recommended model
+            # name and restores ECMWF's weight=1.3 contribution to mean_temp.
+            "models":             "ecmwf_ifs025",
         }
         resp = await http.get("https://api.open-meteo.com/v1/forecast", params=params)
         if resp.status_code != 200:
