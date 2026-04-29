@@ -94,6 +94,15 @@ _SOURCES: Dict[str, DataSource] = {
     "bls_cpi":       DataSource("bls_cpi",       stale_seconds=86400 * 35,  critical=False),  # monthly
     "bls_nfp":       DataSource("bls_nfp",       stale_seconds=86400 * 35,  critical=False),
 
+    # ── Weather forecast sources ─────────────────────────────────────────────
+    # Open-Meteo daily endpoints update hourly; NWS hourly forecast refreshes
+    # 12x/day; NWS daily forecast a few times per day. 1800s catches a fully
+    # silent fetcher within ~30 min while tolerating cache hits.
+    "om_gfs":        DataSource("om_gfs",        stale_seconds=1800,        critical=False),
+    "om_ecmwf":      DataSource("om_ecmwf",      stale_seconds=1800,        critical=False),
+    "noaa_nws":      DataSource("noaa_nws",      stale_seconds=3600,        critical=False),
+    "noaa_hourly":   DataSource("noaa_hourly",   stale_seconds=1800,        critical=False),
+
     # ── Infrastructure ───────────────────────────────────────────────────────
     # Intel loop is 120s; 150s threshold avoids false-stale between cycles
     "redis":         DataSource("redis",         stale_seconds=150,         critical=True),

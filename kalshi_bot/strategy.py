@@ -1014,6 +1014,7 @@ def scan_crypto_price_markets(
 
 import math as _math
 from datetime import date as _date
+from zoneinfo import ZoneInfo as _ZoneInfo
 
 WEATHER_SERIES = {
     "KXHIGHNY":  {"lat": 40.7128, "lon": -74.0060,  "tz": "America/New_York",    "wfo": "OKX", "x": 33,  "y": 37, "type": "high_temp"},
@@ -1342,12 +1343,22 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         today = _date.today()
         if target < today:
             continue   # already resolved
+        # Skip same-day signals after the day's extreme has typically formed.
+        # _temp_prob_above uses static forecast + 2.5°F sigma with no
+        # observed-max input, so post-peak topups buy stale edge against a
+        # market that's already seen the realised high/low.
+        _now_local = datetime.now(_ZoneInfo(cfg["tz"]))
+        if target == _now_local.date():
+            _ttype = cfg.get("type", "")
+            _cutoff_h = 17 if _ttype == "high_temp" else 10 if _ttype == "low_temp" else None
+            if _cutoff_h is not None and _now_local.hour >= _cutoff_h:
+                log.info(
+                    "Weather: same-day %s past %d:00 local — skipping %s (now=%d:%02d %s)",
+                    _ttype, _cutoff_h, ticker,
+                    _now_local.hour, _now_local.minute, cfg["tz"],
+                )
+                continue
         days_ahead = (target - today).days
-        # Day-of weather markets used to be skipped here because the exit loop
-        # fired pre_expiry_t1 immediately on entry. That path is now guarded
-        # for weather (ep_exec._is_weather_ticker), so same-day is fine —
-        # often the highest-conviction signal because day-of forecast has the
-        # lowest uncertainty.
 
         # RFC3339 close_time: end of target date in UTC (weather markets close at 23:59 local ≈ midnight UTC next day)
         _close_dt = datetime(target.year, target.month, target.day, 23, 59, 59, tzinfo=timezone.utc)
@@ -1362,6 +1373,20 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
             fetch_noaa_hourly(cfg["wfo"], cfg["x"], cfg["y"]),
             return_exceptions=True,
         )
+        # Record per-source health so silent fetcher failures surface in ep:health.
+        try:
+            from ep_health import health as _wx_health  # noqa: PLC0415
+            for _hname, _hres in zip(
+                ("om_gfs", "om_ecmwf", "noaa_nws", "noaa_hourly"), _results,
+            ):
+                if isinstance(_hres, BaseException):
+                    _wx_health.mark_fail(_hname, str(_hres)[:80])
+                elif _hres is None:
+                    _wx_health.mark_fail(_hname, "empty response")
+                else:
+                    _wx_health.mark_ok(_hname)
+        except Exception:
+            pass  # ep_health unavailable (e.g. unit tests) — fail soft
         om_gfs, om_ecmwf, _nws_daily_raw, _nws_hourly_raw = (
             None if isinstance(r, Exception) else r for r in _results
         )
