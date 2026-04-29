@@ -1,0 +1,20 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "exclude": [
+    ".venv",
+    "**/__pycache__",
+    "**/node_modules",
+    "dashboard/dist",
+    "dashboard/node_modules",
+    "alembic/versions"
+  ],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownVariableType": "none",
+  "reportGeneralTypeIssues": "warning",
+  "reportPossiblyUnboundVariable": "warning"
+}
