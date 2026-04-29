@@ -389,13 +389,19 @@ def _check_escalation(ctx: Dict[str, Any]) -> list:
 
 # ── Auto-apply safety ─────────────────────────────────────────────────────────
 
-def _validate_adjustment(adj: dict, current: Optional[dict] = None) -> Optional[str]:
+def _validate_adjustment(
+    adj: dict,
+    current: Optional[dict] = None,
+    strategy_health: Optional[dict] = None,
+) -> Optional[str]:
     """
     Validate an adjustment dict from Claude.
     Returns an error string if invalid, or None if it passes all checks.
 
     `current`: optional dict of current ep:config values (bytes or str).
     When provided, enforces the per-cycle max_delta clamp.
+    `strategy_health`: when provided, enforces the kelly-trim quorum rule
+    in code regardless of what the LLM decided.
     """
     key   = adj.get("key", "")
     value = str(adj.get("value", "")).strip()
@@ -444,6 +450,42 @@ def _validate_adjustment(adj: dict, current: Optional[dict] = None) -> Optional[
                         )
                 except (ValueError, TypeError):
                     pass  # current value not numeric; skip delta check
+
+    # Mechanical kelly-trim quorum: reject kelly REDUCTIONS unless at least
+    # one strategy in strategy_health satisfies all four trim conditions
+    # (recent_n ≥ 5, status="degrading", recent_pnl_cents ≤ 0,
+    # days_since_last_trade ≤ 3). This enforces the prompt rule in code so
+    # the LLM cannot rationalize past it. Increases / equality are not
+    # gated. Skipped if strategy_health is unavailable (defensive default
+    # to allow trim — no info means no enforcement).
+    if key == "llm_kelly_fraction" and strategy_health and current is not None:
+        try:
+            cur_raw = current.get(key) or current.get(key.encode())
+            if isinstance(cur_raw, bytes):
+                cur_raw = cur_raw.decode()
+            cur_v = float(cur_raw) if cur_raw else None
+            new_v = float(value)
+            if cur_v is not None and new_v < cur_v:
+                qualifies = False
+                for strat, h in strategy_health.items():
+                    if (
+                        h.get("status") == "degrading"
+                        and (h.get("recent_n", 0) or 0) >= 5
+                        and (h.get("recent_pnl_cents", 0) or 0) <= 0
+                        and (h.get("days_since_last_trade") is not None
+                             and h.get("days_since_last_trade") <= 3)
+                    ):
+                        qualifies = True
+                        break
+                if not qualifies:
+                    return (
+                        "kelly trim rejected: no strategy satisfies the four "
+                        "trim conditions (degrading + recent_n≥5 + pnl≤0 + "
+                        "days_since_last_trade≤3). Adjust scale_factor or alert "
+                        "instead of kelly_fraction."
+                    )
+        except (ValueError, TypeError):
+            pass  # malformed numeric; let earlier branches catch it
 
     return None
 
@@ -586,7 +628,11 @@ async def run_once(
     # ── Auto-apply at most one whitelisted adjustment ─────────────────────────
     applied: Optional[dict] = None
     if adjustment and isinstance(adjustment, dict):
-        err = _validate_adjustment(adjustment, ctx.get("current_config"))
+        err = _validate_adjustment(
+            adjustment,
+            ctx.get("current_config"),
+            strategy_health=ctx.get("strategy_health"),
+        )
         if err:
             print(f"[ep_advisor] Adjustment rejected: {err}", flush=True)
             await _emit_alert(
