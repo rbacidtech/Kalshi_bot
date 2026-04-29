@@ -2537,7 +2537,17 @@ return cnt
                         mode          = "paper" if cfg.PAPER_TRADE else "live",
                         edge_captured = (pnl_cents - _exit_fee) / 100,
                     )
-                    await bus.publish_execution(exit_report)
+                    # Only publish optimistically when the exit is guaranteed-fill:
+                    # paper mode (instant fill in simulator) or BTC (Coinbase market
+                    # orders fill at the next cycle). Live Kalshi exits use limit
+                    # orders that may rest unfilled or be canceled — let fill_poll
+                    # publish the canonical event after confirmation. Without this
+                    # gate, _exit_checker re-publishes a synthesized "filled" report
+                    # every cycle until the order actually fills or the position is
+                    # cleaned up, which polluted the executions stream with
+                    # duplicate -dollar edge_captured values during Apr 22-25.
+                    if cfg.PAPER_TRADE or asset_class == "btc_spot":
+                        await bus.publish_execution(exit_report)
 
                     await telegram.send_exit(
                         ticker        = ticker,
