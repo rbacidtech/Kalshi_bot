@@ -38,6 +38,16 @@ except ImportError:
     print("[ep_advisor] ERROR: redis not installed. Run: pip install redis", flush=True)
     sys.exit(1)
 
+# Postgres audit writer — same pattern as llm_agent.py. ep_advisor was missing
+# this so its decisions only landed in Redis (ep:advisor:status) with no
+# historical trail. With this, every advisor run writes a row to the
+# llm_decisions table (alongside the 4-hourly llm_agent.py rows).
+try:
+    from ep_pg_audit import init_audit_writer, stop_audit_writer, audit as _audit
+    _AUDIT_AVAILABLE = True
+except Exception:
+    _AUDIT_AVAILABLE = False
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -701,6 +711,27 @@ async def run_once(
         f"cache_write={cache_write} cache_read={cache_read}",
         flush=True,
     )
+
+    # ── Postgres audit row for the run (so decisions persist beyond Redis) ───
+    if _AUDIT_AVAILABLE:
+        try:
+            _audit().write("llm_decisions", {
+                "ts_us":              int(time.time() * 1_000_000),
+                "model":              model_used,
+                "prompt_tokens":      usage.input_tokens,
+                "completion_tokens":  usage.output_tokens,
+                "config_before":      ctx.get("current_config", {}) or {},
+                "config_after":       {
+                    "applied":           applied,
+                    "summary":           summary,
+                    "severity_overall":  sev_overall,
+                    "escalation_reasons": escalation_reasons,
+                },
+                "reasoning":          summary or "",
+            })
+        except Exception as _exc:
+            print(f"[ep_advisor] llm_decisions audit write failed: {_exc}", flush=True)
+
     return report
 
 
@@ -729,6 +760,13 @@ async def main(loop: bool) -> None:
         flush=True,
     )
 
+    if _AUDIT_AVAILABLE:
+        try:
+            await init_audit_writer()
+        except Exception as _exc:
+            print(f"[ep_advisor] init_audit_writer failed (continuing without): {_exc}",
+                  flush=True)
+
     try:
         if loop:
             while True:
@@ -746,6 +784,11 @@ async def main(loop: bool) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("[ep_advisor] Shutdown.", flush=True)
     finally:
+        if _AUDIT_AVAILABLE:
+            try:
+                await stop_audit_writer()
+            except Exception:
+                pass
         await r.aclose()
 
 
