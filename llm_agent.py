@@ -160,11 +160,17 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
     ctx.setdefault("btc_rsi",     None)
 
     # Balance (sum across all nodes published to ep:balance)
+    # Skip entries older than 10 minutes — orphan entries from removed services
+    # (e.g. exec node that no longer publishes) would otherwise inflate the sum.
     balances_raw  = await r.hgetall(EP_BALANCE)
     balance_cents = 0
+    now_us = time.time() * 1_000_000
     for v in balances_raw.values():
         try:
-            balance_cents += json.loads(v).get("balance_cents", 0)
+            d = json.loads(v)
+            if now_us - d.get("ts_us", 0) > 600 * 1_000_000:
+                continue
+            balance_cents += d.get("balance_cents", 0)
         except Exception:
             pass
     ctx["balance_usd"] = round(balance_cents / 100, 2)

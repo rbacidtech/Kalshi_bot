@@ -240,10 +240,16 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # Skip entries older than 10 minutes — orphan node balances would
+    # otherwise inflate the sum. See known_gaps_apr24.
     balance_cents = 0
+    now_us = time.time() * 1_000_000
     for v in (bal_raw or {}).values():
         try:
-            balance_cents += json.loads(v).get("balance_cents", 0)
+            d = json.loads(v)
+            if now_us - d.get("ts_us", 0) > 600 * 1_000_000:
+                continue
+            balance_cents += d.get("balance_cents", 0)
         except Exception:
             pass
     ctx["balance_usd"] = round(balance_cents / 100, 2)
