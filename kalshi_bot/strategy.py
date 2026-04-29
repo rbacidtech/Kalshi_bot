@@ -1468,6 +1468,18 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
                 base_sigma *= 0.85
             effective_sig = _math.sqrt(base_sigma ** 2 + (spread / 2) ** 2)
 
+            # Calibration audit: log raw inputs so post-resolution Brier
+            # analysis can reconstruct the exact (mean, σ) that produced
+            # each fair_value. Grep `Weather calib` in intel.log for replay.
+            log.info(
+                "Weather calib %s: sources=%s temps=%s weights=%s "
+                "mean=%.2f spread=%.2f base_sig=%.2f eff_sig=%.2f days_ahead=%d",
+                ticker, "+".join(source_tag),
+                [round(t, 1) for t, _ in temp_weighted],
+                [w for _, w in temp_weighted],
+                mean_temp, spread, base_sigma, effective_sig, days_ahead,
+            )
+
             def _p_above(thresh: float) -> float:
                 """P(actual temp > thresh) under N(mean_temp, effective_sig)."""
                 z = (thresh - mean_temp) / effective_sig
