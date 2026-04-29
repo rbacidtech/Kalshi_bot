@@ -603,8 +603,8 @@ async def get_rolling_strategy_health(
         if first is None or last is None:
             return None
         try:
-            return round((last - first) / 86400, 2)
-        except (TypeError, ValueError):
+            return round((last - first).total_seconds() / 86400, 2)
+        except (TypeError, ValueError, AttributeError):
             return None
 
     result: dict = {}
@@ -625,6 +625,22 @@ async def get_rolling_strategy_health(
             else:
                 status = "stable"
 
+        # Days since the strategy's most recent closed trade. Used by the
+        # advisor's _check_escalation to skip dormant strategies — historical
+        # trade performance shouldn't drive current escalation if the scanner
+        # has stopped firing (e.g., disabled in code but old trades still in
+        # the rolling window).
+        days_since_last_trade: Optional[float] = None
+        if recent:
+            last_exit = recent[-1].get("exit_ts")
+            if last_exit is not None:
+                try:
+                    days_since_last_trade = round(
+                        (now - last_exit).total_seconds() / 86400, 2
+                    )
+                except (TypeError, AttributeError):
+                    pass
+
         result[strat] = {
             "status":             status,
             "recent_n":           len(recent),
@@ -634,6 +650,7 @@ async def get_rolling_strategy_health(
             # Added 2026-04-24 to address audit finding Adv #6.
             "recent_span_days":   _span_days(recent),
             "baseline_span_days": _span_days(baseline),
+            "days_since_last_trade": days_since_last_trade,
             "recent_win_rate":    r["win_rate"]   if r else None,
             "baseline_win_rate":  b["win_rate"]   if b else None,
             "recent_pnl_cents":   r["pnl_cents"]  if r else None,

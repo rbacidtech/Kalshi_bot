@@ -364,6 +364,14 @@ def _check_escalation(ctx: Dict[str, Any]) -> list:
             # auto-trims its kelly fraction.
             if (h.get("recent_pnl_cents", 0) or 0) > 0:
                 continue
+            # Skip dormant strategies — if the scanner stopped firing days
+            # ago (e.g. disabled in code), historical trade performance
+            # shouldn't drive current escalation. Threshold of 3 days catches
+            # disabled scanners while still allowing infrequent FOMC/GDP
+            # strategies (which trade once per release event).
+            days_inactive = h.get("days_since_last_trade")
+            if days_inactive is not None and days_inactive > 3:
+                continue
             reasons.append(f"degrading:{strat}")
 
     max_pct = ctx.get("concentration", {}).get("max_category_pct", 0.0)
