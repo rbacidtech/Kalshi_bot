@@ -128,11 +128,12 @@ Adjustment rules:
   llm_rsi_oversold, llm_rsi_overbought, llm_z_threshold, llm_max_contracts
 - confidence < 0.80 → set adjustment to null (operator decides)
 - HALT_TRADING="1" requires confidence ≥ 0.95; never suggest "0" (only operators un-halt)
-- Reduce llm_kelly_fraction only when a strategy has ≥ 5 recent trades AND is degrading
+- Reduce llm_kelly_fraction only when a strategy has ≥ 5 recent trades AND is degrading AND recent_pnl_cents ≤ 0
 - Never suggest llm_kelly_fraction > 0.35 or llm_scale_factor > 1.5
 
 Strategy health interpretation:
 - "degrading": recent win rate dropped ≥ 10pp vs baseline — notable but check trade count
+- If status="degrading" but recent_pnl_cents > 0, this is fewer-but-bigger wins (selectivity on longshots), NOT decay; do NOT trim kelly for this case
 - "insufficient_data" → do not act on this strategy
 - FOMC win rates are typically 10-25% (large asymmetric payoffs); 0% recent ≠ broken
 - avg_pnl_cents is more reliable than win_rate for FOMC strategies
@@ -356,6 +357,13 @@ def _check_escalation(ctx: Dict[str, Any]) -> list:
     health = ctx.get("strategy_health", {})
     for strat, h in health.items():
         if h.get("status") == "degrading" and h.get("recent_n", 0) >= 5:
+            # Skip strategies that are net positive on recent PnL. A degrading
+            # win-rate paired with positive PnL is the fewer-but-bigger-wins
+            # pattern (selectivity on longshots), not actual decay. Without
+            # this guard, a profitable strategy gets escalated and the LLM
+            # auto-trims its kelly fraction.
+            if (h.get("recent_pnl_cents", 0) or 0) > 0:
+                continue
             reasons.append(f"degrading:{strat}")
 
     max_pct = ctx.get("concentration", {}).get("max_category_pct", 0.0)
