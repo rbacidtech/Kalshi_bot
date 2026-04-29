@@ -137,6 +137,26 @@ _LONG_GAME_MAX_PCT      = float(os.getenv("LONG_GAME_MAX_PCT", "0.30"))
 _MIN_BOOK_DEPTH          = int(os.getenv("MIN_BOOK_DEPTH", "50"))
 _MIN_BOOK_DEPTH_LONG     = int(os.getenv("MIN_BOOK_DEPTH_LONG", "200"))
 
+# ── Bot-traded ticker prefixes ────────────────────────────────────────────────
+# Used by the position sync to distinguish bot-managed positions from operator
+# personal bets adopted via /portfolio/positions. Adopted positions whose
+# ticker prefix is NOT in this list are flagged user_bet=True so the
+# exit_checker (and any other user_bet-aware path) leaves them alone.
+# Operator can override by setting/clearing user_bet manually in Redis.
+_BOT_TRADED_PREFIXES = (
+    "KXFED",       # FOMC rate paths
+    "KXCPI",       # CPI release ladders
+    "KXUNRATE",    # Unemployment rate
+    "KXGDP",       # GDP threshold ladders
+    "KXGDPQ",      # GDP quarterly
+    "KXNFP",       # Nonfarm payrolls
+    "KXPCE",       # PCE inflation
+    "KXHIGHCHI",   # Chicago daily high temp
+    "KXHIGHNY",    # NY daily high temp
+    "KXTEMP",      # Other weather threshold series
+    "KXBTC",       # BTC threshold series
+)
+
 
 def _tiered_take_profit(base_tp: int, hours_remaining: float) -> int:
     """
@@ -1427,16 +1447,32 @@ async def _sync_positions_with_kalshi(
             if existing:
                 # contracts=0 tombstone in Redis — blocked from re-entry, skip.
                 continue
-            # Genuinely missing from Redis — open fresh
+            # Genuinely missing from Redis — open fresh.
+            # If the ticker prefix isn't one the bot trades, default to
+            # user_bet=True so the operator's personal Kalshi bets (NBA,
+            # MLB, election props, etc.) don't get exit-managed by the
+            # bot. Operator can clear via dashboard or `redis-cli`.
+            _ticker_prefix = ticker.split("-")[0] if "-" in ticker else ticker
+            _is_user_bet = not any(
+                _ticker_prefix.startswith(p) for p in _BOT_TRADED_PREFIXES
+            )
             await positions.open(ticker=ticker, side=k_side, contracts=k_qty,
                                  entry_cents=k_entry, fair_value=k_entry / 100.0,
                                  meeting=k_meeting, close_time=k_close_time,
                                  pending=False)
-            await positions.update_fields(ticker, {
+            _patch = {
                 "fill_confirmed": True,
                 "order_id":       "",
                 "contracts_filled": k_qty,
-            })
+            }
+            if _is_user_bet:
+                _patch["user_bet"] = True
+                log.info(
+                    "Position sync: marked %s as user_bet=True (ticker prefix %r "
+                    "not in bot-traded set) — exit_checker will skip",
+                    ticker, _ticker_prefix,
+                )
+            await positions.update_fields(ticker, _patch)
             added += 1
         else:
             # Update diverged fields in-place — always sync contracts_filled so
