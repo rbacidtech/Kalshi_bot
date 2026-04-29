@@ -22,23 +22,32 @@ CREATE INDEX IF NOT EXISTS idx_signals_strategy  ON signals (strategy, emitted_a
 CREATE INDEX IF NOT EXISTS idx_signals_ticker    ON signals (ticker, emitted_at DESC);
 
 -- Every execution report (filled or rejected)
+-- edge_captured (legacy) was double-purposed: per-contract decimal for entries,
+-- dollar realized PnL for exits. Split into predicted_edge (entry-only) and
+-- realized_pnl_cents (exit-only) on 2026-04-29 to give consumers unambiguous
+-- units. edge_captured is kept populated for backward compat but should be
+-- treated as deprecated; new consumers should read predicted_edge or
+-- realized_pnl_cents based on whether they care about pre-fill expectation
+-- or realized outcome.
 CREATE TABLE IF NOT EXISTS executions (
-    exec_id         UUID PRIMARY KEY,
-    signal_id       UUID,   -- no FK: async batching means execution can land before its signal
-    reported_at     TIMESTAMPTZ NOT NULL,
-    status          TEXT NOT NULL,
-    reject_reason   TEXT,
-    ticker          TEXT,
-    side            TEXT,
-    asset_class     TEXT,
-    contracts       INTEGER,
-    fill_price      NUMERIC(10,4),
-    fee_cents       BIGINT,
-    cost_cents      BIGINT,
-    edge_captured   NUMERIC(10,4),
-    order_id        TEXT,
-    mode            TEXT,
-    payload         JSONB NOT NULL
+    exec_id            UUID PRIMARY KEY,
+    signal_id          UUID,   -- no FK: async batching means execution can land before its signal
+    reported_at        TIMESTAMPTZ NOT NULL,
+    status             TEXT NOT NULL,
+    reject_reason      TEXT,
+    ticker             TEXT,
+    side               TEXT,
+    asset_class        TEXT,
+    contracts          INTEGER,
+    fill_price         NUMERIC(10,4),
+    fee_cents          BIGINT,
+    cost_cents         BIGINT,
+    edge_captured      NUMERIC(10,4),    -- deprecated; double-purposed; kept for backward compat
+    predicted_edge     NUMERIC(10,4),    -- entry-only: per-contract decimal edge net of fees
+    realized_pnl_cents BIGINT,           -- exit-only: total realized PnL in cents
+    order_id           TEXT,
+    mode               TEXT,
+    payload            JSONB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_exec_reported ON executions (reported_at DESC);
 CREATE INDEX IF NOT EXISTS idx_exec_status   ON executions (status, reported_at DESC);

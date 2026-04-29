@@ -197,7 +197,23 @@ class ExecutionReport:
     # ── Cost accounting ───────────────────────────────────────────────────────
     cost_cents:    int   = 0     # fill_price * contracts * 100
     fee_cents:     int   = 0     # estimated Kalshi fee on this trade
-    edge_captured: float = 0.0   # signal.edge at time of fill (P&L attribution)
+    # DEPRECATED 2026-04-29: edge_captured was double-purposed — per-contract
+    # decimal on entries, dollar realized PnL on exits. Mixed-unit summing
+    # corrupted the advisor's drawdown metric. Kept populated for backward
+    # compat; new consumers should read predicted_edge or realized_pnl_cents
+    # below based on whether they care about pre-fill expectation or realized
+    # outcome.
+    edge_captured: float = 0.0
+    # Entry-only: per-contract decimal edge net of fees (sig.edge - fee_per_contract).
+    # Exit reports leave this at 0.0. The advisor's recent_pnl_edge metric reads
+    # only this field, ignoring exits, so single-trade losses can no longer dwarf
+    # hundreds of small entry edges.
+    predicted_edge:     float = 0.0
+    # Exit-only: total realized PnL in cents (move_cents * contracts, fees deducted).
+    # Entry reports leave this at 0. Postgres column is nullable so older rows
+    # written before the refactor have NULL here and are excluded from new
+    # aggregates by IS NOT NULL filters.
+    realized_pnl_cents: int   = 0
 
     # ── Validation ───────────────────────────────────────────────────────────
 

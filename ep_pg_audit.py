@@ -166,6 +166,8 @@ class PgAuditWriter:
                 r.get("order_id"),
                 r.get("mode"),
                 json.dumps(r),
+                r.get("predicted_edge"),       # added 2026-04-29 (entry-only)
+                r.get("realized_pnl_cents"),   # added 2026-04-29 (exit-only)
             ))
         async with self._pool.acquire() as conn:
             await conn.executemany(
@@ -173,8 +175,9 @@ class PgAuditWriter:
                 INSERT INTO executions
                     (exec_id, signal_id, reported_at, status, reject_reason,
                      ticker, side, asset_class, contracts, fill_price,
-                     fee_cents, cost_cents, edge_captured, order_id, mode, payload)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                     fee_cents, cost_cents, edge_captured, order_id, mode, payload,
+                     predicted_edge, realized_pnl_cents)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                 ON CONFLICT (exec_id) DO NOTHING
                 """,
                 records,

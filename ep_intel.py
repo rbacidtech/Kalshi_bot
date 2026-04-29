@@ -2788,7 +2788,15 @@ async def intel_main() -> None:
                     reason=r.reject_reason or "",
                 )
                 if r.status == "filled":
-                    metrics.add_pnl(r.edge_captured)
+                    # Session PnL must reflect realized outcomes, not predicted-edge
+                    # at entry. Pre-refactor this used edge_captured, which mixed
+                    # per-contract decimal entries with dollar exit PnL — a single
+                    # losing exit at -$45 would swing the displayed session pnl
+                    # by 45.0 while a winning entry barely moved it. After the
+                    # 2026-04-29 schema split, only realized_pnl_cents (set on
+                    # exits) feeds the session counter; entries contribute 0.
+                    if r.realized_pnl_cents:
+                        metrics.add_pnl(r.realized_pnl_cents / 100)
                     metrics.record_fill_latency(
                         r.asset_class,
                         (int(time.time() * 1_000_000) - r.ts_us) / 1_000_000,

@@ -1021,17 +1021,18 @@ async def _process_signal(
             len(sig.arb_legs), sig.ticker, _arb_cost, sig.signal_id,
         )
         return ExecutionReport(
-            signal_id     = sig.signal_id,
-            ticker        = sig.ticker,
-            asset_class   = sig.asset_class,
-            side          = sig.side,
-            contracts     = len(sig.arb_legs),
-            fill_price    = sig.market_price,
-            status        = "filled",
-            mode          = "paper" if cfg.PAPER_TRADE else "live",
-            cost_cents    = _arb_cost,
-            fee_cents     = _arb_fee,
-            edge_captured = sig.edge - (_arb_fee / 100),
+            signal_id      = sig.signal_id,
+            ticker         = sig.ticker,
+            asset_class    = sig.asset_class,
+            side           = sig.side,
+            contracts      = len(sig.arb_legs),
+            fill_price     = sig.market_price,
+            status         = "filled",
+            mode           = "paper" if cfg.PAPER_TRADE else "live",
+            cost_cents     = _arb_cost,
+            fee_cents      = _arb_fee,
+            edge_captured  = sig.edge - (_arb_fee / 100),       # deprecated, keep for back-compat
+            predicted_edge = sig.edge - (_arb_fee / 100),       # entry: same value
         )
 
     # ── Confirm position (remove pending flag, store order_id) ───────────────
@@ -1181,17 +1182,18 @@ async def _process_signal(
             log.debug("ARB partner %s already held — skipping second leg", sig.arb_partner)
 
     return ExecutionReport(
-        signal_id     = sig.signal_id,
-        ticker        = sig.ticker,
-        asset_class   = sig.asset_class,
-        side          = sig.side,
-        contracts     = contracts,
-        fill_price    = sig.market_price,
-        status        = "filled",
-        mode          = "paper" if cfg.PAPER_TRADE else "live",
-        cost_cents    = cost_cents,
-        fee_cents     = fee_cents,
-        edge_captured = sig.edge - (cfg.FEE_CENTS * contracts) / 100,
+        signal_id      = sig.signal_id,
+        ticker         = sig.ticker,
+        asset_class    = sig.asset_class,
+        side           = sig.side,
+        contracts      = contracts,
+        fill_price     = sig.market_price,
+        status         = "filled",
+        mode           = "paper" if cfg.PAPER_TRADE else "live",
+        cost_cents     = cost_cents,
+        fee_cents      = fee_cents,
+        edge_captured  = sig.edge - (cfg.FEE_CENTS * contracts) / 100,   # deprecated; legacy formula has unit error
+        predicted_edge = sig.edge - (cfg.FEE_CENTS / 100),               # per-contract decimal, fees per-contract
     )
 
 
@@ -1807,14 +1809,15 @@ async def _exit_checker(
                                 _move_r = pos["entry_cents"] - _exit_cents
                             _pnl_r = (_move_r * _contracts_r - cfg.FEE_CENTS * _contracts_r) / 100
                             await bus.publish_execution(ExecutionReport(
-                                ticker        = ticker,
-                                asset_class   = "kalshi",
-                                side          = "no" if _s == "yes" else "yes",
-                                contracts     = _contracts_r,
-                                fill_price    = _exit_cents / 100,
-                                status        = "filled",
-                                mode          = "paper" if cfg.PAPER_TRADE else "live",
-                                edge_captured = _pnl_r,
+                                ticker             = ticker,
+                                asset_class        = "kalshi",
+                                side               = "no" if _s == "yes" else "yes",
+                                contracts          = _contracts_r,
+                                fill_price         = _exit_cents / 100,
+                                status             = "filled",
+                                mode               = "paper" if cfg.PAPER_TRADE else "live",
+                                edge_captured      = _pnl_r,                                   # deprecated
+                                realized_pnl_cents = int(_pnl_r * 100),                        # exit: total cents
                             ))
                             continue
 
@@ -1865,14 +1868,15 @@ async def _exit_checker(
                             _cr = pos.get("contracts_filled") or pos.get("contracts", 1)
                             pnl_cents = _move * _cr
                             await bus.publish_execution(ExecutionReport(
-                                ticker        = ticker,
-                                asset_class   = "kalshi",
-                                side          = "no" if pos["side"] == "yes" else "yes",
-                                contracts     = _cr,
-                                fill_price    = last_cents / 100,
-                                status        = "filled",
-                                mode          = "paper" if cfg.PAPER_TRADE else "live",
-                                edge_captured = (pnl_cents - cfg.FEE_CENTS * _cr) / 100,
+                                ticker             = ticker,
+                                asset_class        = "kalshi",
+                                side               = "no" if pos["side"] == "yes" else "yes",
+                                contracts          = _cr,
+                                fill_price         = last_cents / 100,
+                                status             = "filled",
+                                mode               = "paper" if cfg.PAPER_TRADE else "live",
+                                edge_captured      = (pnl_cents - cfg.FEE_CENTS * _cr) / 100,   # deprecated
+                                realized_pnl_cents = pnl_cents - cfg.FEE_CENTS * _cr,
                             ))
                             continue
                     except Exception as exc:
@@ -2063,14 +2067,15 @@ async def _exit_checker(
                                     _t1_pnl = move_cents * half
                                     _t1_fee = cfg.FEE_CENTS * half if asset_class == "kalshi" else 0
                                     await bus.publish_execution(ExecutionReport(
-                                        ticker        = ticker,
-                                        asset_class   = asset_class,
-                                        side          = "no" if side == "yes" else "yes",
-                                        contracts     = half,
-                                        fill_price    = current_cents / 100,
-                                        status        = "filled",
-                                        mode          = "paper",
-                                        edge_captured = (_t1_pnl - _t1_fee) / 100,
+                                        ticker             = ticker,
+                                        asset_class        = asset_class,
+                                        side               = "no" if side == "yes" else "yes",
+                                        contracts          = half,
+                                        fill_price         = current_cents / 100,
+                                        status             = "filled",
+                                        mode               = "paper",
+                                        edge_captured      = (_t1_pnl - _t1_fee) / 100,   # deprecated
+                                        realized_pnl_cents = _t1_pnl - _t1_fee,
                                     ))
                                     log.info(
                                         "TRANCHE 1 (paper): %s  half=%d  remaining=%d  pnl=%+d¢",
@@ -2202,14 +2207,15 @@ async def _exit_checker(
                                 "mr_breakeven_cents": entry_cents,
                             })
                             await bus.publish_execution(ExecutionReport(
-                                ticker        = ticker,
-                                asset_class   = "btc_spot",
-                                side          = "sell" if side == "buy" else "buy",
-                                contracts     = half,
-                                fill_price    = current_cents / 100,
-                                status        = "filled",
-                                mode          = "paper" if cfg.PAPER_TRADE else "live",
-                                edge_captured = move_cents * half / 100,
+                                ticker             = ticker,
+                                asset_class        = "btc_spot",
+                                side               = "sell" if side == "buy" else "buy",
+                                contracts          = half,
+                                fill_price         = current_cents / 100,
+                                status             = "filled",
+                                mode               = "paper" if cfg.PAPER_TRADE else "live",
+                                edge_captured      = move_cents * half / 100,   # deprecated
+                                realized_pnl_cents = move_cents * half,
                             ))
                             continue   # don't trigger full-exit logic this cycle
                         elif _mr_hit and (mr_tranche == 1 or contracts == 1):
@@ -2531,14 +2537,15 @@ return cnt
 
                     _exit_fee = cfg.FEE_CENTS * contracts if asset_class == "kalshi" else 0
                     exit_report = ExecutionReport(
-                        ticker        = ticker,
-                        asset_class   = asset_class,
-                        side          = "no" if side == "yes" else "yes",
-                        contracts     = contracts,
-                        fill_price    = current_cents / 100,
-                        status        = "filled",
-                        mode          = "paper" if cfg.PAPER_TRADE else "live",
-                        edge_captured = (pnl_cents - _exit_fee) / 100,
+                        ticker             = ticker,
+                        asset_class        = asset_class,
+                        side               = "no" if side == "yes" else "yes",
+                        contracts          = contracts,
+                        fill_price         = current_cents / 100,
+                        status             = "filled",
+                        mode               = "paper" if cfg.PAPER_TRADE else "live",
+                        edge_captured      = (pnl_cents - _exit_fee) / 100,   # deprecated
+                        realized_pnl_cents = pnl_cents - _exit_fee,
                     )
                     # Only publish optimistically when the exit is guaranteed-fill:
                     # paper mode (instant fill in simulator) or BTC (Coinbase market
@@ -2705,14 +2712,15 @@ async def _fill_poll_loop(
                         if bus is not None:
                             try:
                                 await bus.publish_execution(ExecutionReport(
-                                    ticker        = ticker,
-                                    asset_class   = pos.get("asset_class", "kalshi"),
-                                    side          = "no" if _lf_side == "yes" else "yes",
-                                    contracts     = _lf_fill,
-                                    fill_price    = _lf_cents / 100,
-                                    status        = "filled",
-                                    mode          = "live",
-                                    edge_captured = (_lf_pnl - _lf_fee) / 100,
+                                    ticker             = ticker,
+                                    asset_class        = pos.get("asset_class", "kalshi"),
+                                    side               = "no" if _lf_side == "yes" else "yes",
+                                    contracts          = _lf_fill,
+                                    fill_price         = _lf_cents / 100,
+                                    status             = "filled",
+                                    mode               = "live",
+                                    edge_captured      = (_lf_pnl - _lf_fee) / 100,   # deprecated
+                                    realized_pnl_cents = _lf_pnl - _lf_fee,
                                 ))
                             except Exception as _lf_rpt_exc:
                                 log.warning("fill_poll ExecutionReport failed %s: %s",

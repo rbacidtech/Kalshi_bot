@@ -251,18 +251,26 @@ async def _gather_context(r: aioredis.Redis) -> Dict[str, Any]:
             })
 
             if rep.get("status") == "filled":
-                # Filter out synthesized exit reports. Exits at ep_exec.py:2493
-                # (and similar paths) reuse `edge_captured` to store dollar realized
-                # PnL, while entries store per-contract decimal edge. Summing them
-                # together produces incoherent values that can swing the advisor's
-                # `recent_pnl_edge` by thousands while real PnL is small. Entry
-                # fills always carry signal_id and cost_cents>0; synthesized exits
-                # leave both empty.
-                _is_entry = bool(rep.get("signal_id")) and rep.get("cost_cents", 0) > 0
-                if not _is_entry:
-                    continue
+                # Use predicted_edge (entry-only, set 2026-04-29 refactor) for
+                # the advisor's drawdown metric. predicted_edge is per-contract
+                # decimal, populated only on entry fills. Exit fills set
+                # realized_pnl_cents (dollar) instead, which we deliberately
+                # ignore here so single losing exits don't dwarf hundreds of
+                # small entry edges. The legacy heuristic (signal_id+cost_cents)
+                # is kept as a fallback for execution rows written before the
+                # refactor (those rows have no predicted_edge field).
+                _pe = rep.get("predicted_edge")
+                if _pe is not None:
+                    edge = float(_pe)
+                    if edge == 0:
+                        continue   # exit fill (predicted_edge=0 by default)
+                else:
+                    # Pre-refactor row: fall back to the heuristic from deploy 1.
+                    _is_entry = bool(rep.get("signal_id")) and rep.get("cost_cents", 0) > 0
+                    if not _is_entry:
+                        continue
+                    edge = float(rep.get("edge_captured", 0))
                 fills        += 1
-                edge          = float(rep.get("edge_captured", 0))
                 pnl_edge_sum += edge
                 stat["fills"]    += 1
                 stat["pnl"]      += edge
