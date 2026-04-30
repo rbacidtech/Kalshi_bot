@@ -25,20 +25,22 @@ class RiskConfig:
 class RiskManager:
 
     def __init__(self, config: RiskConfig):
-        self.cfg             = config
-        self._start_balance  = None
-        self._halted         = False
-        self._risk_day       = int(time.time() // 86400)
+        self.cfg                     = config
+        self._start_portfolio_value  = None
+        self._halted                 = False
+        self._risk_day               = int(time.time() // 86400)
         # Empirical Kelly cache — refreshed at most once per calendar day
         self._kelly_cached:      float              = config.kelly_fraction
         self._kelly_by_category: dict               = {}   # {bucket: fraction}
         self._kelly_cache_day:   Optional[datetime] = None
 
-    def set_balance(self, balance_cents: int) -> None:
-        # Reset at UTC midnight
+    def set_account_value(self, portfolio_value_cents: int) -> None:
+        # Drawdown is computed against total account value (cash + positions),
+        # not cash alone — otherwise deploying cash into open positions reads
+        # as a loss.
         today = int(time.time() // 86400)
         if self._risk_day != today:
-            self._start_balance = None
+            self._start_portfolio_value = None
             if self._halted:
                 log.warning(
                     "Drawdown halt reset at UTC midnight — daily reset in effect."
@@ -46,12 +48,15 @@ class RiskManager:
             self._halted = False
             self._risk_day = today
 
-        if self._start_balance is None:
-            self._start_balance = balance_cents
-            log.info("RiskManager: session balance set to $%.2f", balance_cents / 100)
+        if self._start_portfolio_value is None:
+            self._start_portfolio_value = portfolio_value_cents
+            log.info(
+                "RiskManager: session portfolio value set to $%.2f",
+                portfolio_value_cents / 100,
+            )
 
-        if self._start_balance > 0:
-            drawdown = 1.0 - (balance_cents / self._start_balance)
+        if self._start_portfolio_value > 0:
+            drawdown = 1.0 - (portfolio_value_cents / self._start_portfolio_value)
             if drawdown >= self.cfg.daily_drawdown_limit:
                 if not self._halted:
                     log.warning(
@@ -72,7 +77,7 @@ class RiskManager:
                 "reset_day() called — drawdown halt was manually cleared. "
                 "Ensure this is intentional before resuming trading."
             )
-        self._start_balance = None
+        self._start_portfolio_value = None
         self._halted = False
 
     @staticmethod

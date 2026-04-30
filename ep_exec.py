@@ -433,7 +433,9 @@ async def _process_signal(
         # cash-on-hand question, different from the aggregate-risk cap.
         _portfolio_value_cents = int(intel_bal.get("portfolio_value_cents", 0) or 0)
         # Update drawdown tracking and persist halt to Redis if triggered.
-        risk_engine._kalshi.set_balance(balance_cents)
+        # Drawdown is anchored on portfolio value (cash + positions), not cash —
+        # cash alone falls when entries are placed and would mis-trip the breaker.
+        risk_engine._kalshi.set_account_value(_portfolio_value_cents)
         if risk_engine._kalshi._halted:
             try:
                 already = await bus._r.hget("ep:config", "HALT_TRADING")
@@ -444,9 +446,9 @@ async def _process_signal(
                         "tripped_at_us": str(int(time.time() * 1_000_000)),
                     })
                     log.warning(
-                        "Drawdown halt persisted to Redis (balance=%.2f start=%.2f)",
-                        balance_cents / 100,
-                        (risk_engine._kalshi._start_balance or 0) / 100,
+                        "Drawdown halt persisted to Redis (portfolio=%.2f start=%.2f)",
+                        _portfolio_value_cents / 100,
+                        (risk_engine._kalshi._start_portfolio_value or 0) / 100,
                     )
             except Exception as _e:
                 log.warning("Failed to persist drawdown halt to Redis: %s", _e)

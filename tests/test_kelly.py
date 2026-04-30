@@ -122,8 +122,8 @@ class TestKellySizing:
     def test_drawdown_halt_blocks_trading(self):
         """After daily drawdown limit hit, approve() returns False."""
         rm = make_risk(daily_drawdown_limit=0.10)
-        rm.set_balance(100_000)
-        rm.set_balance(89_000)   # 11% drawdown → halted
+        rm.set_account_value(100_000)
+        rm.set_account_value(89_000)   # 11% portfolio drawdown → halted
         approved = rm.approve(
             ticker="TEST-A", contracts=1,
             market_price=0.50, balance_cents=89_000,
