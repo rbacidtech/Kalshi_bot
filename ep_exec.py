@@ -2377,6 +2377,27 @@ return cnt
                             ticker, _cd_ttl, _stop_cnt,
                         )
 
+                    # Pre-expiry cooldown: prevents re-entry thrashing on tickers
+                    # whose strategy keeps emitting as close_time approaches.
+                    # Audit on KXGDP-26APR30-T2.5 saw 13 entries / 12 pre_expiry
+                    # exits in one day — each cycle paid 14¢ × n_contracts in fees
+                    # for ~flat P&L. Same TTL as tier-1 stop (30 min); no escalation
+                    # since pre_expiry isn't a "we were wrong" signal. Weather
+                    # exempted because tickers rotate daily.
+                    elif "pre_expiry" in exit_reason and not _weather:
+                        _exit_cooldown[ticker] = time.time()
+                        try:
+                            await bus._r.setex(
+                                f"ep:cooldown:{_safe_key(ticker)}",
+                                _COOLDOWN_TIER_1, "pre_expiry",
+                            )
+                            log.info(
+                                "Pre-expiry cooldown set: %s — no re-entry for %ds",
+                                ticker, _COOLDOWN_TIER_1,
+                            )
+                        except Exception:
+                            pass
+
                     if asset_class == "btc_spot":
                         # Place reverse market order on Coinbase to close spot position
                         close_side = "SELL" if side in ("buy", "yes") else "BUY"
