@@ -2846,14 +2846,15 @@ async def intel_main() -> None:
                 ):
                     _perf: dict = {}
                     try:
-                        _perf_raw = await bus._r.hgetall("ep:performance")
-                        _perf     = {k: v for k, v in (_perf_raw or {}).items()}
+                        _perf_raw = await bus._r.get("ep:performance")
+                        if _perf_raw:
+                            _perf = json.loads(_perf_raw)
                     except Exception as _perf_exc:
                         log.debug("ep:performance read failed: %s", _perf_exc)
 
-                    _pnl_cents      = int(float(_perf.get("pnl_cents",      0) or 0))
-                    _trades         = int(float(_perf.get("trades",         0) or 0))
-                    _win_rate       = float(_perf.get("win_rate",           0) or 0)
+                    _pnl_cents      = int(float(_perf.get("total_pnl_cents", 0) or 0))
+                    _trades         = int(float(_perf.get("total_trades",    0) or 0))
+                    _win_rate       = float(_perf.get("win_rate",            0) or 0)
                     _open_positions = len(current_positions)
 
                     _ok = await _telegram.send_daily_summary(
