@@ -2730,6 +2730,21 @@ async def _fill_poll_loop(
                             await positions.close(ticker)
                             log.info("EXIT FILLED ✓ %s  order_id=%.8s", ticker, exit_oid)
 
+                        # CSV row written at fill confirmation (not order placement)
+                        # — see executor._exit_position docstring.
+                        try:
+                            executor.log_exit_fill(
+                                ticker            = ticker,
+                                pos               = pos,
+                                fill_cents        = _lf_cents,
+                                contracts_filled  = _lf_fill,
+                                reason            = _lf_reason,
+                                order_id          = exit_oid,
+                                mode              = "live",
+                            )
+                        except Exception as _csv_exc:
+                            log.warning("trades.csv exit log failed for %s: %s", ticker, _csv_exc)
+
                         try:
                             _audit_writer().write("position_history", {
                                 "entry_exec_id":      _lf_exec_id or None,
@@ -2813,6 +2828,28 @@ async def _fill_poll_loop(
                                     "fill=%d/%d — closing position",
                                     ticker, exit_oid, _pc_fill, int(_e_total),
                                 )
+
+                            # Partial-cancel fill: log the contracts that did fill
+                            try:
+                                _pc_reason = pos.get("exit_reason", "live_exit_partial_canceled")
+                                _pc_side   = pos.get("side", "yes")
+                                _pc_entry  = int(pos.get("entry_cents", 50))
+                                _pc_pkey   = ("yes_price_dollars" if _pc_side == "yes"
+                                              else "no_price_dollars")
+                                _pc_raw    = _e_order.get(_pc_pkey)
+                                _pc_cents  = (int(float(_pc_raw) * 100) if _pc_raw is not None
+                                              else int(pos.get("exit_offer_cents", 50)))
+                                executor.log_exit_fill(
+                                    ticker            = ticker,
+                                    pos               = pos,
+                                    fill_cents        = _pc_cents,
+                                    contracts_filled  = _pc_fill,
+                                    reason            = _pc_reason,
+                                    order_id          = exit_oid,
+                                    mode              = "live",
+                                )
+                            except Exception as _csv_exc:
+                                log.warning("trades.csv partial-cancel log failed for %s: %s", ticker, _csv_exc)
                         else:
                             # Canceled with 0 fills — Kalshi rejected the limit price
                             # (likely stale price too far from market). Keep the position

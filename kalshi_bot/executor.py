@@ -119,6 +119,42 @@ class Executor:
         self._csv_writer.writerow(row)
         self._csv_fh.flush()
 
+    def log_exit_fill(
+        self,
+        ticker: str,
+        pos: dict,
+        fill_cents: int,
+        contracts_filled: int,
+        reason: str,
+        order_id: str,
+        mode: str = "live",
+    ) -> None:
+        """Log a confirmed exit fill to trades.csv.
+
+        Called by _fill_poll_loop once the exit order actually fills (or
+        partially fills + cancels). Replaces the prior pattern of logging at
+        order-placement time, which produced duplicate rows when illiquid
+        sell-limits got canceled and retried by exit_checker.
+        """
+        side      = pos.get("side", "yes")
+        exit_side = "no" if side == "yes" else "yes"
+        exit_signal = Signal(
+            ticker            = ticker,
+            title             = "",
+            category          = pos.get("category", "fomc"),
+            meeting           = pos.get("meeting", ""),
+            outcome           = pos.get("outcome", ""),
+            side              = exit_side,
+            fair_value        = pos.get("fair_value", 0.5),
+            market_price      = fill_cents / 100,
+            edge              = 0.0,
+            fee_adjusted_edge = 0.0,
+            contracts         = contracts_filled,
+            confidence        = 0.0,
+            model_source      = f"exit: {reason}",
+        )
+        self._log_trade(exit_signal, "exit", order_id, mode)
+
     # ── Cycle management ──────────────────────────────────────────────────────
 
     def __del__(self):
@@ -712,7 +748,10 @@ class Executor:
             try:
                 resp     = self.client.post("/portfolio/orders", payload)
                 order_id = resp.get("order", {}).get("order_id", "") or ""
-                self._log_trade(exit_signal, "exit", order_id, "live")
+                # Note: trades.csv exit row is written by _fill_poll_loop on
+                # fill confirmation, NOT here. Logging at order-placement time
+                # produced ~100 duplicate rows per ticker on illiquid markets
+                # where sell-limit orders kept getting canceled and retried.
                 log.info(
                     "[LIVE  EXIT ] %-38s  side=%-3s  contracts=%-2d  "
                     "price=%d¢  reason=%s  order_id=%s",
