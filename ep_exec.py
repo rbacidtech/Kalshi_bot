@@ -352,6 +352,42 @@ async def _process_signal(
         else:
             return _rejected("KALSHI_API_CIRCUIT")
 
+    # ── Time-to-close filter (short-game policy) ─────────────────────────────
+    # Reject signals on markets that resolve more than ep:config:max_days_to_close
+    # days from now (default 14). Operator can change without restart.
+    if sig.asset_class == "kalshi" and sig.close_time:
+        try:
+            _max_days_raw = await bus._r.hget("ep:config", "max_days_to_close")
+            _max_days = float(_max_days_raw) if _max_days_raw else 14.0
+            _close_dt = datetime.fromisoformat(sig.close_time.replace("Z", "+00:00"))
+            _days_out = (_close_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
+            if _days_out > _max_days:
+                log.debug(
+                    "MAX_DAYS_TO_CLOSE: %s close=%.1fd > %.1fd — skipping",
+                    sig.ticker, _days_out, _max_days,
+                )
+                return _rejected("MAX_DAYS_TO_CLOSE")
+        except Exception:
+            pass
+
+    # ── Per-source kill switch ───────────────────────────────────────────────
+    # Reject signals whose model_source matches the comma-separated
+    # ep:config:disabled_model_sources list. Lets the operator turn off losing
+    # strategies without redeploying.
+    try:
+        _dis_raw = await bus._r.hget("ep:config", "disabled_model_sources")
+        if _dis_raw:
+            _dis_str = _dis_raw.decode() if isinstance(_dis_raw, bytes) else _dis_raw
+            _dis_set = {s.strip() for s in _dis_str.split(",") if s.strip()}
+            if sig.model_source in _dis_set:
+                log.debug(
+                    "DISABLED_SOURCE: %s src=%s",
+                    sig.ticker, sig.model_source,
+                )
+                return _rejected("DISABLED_SOURCE")
+    except Exception:
+        pass
+
     # ── Stop-loss cooldown ────────────────────────────────────────────────────
     # Prevent re-entering a market we just stopped out of.
     # In-memory fast path first; Redis check survives restarts.
