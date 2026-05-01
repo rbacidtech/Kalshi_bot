@@ -1577,6 +1577,16 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         if fee_edge < MIN_EDGE_GROSS * 0.5:
             continue
 
+        # Skip the broken-calibration mid-confidence zone.
+        # Backtest on 254 resolved weather entries: when the model puts
+        # P(this-side-wins) in [0.50, 0.70), realized win rate is 13% vs
+        # predicted 55-65% — a 50pp miscalibration. Dropping this band
+        # lifts fee-adjusted P&L from $33.81 → $110.00 (+$76.19, +3.3x)
+        # over the historical sample. See output/weather_blend_comparison.csv.
+        _p_win = fair_value if side == "yes" else (1 - fair_value)
+        if 0.50 <= _p_win < 0.70:
+            continue
+
         # Confidence tiers based on source count and inter-model spread.
         # 3+ sources strongly agreeing → near-FOMC tier confidence.
         n_src        = len(set(source_tag))
