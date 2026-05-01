@@ -81,8 +81,10 @@ class BotState:
         self.recent_trades: list[TradeEvent]        = []   # last 50
         self.signals:       list[dict]              = []   # current cycle signals
         self.balance_cents: int                     = 0
+        self.portfolio_value_cents: int             = 0
         self.session_pnl_cents: int                 = 0
         self.start_balance_cents: int               = 0
+        self.start_portfolio_value_cents: int       = 0
         self.cycle_count:   int                     = 0
         self.last_cycle_at: datetime.datetime | None = None
         self.ws_connected:  bool                    = False
@@ -153,11 +155,15 @@ class BotState:
 
     # ── Session state ─────────────────────────────────────────────────────────
 
-    def set_balance(self, balance_cents: int):
+    def set_balance(self, balance_cents: int, portfolio_value_cents: int = 0):
         with self._lock:
             if self.start_balance_cents == 0:
                 self.start_balance_cents = balance_cents
             self.balance_cents = balance_cents
+            if portfolio_value_cents > 0:
+                if self.start_portfolio_value_cents == 0:
+                    self.start_portfolio_value_cents = portfolio_value_cents
+                self.portfolio_value_cents = portfolio_value_cents
         self._emit("balance", balance_cents)
 
     def set_signals(self, signals: list):

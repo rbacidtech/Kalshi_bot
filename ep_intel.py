@@ -1600,7 +1600,7 @@ async def intel_main() -> None:
                         log.warning("Balance fetch failed — no prior value; using paper default.")
                         # keep balance_cents = 100_000 as safe fallback
             if balance_cents is not None:
-                state.set_balance(balance_cents)
+                state.set_balance(balance_cents, _portfolio_value_cents)
                 await bus.set_balance(balance_cents, state.mode, _portfolio_value_cents)
                 metrics.update_balance(balance_cents)
 

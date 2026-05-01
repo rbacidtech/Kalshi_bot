@@ -137,12 +137,18 @@ class AlertManager:
         self._send(f"Trade {trade.action}: {trade.ticker}", msg)
 
     def _on_balance(self, balance_cents: int):
-        """Alert if drawdown limit is approaching."""
+        """Alert if drawdown limit is approaching.
+
+        Drawdown is computed against total account value (cash + positions),
+        not cash alone — otherwise deploying cash into positions reads as a loss.
+        """
         state = self.state
-        if state.start_balance_cents <= 0:
+        start_pv   = state.start_portfolio_value_cents
+        current_pv = state.portfolio_value_cents
+        if start_pv <= 0 or current_pv <= 0:
             return
 
-        drawdown = 1.0 - (balance_cents / state.start_balance_cents)
+        drawdown = 1.0 - (current_pv / start_pv)
 
         # Warn at 7%, alert at 10%
         if drawdown >= 0.10:
@@ -150,9 +156,10 @@ class AlertManager:
             if self._check_rate(rate_key):
                 msg = (
                     f"🚨 DRAWDOWN ALERT\n"
-                    f"Balance: ${balance_cents/100:.2f}\n"
-                    f"Session start: ${state.start_balance_cents/100:.2f}\n"
+                    f"Portfolio: ${current_pv/100:.2f}\n"
+                    f"Session start: ${start_pv/100:.2f}\n"
                     f"Drawdown: {drawdown:.1%}\n"
+                    f"Cash on hand: ${balance_cents/100:.2f}\n"
                     f"Monitor positions closely."
                 )
                 self._send("DRAWDOWN ALERT", msg)
@@ -163,7 +170,7 @@ class AlertManager:
                 msg = (
                     f"⚠️ Drawdown Warning\n"
                     f"Current drawdown: {drawdown:.1%} (limit: 10%)\n"
-                    f"Balance: ${balance_cents/100:.2f}"
+                    f"Portfolio: ${current_pv/100:.2f}"
                 )
                 self._send("Drawdown Warning", msg)
 
