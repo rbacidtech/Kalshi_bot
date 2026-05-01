@@ -402,11 +402,16 @@ class ResolutionDB:
     def init(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
+        # NOTE: fresh-install schema body intentionally includes series_ticker
+        # so new deployments match the legacy on-disk schema (which has it as
+        # NOT NULL). For legacy DBs this CREATE no-ops; the idempotent ALTER
+        # below is the path that adds series_ticker and outcome to legacy.
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS resolutions (
-                ticker      TEXT PRIMARY KEY,
-                outcome     TEXT,
-                resolved_at TEXT
+                ticker        TEXT PRIMARY KEY,
+                series_ticker TEXT,
+                outcome       TEXT,
+                resolved_at   TEXT
             )
         """)
         self._conn.execute("""
@@ -425,22 +430,51 @@ class ResolutionDB:
             )
         """)
         self._conn.commit()
-        # Migrations: add columns that were added after initial deployment
-        for _col, _typedef in [
-            ("series",       "TEXT"),
-            ("entry_cents",  "INTEGER"),
-            ("exit_cents",   "INTEGER"),
-            ("correct",      "INTEGER"),
-            ("recorded_at",  "TEXT"),
-            ("model_source", "TEXT"),
+        # Migrations: add columns that were added after initial deployment.
+        # Idempotent — ALTER ... ADD COLUMN raises OperationalError ("duplicate
+        # column name") if the column already exists; we swallow that case.
+        # Critical: legacy DBs had only (ticker, outcome, resolved_at) in some
+        # builds and (ticker, series_ticker NOT NULL, ...) in others. Both the
+        # outcome and series_ticker ALTERs run unconditionally so any on-disk
+        # variant ends up with the columns the current code expects.
+        for _table, _col, _typedef in [
+            ("resolutions",    "outcome",       "TEXT"),
+            ("resolutions",    "series_ticker", "TEXT"),
+            ("trade_outcomes", "series",        "TEXT"),
+            ("trade_outcomes", "entry_cents",   "INTEGER"),
+            ("trade_outcomes", "exit_cents",    "INTEGER"),
+            ("trade_outcomes", "correct",       "INTEGER"),
+            ("trade_outcomes", "recorded_at",   "TEXT"),
+            ("trade_outcomes", "model_source",  "TEXT"),
         ]:
             try:
                 self._conn.execute(
-                    f"ALTER TABLE trade_outcomes ADD COLUMN {_col} {_typedef}"
+                    f"ALTER TABLE {_table} ADD COLUMN {_col} {_typedef}"
                 )
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+        # Round-trip self-test: write, read, delete a sentinel row to prove
+        # the resolutions write path actually works end-to-end. Cheaper than
+        # 14 days of silent failure (the bug we just lived through).
+        _TEST_TICKER = "__SELFTEST__"
+        try:
+            self.record_resolution(_TEST_TICKER, "yes")
+            _got = self.get_outcome(_TEST_TICKER)
+            if _got != "yes":
+                raise RuntimeError(
+                    f"ResolutionDB self-test mismatch: wrote 'yes', read {_got!r}"
+                )
+        finally:
+            try:
+                self._conn.execute(
+                    "DELETE FROM resolutions WHERE ticker = ?", (_TEST_TICKER,)
+                )
+                self._conn.commit()
+            except Exception:
+                pass
+
         log.info("ResolutionDB initialised at %s", self._path)
 
     def get_outcome(self, ticker: str) -> Optional[str]:
@@ -453,21 +487,52 @@ class ResolutionDB:
             )
             row = cur.fetchone()
             return row[0] if row else None
-        except Exception:
+        except sqlite3.OperationalError as exc:
+            # Schema mismatch — column missing, table missing, etc.
+            # Surface as warning so it doesn't silently corrupt downstream
+            # behavioral_recency_bias_adj and resolved-against fast-exits.
+            log.warning(
+                "ResolutionDB.get_outcome schema error for %s: %s",
+                ticker, exc,
+            )
+            return None
+        except Exception as exc:
+            log.debug("ResolutionDB.get_outcome error for %s: %s", ticker, exc)
             return None
 
     def record_resolution(self, ticker: str, outcome: str) -> None:
         if self._conn is None:
             return
         from datetime import datetime, timezone as _tz
+        # series_ticker is NOT NULL in the legacy on-disk schema; populate it
+        # so INSERTs succeed against legacy DBs. Same convention as the poll
+        # loop (`_series` derivation): split on first dash, fall back to the
+        # full ticker when no dash is present.
+        series_ticker = ticker.split("-")[0] if "-" in ticker else ticker
         try:
             self._conn.execute(
-                "INSERT OR REPLACE INTO resolutions (ticker, outcome, resolved_at) VALUES (?, ?, ?)",
-                (ticker, outcome, datetime.now(_tz.utc).isoformat()),
+                "INSERT OR REPLACE INTO resolutions "
+                "(ticker, series_ticker, outcome, resolved_at) "
+                "VALUES (?, ?, ?, ?)",
+                (ticker, series_ticker, outcome,
+                 datetime.now(_tz.utc).isoformat()),
             )
             self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            # Schema mismatch — e.g. column missing or table missing.
+            # This is a programmer/migration error, not a runtime hiccup;
+            # surface clearly so it doesn't silently disable resolution
+            # tracking for weeks (the exact failure mode this whole fix
+            # targets).
+            log.warning(
+                "ResolutionDB.record_resolution schema error for %s: %s",
+                ticker, exc,
+            )
         except Exception as exc:
-            log.warning("ResolutionDB.record_resolution error: %s", exc)
+            log.warning(
+                "ResolutionDB.record_resolution error for %s: %s",
+                ticker, exc,
+            )
 
     def record_trade_outcome(self, *, ticker: str, series: str, side: str,
                               contracts: int, entry_cents: int, exit_cents: int,
@@ -549,7 +614,22 @@ async def poll_resolutions_loop(
                             except Exception as exc:
                                 log.warning("ep:resolutions Redis write error for %s: %s", _series, exc)
                 except Exception as exc:
-                    log.debug("poll_resolutions: %s — %s", ticker, exc)
+                    # 404s are expected (markets that have been delisted or
+                    # never existed under our subscription) and would spam
+                    # the log if surfaced — keep those at debug. Anything
+                    # else (auth, schema, JSON shape) is a real defect and
+                    # must be visible.
+                    _exc_name = type(exc).__name__
+                    _is_404 = "404" in str(exc) or "404" in _exc_name
+                    if _is_404:
+                        log.debug(
+                            "poll_resolutions 404: %s — %s", ticker, exc,
+                        )
+                    else:
+                        log.warning(
+                            "poll_resolutions: %s — %s: %s",
+                            ticker, _exc_name, exc,
+                        )
         except Exception as exc:
             log.warning("poll_resolutions_loop error: %s", exc)
         await _asyncio.sleep(interval)
