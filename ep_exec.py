@@ -555,16 +555,27 @@ async def _process_signal(
 
     # Apply per-strategy calibration multiplier from 90-day rolling win-rate analysis.
     # Strategies with win_rate > 65% → up to 1.20x; < 40% → down to 0.60x.
+    # Operator can override per-source via ep:config:source_kelly_mult hash —
+    # bounded to [0.1, 2.0] for safety. Override takes precedence over empirical.
     # Re-clamp to risk_engine's max_contracts so the multiplier can't push the
     # order over the Kelly ceiling (e.g. 1.20× × max=10 → 12 would violate cap).
     if contracts > 0:
         _strat_mult = get_strategy_conf_mult(sig.model_source or "")
+        try:
+            _op_raw = await bus._r.hget(
+                "ep:config:source_kelly_mult", sig.model_source or ""
+            )
+            if _op_raw:
+                _op_str = _op_raw.decode() if isinstance(_op_raw, bytes) else _op_raw
+                _strat_mult = max(0.1, min(2.0, float(_op_str)))
+        except Exception:
+            pass
         if _strat_mult != 1.0:
             _post_mult = max(1, int(contracts * _strat_mult))
             _kelly_cap = risk_engine._kalshi.cfg.max_contracts \
                 if sig.asset_class == "kalshi" else _post_mult
             contracts = min(_post_mult, _kelly_cap)
-            log.debug("Strategy calib mult %.2f applied to %s → %d contracts (cap=%d)",
+            log.debug("Strategy mult %.2f applied to %s → %d contracts (cap=%d)",
                       _strat_mult, sig.model_source, contracts, _kelly_cap)
 
     _ABSOLUTE_MAX_CONTRACTS = 500  # hard safety cap — prevents Kelly misconfiguration
