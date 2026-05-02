@@ -18,6 +18,18 @@ _Updated 2026-04-24 06:15 UTC — third-round LOW sweep: 5 items patched (commit
 
 ## Silently broken — needs fix
 
+- **`ep_pnl_snapshots.py` bypasses the audit-writer hardening.**
+  Documented 2026-05-02 as part of Phase 1 (`PgAuditWriter` hardening).
+  `ep_pnl_snapshots.py:67-91` writes Postgres directly via its own
+  `asyncpg.create_pool` (lines 47-50), so it does NOT benefit from the
+  Phase 1 hardenings landed in `ep_pg_audit.py` (init-failure handling,
+  queue overflow visibility, DLQ retry, schema validation). Its failure
+  modes — Postgres dropout mid-snapshot, missing/typo'd payload fields,
+  pool-creation failure on boot — are governed by whatever local
+  exception handling lives in that file. Not yet audited. Out of Phase 1
+  scope by operator decision; revisit in a future phase that consolidates
+  Postgres write paths (or audits `ep_pnl_snapshots.py` in isolation).
+
 - ~~**Item 9 — Per-strategy Kelly calibration multiplier.**~~
   **FIXED 2026-04-24 04:48 UTC.** `ep_kelly_calib.py:_compute_calibration`
   had three column-name mismatches against the `terminal_trades` view:

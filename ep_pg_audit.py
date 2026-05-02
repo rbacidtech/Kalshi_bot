@@ -21,8 +21,47 @@ log = logging.getLogger("edgepulse.pg_audit")
 _BATCH_SIZE   = 100
 _FLUSH_SECS   = 2.0
 _QUEUE_MAXLEN = 10_000
+_MAX_RETRIES  = 3
+
+# Required fields per table — derived from the Postgres schema's NOT NULL
+# columns minus those auto-supplied by _insert_*() (e.g. ts_us → emitted_at,
+# server defaults). Validated at enqueue time so bad payloads fail loudly at
+# the call site rather than poisoning a 100-row batch.
+_REQUIRED_FIELDS: Dict[str, set] = {
+    "signals":           {"signal_id", "ts_us", "strategy", "ticker", "side", "asset_class"},
+    "executions":        {"exec_id", "ts_us", "status"},
+    "balance_snapshots": {"ts_us", "asset_class", "balance_cents", "open_pos_count", "exposure_cents"},
+    "llm_decisions":     {"ts_us", "model"},
+    "position_history":  {"ticker", "side", "contracts", "entry_cents", "exit_cents",
+                          "realized_pnl_cents"},
+    "market_snapshots":  {"ts_us", "ticker"},
+}
 
 _writer: Optional["PgAuditWriter"] = None
+_disabled_write_count: int = 0
+_last_disabled_warn_ts: float = 0.0
+
+
+class _NoopWriter:
+    """Stand-in returned by audit() when the real writer is unavailable.
+    Counts dropped writes; emits one WARN per minute (rate-limited)."""
+    def write(self, table: str, payload: Dict[str, Any]) -> None:
+        global _disabled_write_count, _last_disabled_warn_ts
+        _disabled_write_count += 1
+        import time as _t
+        now = _t.time()
+        if now - _last_disabled_warn_ts > 60.0:
+            log.warning("pg_audit disabled — %d writes dropped (most recent: %s)",
+                        _disabled_write_count, table)
+            _last_disabled_warn_ts = now
+
+    @property
+    def _queue(self):
+        # Heartbeat code in ep_intel.py:1142 and ep_exec.py:1282 reads
+        # _audit_writer()._queue.qsize() — return a stub so it keeps working.
+        class _Q:
+            def qsize(self): return 0
+        return _Q()
 
 
 class PgAuditWriter:
@@ -32,6 +71,7 @@ class PgAuditWriter:
         self._pool: Optional[asyncpg.Pool] = None
         self._queue: asyncio.Queue         = asyncio.Queue(maxsize=_QUEUE_MAXLEN)
         self._task:  Optional[asyncio.Task] = None
+        self._failed: List[tuple]          = []   # [(table, rows, retries_left)]
 
     async def start(self) -> None:
         self._pool = await asyncpg.create_pool(
@@ -56,19 +96,45 @@ class PgAuditWriter:
         log.info("PgAuditWriter stopped")
 
     def write(self, table: str, payload: Dict[str, Any]) -> None:
-        """Enqueue a row.  Drops the oldest entry if the queue is full."""
+        """Enqueue a row. Drops the oldest entry if the queue is full."""
+        # H4 schema validation BEFORE enqueue — see _REQUIRED_FIELDS map at top of module.
+        required = _REQUIRED_FIELDS.get(table)
+        if required:
+            missing = required - set(payload.keys())
+            if missing:
+                log.error("pg_audit: %s payload missing required fields %s — dropped",
+                          table, sorted(missing))
+                try:
+                    from ep_metrics import metrics
+                    metrics.invariant_violations.labels(
+                        invariant=f"audit_payload_invalid_{table}").inc()
+                except Exception:
+                    pass
+                return
+
         item = (table, payload)
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
+            # Eviction site — this is where the actual drop happens.
             try:
-                self._queue.get_nowait()
+                dropped_table, _ = self._queue.get_nowait()
+                try:
+                    from ep_metrics import metrics
+                    metrics.invariant_violations.labels(
+                        invariant=f"audit_queue_overflow_{dropped_table}").inc()
+                except Exception:
+                    pass
+                log.warning(
+                    "audit queue overflow: queue full at %d, evicting oldest %s row to make room for %s",
+                    _QUEUE_MAXLEN, dropped_table, table,
+                )
             except asyncio.QueueEmpty:
                 pass
             try:
                 self._queue.put_nowait(item)
             except asyncio.QueueFull:
-                log.debug("audit queue full — dropping %s row", table)
+                log.error("audit queue full immediately after eviction — dropping %s row", table)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -78,6 +144,28 @@ class PgAuditWriter:
             await self._flush_all()
 
     async def _flush_all(self) -> None:
+        # Retry previously-failed batches FIRST (head-of-line for outage recovery).
+        if self._failed:
+            still_failed: List[tuple] = []
+            for table, rows, retries in self._failed:
+                try:
+                    await self._insert_batch(table, rows)
+                except Exception as exc:
+                    if retries > 0:
+                        still_failed.append((table, rows, retries - 1))
+                        log.warning("pg_audit retry %d remaining for %s (%d rows): %s",
+                                    retries - 1, table, len(rows), exc)
+                    else:
+                        log.error("pg_audit DROPPING %d %s rows after %d retries: %s",
+                                  len(rows), table, _MAX_RETRIES, exc)
+                        try:
+                            from ep_metrics import metrics
+                            metrics.invariant_violations.labels(
+                                invariant=f"audit_dropped_{table}").inc(len(rows))
+                        except Exception:
+                            pass
+            self._failed = still_failed
+
         if self._queue.empty():
             return
         batch: List[tuple] = []
@@ -95,7 +183,9 @@ class PgAuditWriter:
             try:
                 await self._insert_batch(table, rows)
             except Exception as exc:
-                log.warning("pg_audit insert failed (%s, %d rows): %s", table, len(rows), exc)
+                log.warning("pg_audit insert failed (%s, %d rows) — queued for retry: %s",
+                            table, len(rows), exc)
+                self._failed.append((table, rows, _MAX_RETRIES))
 
     async def _insert_batch(self, table: str, rows: List[Dict]) -> None:
         if not self._pool:
@@ -344,9 +434,18 @@ async def init_audit_writer() -> None:
     dsn = dsn.replace("postgresql+asyncpg://", "postgresql://")
     if not dsn:
         log.warning("DATABASE_URL not set — audit writes disabled")
+        _writer = None
         return
-    _writer = PgAuditWriter(dsn)
-    await _writer.start()
+    candidate = PgAuditWriter(dsn)
+    try:
+        await candidate.start()
+    except Exception as exc:
+        log.error("init_audit_writer: pool creation failed (%s) — audit disabled", exc)
+        # CRITICAL: do NOT leave the partially-constructed instance assigned.
+        # Otherwise writes silently land in a queue that never drains.
+        _writer = None
+        return
+    _writer = candidate
 
 
 async def stop_audit_writer() -> None:
@@ -356,7 +455,7 @@ async def stop_audit_writer() -> None:
         _writer = None
 
 
-def audit() -> PgAuditWriter:
+def audit() -> "PgAuditWriter":
     if _writer is None:
-        raise RuntimeError("audit writer not initialised — call init_audit_writer() first")
+        return _NoopWriter()  # type: ignore[return-value]
     return _writer
