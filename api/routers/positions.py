@@ -21,6 +21,12 @@ from api.schemas import PortfolioResponse, PositionResponse, PositionSide
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/positions", tags=["positions"])
 
+# Price staleness gate for unrealized P&L. If a price record's ts_us is older
+# than this many seconds, treat the position as having no current price (return
+# pnl=None, status="stale") so unrealized P&L can't silently freeze when a
+# scanner halts.
+_MAX_PRICE_AGE_S = float(os.getenv("UNREALIZED_PRICE_MAX_AGE_S", "600"))
+
 
 def _redis_key(user_id: str, key: str) -> str:
     """
@@ -35,20 +41,41 @@ async def _get_redis() -> aioredis.Redis:
     return aioredis.from_url(settings.redis_url, decode_responses=False)
 
 
-def _compute_pnl(pos: dict[str, Any], prices: dict[str, Any]) -> Optional[int]:
-    ticker   = pos.get("ticker", "")
-    side     = pos.get("side", "yes")
+def _compute_pnl(
+    pos: dict[str, Any],
+    prices: dict[str, Any],
+) -> tuple[Optional[int], str]:
+    """
+    Return (unrealized_pnl_cents, status) where status is one of:
+      "ok"       — fresh price, pnl is valid
+      "missing"  — no price record for this ticker
+      "stale"    — price record exists but its ts_us is older than
+                   _MAX_PRICE_AGE_S; pnl is None (unrealized must not be
+                   trusted when the upstream scanner has stopped publishing).
+    """
+    ticker    = pos.get("ticker", "")
+    side      = pos.get("side", "yes")
     contracts = int(pos.get("contracts", 0))
-    entry    = int(pos.get("entry_cents", 0))
+    entry     = int(pos.get("entry_cents", 0))
     price_data = prices.get(ticker, {})
-    cur_yes  = price_data.get("yes_price")
+    cur_yes   = price_data.get("yes_price")
     if cur_yes is None:
-        return None
+        return None, "missing"
+    # Staleness check — only enforce when ts_us is present. Records without a
+    # ts_us field are treated as fresh (back-compat with any older publishers).
+    ts_us = price_data.get("ts_us")
+    if ts_us is not None:
+        try:
+            age_s = time.time() - (float(ts_us) / 1_000_000.0)
+            if age_s > _MAX_PRICE_AGE_S:
+                return None, "stale"
+        except (TypeError, ValueError):
+            pass  # malformed ts_us — treat as fresh rather than blocking pnl
     cur_yes = int(cur_yes)
     if side == "yes":
-        return (cur_yes - entry) * contracts
+        return (cur_yes - entry) * contracts, "ok"
     else:
-        return (entry - cur_yes) * contracts
+        return (entry - cur_yes) * contracts, "ok"
 
 
 @router.get("", response_model=PortfolioResponse)
@@ -83,6 +110,7 @@ async def get_positions(
         total_deployed   = 0
         total_unrealized = 0
         missing_price_count = 0
+        stale_price_count   = 0
 
         for raw_key, raw_val in raw_positions.items():
             ticker = (raw_key.decode() if isinstance(raw_key, bytes) else raw_key)
@@ -98,11 +126,13 @@ async def get_positions(
             side      = p.get("side", "yes")
             entry     = int(p.get("entry_cents", 0))
             cost      = (100 - entry) * contracts if side == "no" else entry * contracts
-            pnl       = _compute_pnl({**p, "ticker": ticker}, prices)
+            pnl, pnl_status = _compute_pnl({**p, "ticker": ticker}, prices)
 
             total_deployed += cost
-            if pnl is not None:
+            if pnl_status == "ok" and pnl is not None:
                 total_unrealized += pnl
+            elif pnl_status == "stale":
+                stale_price_count += 1
             else:
                 missing_price_count += 1
 
@@ -158,6 +188,7 @@ async def get_positions(
             total_value_cents          = total_value,
             position_count             = len(positions),
             positions_without_price    = missing_price_count,
+            positions_with_stale_price = stale_price_count,
         )
     finally:
         await r.aclose()

@@ -14,7 +14,8 @@ import json
 import os
 import re as _re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 from ep_config import cfg, NODE_ID, REDIS_URL, EXIT_INTERVAL, EP_PRICES, log, sd_notify
@@ -32,7 +33,7 @@ from ep_coinbase import CoinbaseTradeClient, fetch_btc_spot_usd
 from ep_risk import BTC_UNIT
 from ep_metrics import metrics
 from ep_telegram import telegram
-from ep_resolution_db import ResolutionDB, poll_resolutions_loop
+from ep_resolution_db import ResolutionDB, poll_resolutions_loop, _load_completed_trades
 from kalshi_bot.executor import ArbRollbackFailed
 from ep_pg_audit import init_audit_writer, stop_audit_writer, audit as _audit_writer
 try:
@@ -4086,46 +4087,44 @@ async def _divergence_monitor_loop(bus: RedisBus, positions: "PositionStore", in
     while True:
         try:
             await asyncio.sleep(interval_s)
-            if not os.path.exists(trades_csv):
+            csv_path = Path(trades_csv)
+            if not csv_path.exists():
                 continue
 
-            cutoff_s = 7 * 86400
-            entries: dict = {}
-            realized_pnl  = 0.0
-            expected_pnl  = 0.0
-            n_completed   = 0
+            # Reuse the canonical performance pairing (strict FIFO, exit-ts
+            # window). Previously this loop hand-rolled the pairing and
+            # disagreed with _load_completed_trades on two points:
+            #   1. `entries[ticker] = row` overwrote prior entries for the same
+            #      ticker (no FIFO; multiple entries collapsed into the last).
+            #   2. The 7d cutoff was applied to every CSV row, so an old entry
+            #      whose exit was recent got dropped before pairing.
+            since = datetime.now(timezone.utc) - timedelta(days=7)
+            completed = _load_completed_trades(csv_path, since=since, mode="live")
 
-            with open(trades_csv, newline="") as f:
-                for row in csv.DictReader(f):
-                    try:
-                        ts_s = row.get("timestamp", "")
-                        if ts_s:
-                            row_dt = datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
-                            if (datetime.now(timezone.utc) - row_dt.astimezone(timezone.utc)).total_seconds() > cutoff_s:
-                                continue
-                        ticker = row.get("ticker", "")
-                        action = row.get("action", "")
-                        if action == "entry":
-                            entries[ticker] = row
-                        elif action == "exit" and ticker in entries:
-                            e = entries.pop(ticker)
-                            ep  = float(e.get("price_cents", 50) or 50)
-                            xp  = float(row.get("price_cents", ep) or ep)
-                            fv  = float(e.get("fair_value", ep / 100) or ep / 100)
-                            side = e.get("side", "yes")
-                            contracts = int(e.get("contracts", 1) or 1)
-                            if side == "yes":
-                                gross_r = (xp - ep) * contracts
-                                gross_e = (fv * 100 - ep) * contracts
-                            else:
-                                gross_r = (ep - xp) * contracts
-                                gross_e = (ep - fv * 100) * contracts
-                            fee = max(0.0, abs(gross_r) * 0.07)
-                            realized_pnl  += gross_r - fee
-                            expected_pnl  += max(0.0, gross_e)  # only positive expected PnL
-                            n_completed   += 1
-                    except Exception:
-                        continue
+            realized_pnl = 0.0
+            expected_pnl = 0.0
+            n_completed  = 0
+
+            for t in completed:
+                ep_c   = t["entry_price_cents"]
+                xp_c   = t["exit_price_cents"]
+                c      = t["contracts"]
+                side   = t["side"]
+                # Fall back to entry price (= break-even, gross_e = 0) when
+                # fair_value is missing rather than fabricating expected P&L.
+                fv_c   = t.get("fair_value_cents")
+                if fv_c is None:
+                    fv_c = ep_c
+                if side == "yes":
+                    gross_r = (xp_c - ep_c) * c
+                    gross_e = (fv_c - ep_c) * c
+                else:
+                    gross_r = (ep_c - xp_c) * c
+                    gross_e = (ep_c - fv_c) * c
+                fee = max(0.0, abs(gross_r) * 0.07)
+                realized_pnl += gross_r - fee
+                expected_pnl += max(0.0, gross_e)  # only positive expected PnL
+                n_completed  += 1
 
             if n_completed < 5:
                 continue

@@ -68,7 +68,8 @@ def _load_completed_trades(
         ticker, strategy, side, contracts,
         entry_price_cents, exit_price_cents,
         entry_ts, exit_ts,
-        hold_seconds, pnl_cents, mode
+        hold_seconds, pnl_cents, mode,
+        fair_value_cents  (entry-row fair_value × 100, or None if unparseable)
     """
     if not csv_path.exists():
         log.debug("Trades CSV not found at %s — returning empty list.", csv_path)
@@ -137,6 +138,15 @@ def _load_completed_trades(
             except (ValueError, TypeError):
                 continue
 
+            # fair_value is stored as a 0-1 fraction in trades.csv; surface as
+            # cents so downstream callers (e.g. _divergence_monitor_loop) can
+            # use it without re-applying the *100 conversion.
+            fv_raw = entry_row.get("fair_value", "")
+            try:
+                fair_value_cents = float(fv_raw) * 100 if fv_raw not in ("", None) else None
+            except (ValueError, TypeError):
+                fair_value_cents = None
+
             # P&L: profit when price moves in our favour
             if side == "yes":
                 pnl_cents = (exit_price_cents - entry_price_cents) * contracts
@@ -161,6 +171,7 @@ def _load_completed_trades(
                 "hold_seconds":       hold_seconds,
                 "pnl_cents":          pnl_cents,
                 "mode":               row_mode,
+                "fair_value_cents":   fair_value_cents,
             })
 
     return completed

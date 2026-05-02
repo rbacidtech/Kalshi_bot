@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -37,6 +38,11 @@ router = APIRouter(tags=["websocket"])
 
 _POLL_S = 3.0    # how often to poll Redis for deltas
 _PING_S = 10.0   # keepalive ping interval
+
+# Same staleness gate as api/routers/positions.py — price records older than
+# this are excluded from unrealized P&L. Defaults to 600s; override via the
+# UNREALIZED_PRICE_MAX_AGE_S env var.
+_MAX_PRICE_AGE_S = float(os.getenv("UNREALIZED_PRICE_MAX_AGE_S", "600"))
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -116,6 +122,9 @@ async def _portfolio(r) -> dict[str, Any]:
     total_deployed   = 0
     total_unrealized = 0
     missing          = 0
+    stale            = 0
+
+    now_s = time.time()
 
     for ticker, raw_val in raw_pos.items():
         try: p = json.loads(raw_val)
@@ -130,10 +139,25 @@ async def _portfolio(r) -> dict[str, Any]:
 
         price_data = prices.get(ticker, {})
         cur_yes = price_data.get("yes_price")
+        # Mirror api/routers/positions.py:_compute_pnl — null pnl on missing
+        # OR stale (>_MAX_PRICE_AGE_S) ts_us so unrealized totals never freeze
+        # silently when a scanner halts.
+        is_stale = False
         if cur_yes is not None:
+            ts_us = price_data.get("ts_us")
+            if ts_us is not None:
+                try:
+                    if (now_s - float(ts_us) / 1_000_000.0) > _MAX_PRICE_AGE_S:
+                        is_stale = True
+                except (TypeError, ValueError):
+                    pass
+        if cur_yes is not None and not is_stale:
             cur_yes = int(cur_yes)
             pnl = (cur_yes - entry) * contracts if side == "yes" else (entry - cur_yes) * contracts
             total_unrealized += pnl
+        elif is_stale:
+            pnl = None
+            stale += 1
         else:
             pnl = None
             missing += 1
@@ -187,6 +211,7 @@ async def _portfolio(r) -> dict[str, Any]:
         "total_value_cents":          total_value,
         "position_count":             len(positions),
         "positions_without_price":    missing,
+        "positions_with_stale_price": stale,
     }
 
 

@@ -169,6 +169,7 @@ class PortfolioResponse(BaseModel):
     total_value_cents: Optional[int]      # available + deployed (total account value)
     position_count: int
     positions_without_price: int = 0      # positions excluded from P&L total (price feed gap)
+    positions_with_stale_price: int = 0   # excluded because price ts_us > UNREALIZED_PRICE_MAX_AGE_S
 
 
 # ---------------------------------------------------------------------------
