@@ -1550,6 +1550,26 @@ async def _sync_positions_with_kalshi(
         k_meeting    = _meeting_from_ticker(ticker)
         k_close_time = mp.get("close_time") or mp.get("expiration_time") or ""
 
+        # ── Skip resolved tickers (Phase 5 Finding #7 fix) ──────────────────
+        # Kalshi keeps settled positions visible in /portfolio/positions until
+        # the contracts clear from the user's account, which can take hours.
+        # Without this skip, the sync re-adds a Redis entry for a settled
+        # ticker, the post-resolution-cleanup branch in _exit_checker fires
+        # again on the next cycle, publishing another ExecutionReport (and
+        # hence another `executions` row) every 30 min.  Empirically observed:
+        # 9-11x duplication per settled ticker, $1,930/30d phantom dup-write.
+        # Threshold mirrors the cleanup branch (`hours_past > 2.0`).
+        if k_close_time:
+            try:
+                _close_dt   = datetime.fromisoformat(k_close_time.replace("Z", "+00:00"))
+                _hours_past = (datetime.now(timezone.utc) - _close_dt).total_seconds() / 3600
+                if _hours_past > 2.0:
+                    log.debug("Position sync: skipping resolved ticker %s "
+                              "(closed %.1fh ago)", ticker, _hours_past)
+                    continue
+            except Exception:
+                pass
+
         # "Already correct" check must include meeting/close_time — a prior-version
         # sync may have written these as "" and those records silently bypass the
         # meeting-concentration gate until backfilled. Continue only if every
