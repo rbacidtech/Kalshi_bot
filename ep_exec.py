@@ -2658,6 +2658,29 @@ return cnt
 
                         # Paper / forced close: close immediately
                         if _exit_order_id in ("paper", "divergence") or cfg.PAPER_TRADE:
+                            # ── Audit asymmetry close (Phase 2b): live_divergence_close ──
+                            # When _exit_position raised KeyError (state divergence
+                            # between executor._positions and Redis), we set
+                            # _exit_order_id="divergence" and force-close here.  No
+                            # live order was placed, so executor._exit_position never
+                            # wrote a CSV exit row in live mode.  Paper mode is
+                            # already covered by _exit_position:723.  Audit and
+                            # ExecutionReport are both written by the fall-through
+                            # at 2826/2806 below — only CSV is missing here.
+                            if _exit_order_id == "divergence" and not cfg.PAPER_TRADE:
+                                try:
+                                    executor.log_exit_fill(
+                                        ticker            = ticker,
+                                        pos               = pos,
+                                        fill_cents        = current_cents,
+                                        contracts_filled  = contracts,
+                                        reason            = "live_divergence_close",
+                                        order_id          = "divergence",
+                                        mode              = "live",
+                                    )
+                                except Exception as _ld_csv_exc:
+                                    log.warning("live_divergence_close CSV log failed for %s: %s",
+                                                ticker, _ld_csv_exc)
                             await positions.close(ticker)
                         else:
                             # Live exit order placed — don't close yet.
@@ -2753,6 +2776,77 @@ return cnt
                                 )
                             if _sib_oid:
                                 if _sib_oid in ("paper", "divergence") or cfg.PAPER_TRADE:
+                                    # ── Audit asymmetry close (Phase 2b): arb_sibling_close ──
+                                    # The arb-group sibling sweep closes peers atomically
+                                    # when one leg stops out, but the OUTER 2826 audit block
+                                    # uses the primary's vars only — siblings get no audit
+                                    # row, no ExecReport, and only paper-mode CSV (via
+                                    # _exit_position:723).  Add the missing writes here.
+                                    # No fee on settlement-style closes; sibling fee is
+                                    # accounted for separately in primary leg's exit.
+                                    _sib_side = _sib_pos.get("side", "yes")
+                                    if _sib_side in ("yes", "buy"):
+                                        _sib_move = _sib_cents - int(_sib_pos.get("entry_cents", 50))
+                                    else:                                       # "no" or "sell"
+                                        _sib_move = int(_sib_pos.get("entry_cents", 50)) - _sib_cents
+                                    _sib_fee  = cfg.FEE_CENTS * _sib_cts        # mirror primary 2785
+                                    _sib_pnl  = _sib_move * _sib_cts - _sib_fee
+                                    try:
+                                        _audit_writer().write("position_history", {
+                                            "entry_exec_id":      _sib_pos.get("exec_id") or None,
+                                            "ticker":             _sib_ticker,
+                                            "side":               _sib_side,
+                                            "contracts":          _sib_cts,
+                                            "entry_cents":        int(_sib_pos.get("entry_cents", 50)),
+                                            "exit_cents":         int(_sib_cents),
+                                            "realized_pnl_cents": _sib_pnl,
+                                            "exit_reason":        "arb_sibling_close",
+                                            "entered_at":         _sib_pos.get("entered_at"),
+                                            "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                            "strategy":           _sib_pos.get("model_source") or "unknown",
+                                        })
+                                    except Exception as _sib_aud_exc:
+                                        log.warning("arb_sibling_close audit write failed for %s "
+                                                    "(primary %s, reason %s): %s",
+                                                    _sib_ticker, ticker, exit_reason, _sib_aud_exc)
+                                    if not cfg.PAPER_TRADE:
+                                        try:
+                                            executor.log_exit_fill(
+                                                ticker            = _sib_ticker,
+                                                pos               = _sib_pos,
+                                                fill_cents        = int(_sib_cents),
+                                                contracts_filled  = _sib_cts,
+                                                reason            = "arb_sibling_close",
+                                                order_id          = _sib_oid,
+                                                mode              = "live",
+                                            )
+                                        except Exception as _sib_csv_exc:
+                                            log.warning("arb_sibling_close CSV log failed for %s: %s",
+                                                        _sib_ticker, _sib_csv_exc)
+                                    # ExecReport: gate on paper-or-btc to mirror primary at 2806.
+                                    if cfg.PAPER_TRADE or _sib_pos.get("asset_class") == "btc_spot":
+                                        try:
+                                            await bus.publish_execution(ExecutionReport(
+                                                ticker             = _sib_ticker,
+                                                asset_class        = _sib_pos.get("asset_class", "kalshi"),
+                                                side               = "no" if _sib_side == "yes" else "yes",
+                                                contracts          = _sib_cts,
+                                                fill_price         = _sib_cents / 100,
+                                                status             = "filled",
+                                                mode               = "paper" if cfg.PAPER_TRADE else "live",
+                                                edge_captured      = (_sib_pnl) / 100,   # deprecated
+                                                realized_pnl_cents = _sib_pnl,
+                                            ))
+                                        except Exception as _sib_rpt_exc:
+                                            log.warning("arb_sibling_close ExecReport publish failed "
+                                                        "for %s: %s", _sib_ticker, _sib_rpt_exc)
+                                    log.info(
+                                        "[ARB-ATOM] Sibling closed: %s (primary %s hit %s) — "
+                                        "side=%s entry=%d exit=%d pnl=%+d¢",
+                                        _sib_ticker, ticker, exit_reason,
+                                        _sib_side, int(_sib_pos.get("entry_cents", 50)),
+                                        int(_sib_cents), _sib_pnl,
+                                    )
                                     executor._positions.pop(_sib_ticker, None)
                                     await positions.close(_sib_ticker)
                                 else:
@@ -3030,6 +3124,61 @@ async def _fill_poll_loop(
                                     ticker, _pc_fill, _new_ct, exit_oid,
                                 )
                             else:
+                                # ── Audit asymmetry close (Phase 2b): partial_cancel ──
+                                # Full-position exit order partial-filled then canceled.
+                                # CSV is already written below at line ~3051 via
+                                # executor.log_exit_fill.  Audit and ExecReport were
+                                # missing — fill_poll's normal post-fill audit at 2781
+                                # only fires for fully-filled exits, not partial+cancel.
+                                _ppc_side  = pos.get("side", "yes")
+                                _ppc_entry = int(pos.get("entry_cents", 50))
+                                _ppc_pkey  = ("yes_price_dollars" if _ppc_side == "yes"
+                                              else "no_price_dollars")
+                                _ppc_raw   = _e_order.get(_ppc_pkey)
+                                _ppc_cents = (int(float(_ppc_raw) * 100) if _ppc_raw is not None
+                                              else int(pos.get("exit_offer_cents", 50)))
+                                if _ppc_side in ("yes", "buy"):
+                                    _ppc_move = _ppc_cents - _ppc_entry
+                                else:                                            # "no" or "sell"
+                                    _ppc_move = _ppc_entry - _ppc_cents
+                                _ppc_fee  = cfg.FEE_CENTS * _pc_fill             # mirror primary 2785
+                                _ppc_pnl  = _ppc_move * _pc_fill - _ppc_fee
+                                try:
+                                    _audit_writer().write("position_history", {
+                                        "entry_exec_id":      pos.get("exec_id") or None,
+                                        "ticker":             ticker,
+                                        "side":               _ppc_side,
+                                        "contracts":          _pc_fill,
+                                        "entry_cents":        _ppc_entry,
+                                        "exit_cents":         _ppc_cents,
+                                        "realized_pnl_cents": _ppc_pnl,
+                                        "exit_reason":        "partial_cancel",
+                                        "entered_at":         pos.get("entered_at"),
+                                        "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                        "strategy":           pos.get("model_source") or "unknown",
+                                    })
+                                except Exception as _ppc_aud_exc:
+                                    log.warning("partial_cancel audit write failed for %s: %s",
+                                                ticker, _ppc_aud_exc)
+                                # ExecReport: always publish here — partial+cancel is a real
+                                # confirmed fill on those _pc_fill contracts (no rest-and-wait
+                                # like the live exit path); same logic as fill_poll's
+                                # filled-exit ExecReport at 2786.
+                                try:
+                                    await bus.publish_execution(ExecutionReport(
+                                        ticker             = ticker,
+                                        asset_class        = pos.get("asset_class", "kalshi"),
+                                        side               = "no" if _ppc_side == "yes" else "yes",
+                                        contracts          = _pc_fill,
+                                        fill_price         = _ppc_cents / 100,
+                                        status             = "filled",
+                                        mode               = "paper" if cfg.PAPER_TRADE else "live",
+                                        edge_captured      = _ppc_pnl / 100,     # deprecated
+                                        realized_pnl_cents = _ppc_pnl,
+                                    ))
+                                except Exception as _ppc_rpt_exc:
+                                    log.warning("partial_cancel ExecReport publish failed for %s: %s",
+                                                ticker, _ppc_rpt_exc)
                                 executor._positions.pop(ticker, None)
                                 await positions.close(ticker)
                                 log.warning(
