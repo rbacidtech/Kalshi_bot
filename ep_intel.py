@@ -1509,6 +1509,12 @@ async def intel_main() -> None:
                     _gdp_now_val = float(_gdp_obs[0]["value"])
                     log.info("Startup GDP risk check: GDPNow = %.2f%%", _gdp_now_val)
                     await bus._r.hset("ep:macro", "gdpnow", str(_gdp_now_val))
+                    # Mark health OK at startup. Without this, ep:health.gdpnow
+                    # reports stale (age_s=None) until the cut-loss check at line
+                    # 2133 fires — which requires an open KXGDP position. With
+                    # stale_seconds=7d, this single mark_ok carries the source
+                    # for a week even if no KXGDP positions exist.
+                    _src_health.mark_ok("gdpnow")
 
             if _gdp_now_val is not None:
                 _open_positions = await bus.get_all_positions()
