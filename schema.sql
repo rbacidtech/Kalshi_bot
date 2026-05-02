@@ -103,25 +103,6 @@ CREATE INDEX IF NOT EXISTS idx_poshistory_exited   ON position_history (exited_a
 CREATE INDEX IF NOT EXISTS idx_poshistory_ticker   ON position_history (ticker, exited_at DESC);
 CREATE INDEX IF NOT EXISTS idx_poshistory_strategy ON position_history (strategy, exited_at DESC);
 
--- Settlement reconciliation columns (Phase 3, 2026-05-02). Idempotent — re-run safe.
--- settlement_ts:        Kalshi /portfolio/settlements settled_time, NULL for non-settlement rows
--- cost_basis_source:    'internal' (matched position_history row), 'kalshi_agg'
---                       (yes_total_cost_dollars + no_total_cost_dollars), 'mismatch'
---                       (internal vs kalshi diverge >2%, internal wins, mismatch logged),
---                       or 'missing' (defensive — neither source available, cost_basis=0;
---                       unexpected in practice but logged loudly when it happens)
--- kalshi_fee_cents:     Kalshi-reported fee_cost (dollars × 100). NOT additive with cfg.FEE_CENTS.
--- kalshi_revenue_cents: Kalshi settlement revenue field, already in cents per API.
--- The partial unique index makes (ticker, settlement_ts) unique only when settlement_ts
--- is set, so the existing 11-column non-settlement insert path is unaffected.
-ALTER TABLE position_history ADD COLUMN IF NOT EXISTS settlement_ts        TIMESTAMPTZ NULL;
-ALTER TABLE position_history ADD COLUMN IF NOT EXISTS cost_basis_source    TEXT NULL;
-ALTER TABLE position_history ADD COLUMN IF NOT EXISTS kalshi_fee_cents     BIGINT NULL;
-ALTER TABLE position_history ADD COLUMN IF NOT EXISTS kalshi_revenue_cents BIGINT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS position_history_settlement_uniq
-    ON position_history (ticker, settlement_ts)
-    WHERE settlement_ts IS NOT NULL;
-
 -- Terminal-trades view: join signal metadata → fill → outcome for Kelly recalibration.
 -- "Terminal" exits (resolution, pre-expiry) give clean empirical win rates per edge bucket.
 -- LEFT JOIN since 2026-04-29: includes position_history rows whose entry_exec_id is
