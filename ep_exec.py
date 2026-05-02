@@ -33,6 +33,7 @@ from ep_risk import BTC_UNIT
 from ep_metrics import metrics
 from ep_telegram import telegram
 from ep_resolution_db import ResolutionDB, poll_resolutions_loop
+from ep_settlements import settlement_recon_loop
 from kalshi_bot.executor import ArbRollbackFailed
 from ep_pg_audit import init_audit_writer, stop_audit_writer, audit as _audit_writer
 try:
@@ -4381,6 +4382,7 @@ async def exec_main() -> None:
             _exit_checker(bus, positions, executor, risk_engine, db, coinbase),
             _heartbeat_loop(bus),
             poll_resolutions_loop(client, bus, db),
+            settlement_recon_loop(client, bus, executor),
             _fill_poll_loop(positions, client, executor, bus, db),
             _performance_publisher_loop(bus),
             _business_health_loop(bus),

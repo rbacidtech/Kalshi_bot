@@ -333,6 +333,18 @@ class PgAuditWriter:
                     exited_at = datetime.fromisoformat(exited_at.replace("Z", "+00:00"))
             except Exception:
                 exited_at = datetime.now(timezone.utc)
+            # Settlement-reconciliation columns (Phase 3, 2026-05-02). All four are
+            # NULL for non-settlement rows; existing 11-column writes pass nothing
+            # for them and r.get(...) returns None — no behaviour change for legacy
+            # call sites.
+            settlement_ts = r.get("settlement_ts")
+            try:
+                if settlement_ts and not hasattr(settlement_ts, "tzinfo"):
+                    settlement_ts = datetime.fromisoformat(
+                        settlement_ts.replace("Z", "+00:00")
+                    )
+            except Exception:
+                settlement_ts = None
             records.append((
                 r.get("entry_exec_id"),    # nullable since 2026-04-29 schema relaxation
                 r.get("ticker", ""),
@@ -347,15 +359,27 @@ class PgAuditWriter:
                 r.get("strategy"),         # added 2026-04-29 — used by terminal_trades
                                             # view's COALESCE when entry_exec_id is NULL
                                             # or doesn't match an executions row
+                settlement_ts,             # added 2026-05-02 (Phase 3)
+                r.get("cost_basis_source"),
+                r.get("kalshi_fee_cents"),
+                r.get("kalshi_revenue_cents"),
             ))
+        # ON CONFLICT (ticker, settlement_ts) WHERE settlement_ts IS NOT NULL DO NOTHING
+        # leverages position_history_settlement_uniq partial unique index for
+        # settlement rows. For non-settlement rows (settlement_ts IS NULL) the
+        # predicate fails, no arbiter applies, and the insert proceeds normally —
+        # same behaviour as the prior `ON CONFLICT DO NOTHING` (pkey is BIGSERIAL,
+        # no natural conflict). Verified empirically against Postgres 16 on
+        # 2026-05-02 in edgepulse_phase3_test.
         async with self._pool.acquire() as conn:
             await conn.executemany(
                 """
                 INSERT INTO position_history
                     (entry_exec_id, ticker, side, contracts, entry_cents, exit_cents,
-                     realized_pnl_cents, exit_reason, entered_at, exited_at, strategy)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                ON CONFLICT DO NOTHING
+                     realized_pnl_cents, exit_reason, entered_at, exited_at, strategy,
+                     settlement_ts, cost_basis_source, kalshi_fee_cents, kalshi_revenue_cents)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                ON CONFLICT (ticker, settlement_ts) WHERE settlement_ts IS NOT NULL DO NOTHING
                 """,
                 records,
             )
