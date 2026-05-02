@@ -4016,8 +4016,11 @@ async def fetch_signals_async(
     all_signals: list[Signal] = []
 
     # 0a. YES+NO same-market book arb (runs on all markets, no feature flag needed)
+    # min_profit_cents=5: Phase 5 audit lowered from 7 to capture tighter arbs.
+    # Operator decision 2026-05-02; revisit once we have empirical fill data on
+    # 5-7¢ arbs to confirm they're net-profitable after slippage.
     try:
-        book_arb_sigs = scan_book_arb(all_markets)
+        book_arb_sigs = scan_book_arb(all_markets, min_profit_cents=5)
         all_signals.extend(book_arb_sigs)
     except Exception as exc:
         log.warning("Book arb scan failed: %s", exc)
