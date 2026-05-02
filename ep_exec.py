@@ -1225,6 +1225,76 @@ async def _process_signal(
                     int(sig.market_price * 100),
                     "arb_partner_failed",
                 )
+
+                # ── Audit asymmetry close (Phase 2): position_history + CSV + ExecReport ──
+                # _exit_position handles paper-mode CSV (line 723) but live-mode CSV
+                # is normally written by _fill_poll_loop on confirmed fill.  An arb
+                # rollback's sell order rests at the same price the position was
+                # just opened at — it may never fill, so log the CSV exit row here
+                # in live mode to keep trades.csv complete.  P&L is zero (entry ==
+                # exit price); the only realised cost is fee bleed on the placed
+                # sell order, captured by audit's realized_pnl_cents = 0 with the
+                # implicit fee on entry already booked.
+                _ap_entry_cents  = int(sig.market_price * 100)
+                _ap_exit_cents   = int(sig.market_price * 100)
+                _ap_pnl_cents    = 0  # entry == exit, no move
+                _ap_now_iso      = datetime.now(timezone.utc).isoformat()
+                try:
+                    _audit_writer().write("position_history", {
+                        "entry_exec_id":      None,                              # primary order_id not yet exec_id
+                        "ticker":             sig.ticker,
+                        "side":               sig.side,
+                        "contracts":          contracts,
+                        "entry_cents":        _ap_entry_cents,
+                        "exit_cents":         _ap_exit_cents,
+                        "realized_pnl_cents": _ap_pnl_cents,
+                        "exit_reason":        "arb_partner_unwind",
+                        "entered_at":         _ap_now_iso,                       # just-opened, sub-second
+                        "exited_at":          _ap_now_iso,
+                        "strategy":           getattr(sig, "strategy", "")
+                                              or sig.model_source or "unknown",
+                    })
+                except Exception as _ap_aud_exc:
+                    log.warning("arb_partner_unwind audit write failed for %s: %s",
+                                sig.ticker, _ap_aud_exc)
+                if not cfg.PAPER_TRADE:
+                    try:
+                        _ap_exit_sig = KSignal(
+                            ticker            = sig.ticker,
+                            title             = "",
+                            category          = sig.category or "arb",
+                            meeting           = sig.meeting or "",
+                            outcome           = sig.outcome or "",
+                            side              = "no" if sig.side == "yes" else "yes",
+                            fair_value        = sig.fair_value,
+                            market_price      = sig.market_price,
+                            edge              = 0.0,
+                            fee_adjusted_edge = 0.0,
+                            contracts         = contracts,
+                            confidence        = 0.0,
+                            model_source      = "exit: arb_partner_unwind",
+                        )
+                        executor._log_trade(_ap_exit_sig, "exit",
+                                            "arb_partner_unwind", "live")
+                    except Exception as _ap_csv_exc:
+                        log.warning("arb_partner_unwind CSV log failed for %s: %s",
+                                    sig.ticker, _ap_csv_exc)
+                try:
+                    await bus.publish_execution(ExecutionReport(
+                        ticker             = sig.ticker,
+                        asset_class        = "kalshi",
+                        side               = "no" if sig.side == "yes" else "yes",
+                        contracts          = contracts,
+                        fill_price         = sig.market_price,
+                        status             = "filled",
+                        mode               = "paper" if cfg.PAPER_TRADE else "live",
+                        edge_captured      = 0.0,                                # deprecated
+                        realized_pnl_cents = _ap_pnl_cents,
+                    ))
+                except Exception as _ap_rpt_exc:
+                    log.warning("arb_partner_unwind ExecReport publish failed for %s: %s",
+                                sig.ticker, _ap_rpt_exc)
+
                 await positions.close(sig.ticker)
                 return _rejected("ARB_PARTNER_FAILED")
         else:
@@ -1850,8 +1920,56 @@ async def _exit_checker(
                             # Resolution is final — remove from executor immediately
                             # rather than waiting for fill poll (market is over).
                             executor._positions.pop(ticker, None)
-                            await positions.close(ticker)
+
+                            # ── Audit asymmetry close (Phase 2): position_history + CSV ──
+                            # Settlement against the held side — market resolved
+                            # opposite to our position.  No fee applied (settlement
+                            # does not place a fillable order; the sell order from
+                            # _exit_position will not be filled by Kalshi on a
+                            # resolved market).  ExecutionReport is published
+                            # below (preserved); only audit + CSV are new here.
                             _s = pos.get("side", "yes")
+                            if _s in ("yes", "buy"):
+                                _move_r_aud = _exit_cents - pos["entry_cents"]
+                            else:
+                                _move_r_aud = pos["entry_cents"] - _exit_cents
+                            _pnl_r_cents = _move_r_aud * _contracts_r            # no fee
+                            _ra_reason   = ("settlement_against_yes"
+                                            if _outcome == "yes"
+                                            else "settlement_against_no")
+                            try:
+                                _audit_writer().write("position_history", {
+                                    "entry_exec_id":      pos.get("exec_id") or None,
+                                    "ticker":             ticker,
+                                    "side":               _s,
+                                    "contracts":          _contracts_r,
+                                    "entry_cents":        int(pos["entry_cents"]),
+                                    "exit_cents":         int(_exit_cents),
+                                    "realized_pnl_cents": _pnl_r_cents,
+                                    "exit_reason":        _ra_reason,
+                                    "entered_at":         pos.get("entered_at"),
+                                    "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                    "strategy":           pos.get("model_source") or "unknown",
+                                })
+                            except Exception as _ra_aud_exc:
+                                log.warning("settlement_against audit write failed for %s: %s",
+                                            ticker, _ra_aud_exc)
+                            if not cfg.PAPER_TRADE:
+                                try:
+                                    executor.log_exit_fill(
+                                        ticker            = ticker,
+                                        pos               = pos,
+                                        fill_cents        = int(_exit_cents),
+                                        contracts_filled  = _contracts_r,
+                                        reason            = _ra_reason,
+                                        order_id          = "settlement",
+                                        mode              = "live",
+                                    )
+                                except Exception as _ra_csv_exc:
+                                    log.warning("settlement_against CSV log failed for %s: %s",
+                                                ticker, _ra_csv_exc)
+
+                            await positions.close(ticker)
                             if _s in ("yes", "buy"):
                                 _move_r = _exit_cents - pos["entry_cents"]
                             else:
@@ -1880,6 +1998,12 @@ async def _exit_checker(
                         now_utc     = datetime.now(timezone.utc)
                         hours_past  = (now_utc - close_dt).total_seconds() / 3600
                         if hours_past > 2.0:
+                            # Track which path produced last_cents so the audit
+                            # exit_reason discriminates yes/no/unresolved cleanly.
+                            # Price-data path leaves us with a number but no DB
+                            # confirmation — that's "_unresolved" in the v2
+                            # taxonomy.  DB-result path sets the outcome.
+                            _settle_outcome: Optional[str] = None
                             last_cents = (
                                 (price_data or {}).get("last_price")
                                 or (price_data or {}).get("yes_price")
@@ -1889,8 +2013,10 @@ async def _exit_checker(
                                 _db_result = db.get_outcome(ticker) if db else None
                                 if _db_result == "yes":
                                     last_cents = 100
+                                    _settle_outcome = "yes"
                                 elif _db_result == "no":
                                     last_cents = 0
+                                    _settle_outcome = "no"
                                 else:
                                     log.warning(
                                         "Post-resolution cleanup: %s closed %.1fh ago "
@@ -1906,6 +2032,57 @@ async def _exit_checker(
                                 ticker, pos, last_cents,
                                 f"market_resolved ({hours_past:.1f}h past close)",
                             )
+
+                            # ── Audit asymmetry close (Phase 2): position_history + CSV ──
+                            # Settlement cleanup — market closed >2h ago.  No fee
+                            # applied (settlement does not place a fillable order).
+                            # Discriminator: yes/no when we have a confirmed DB
+                            # outcome, "unresolved" when last_cents came from
+                            # price data only with no DB confirmation.
+                            _pc_side = pos["side"]
+                            if _pc_side in ("yes", "buy"):
+                                _pc_move = last_cents - pos["entry_cents"]
+                            else:                                                # "no" or "sell"
+                                _pc_move = pos["entry_cents"] - last_cents
+                            _pc_qty       = pos.get("contracts_filled") or pos.get("contracts", 1)
+                            _pc_pnl_cents = _pc_move * _pc_qty                   # no fee
+                            _pc_reason    = ("settlement_cleanup_yes"
+                                             if _settle_outcome == "yes" else
+                                             "settlement_cleanup_no"
+                                             if _settle_outcome == "no" else
+                                             "settlement_cleanup_unresolved")
+                            try:
+                                _audit_writer().write("position_history", {
+                                    "entry_exec_id":      pos.get("exec_id") or None,
+                                    "ticker":             ticker,
+                                    "side":               _pc_side,
+                                    "contracts":          _pc_qty,
+                                    "entry_cents":        int(pos["entry_cents"]),
+                                    "exit_cents":         int(last_cents),
+                                    "realized_pnl_cents": _pc_pnl_cents,
+                                    "exit_reason":        _pc_reason,
+                                    "entered_at":         pos.get("entered_at"),
+                                    "exited_at":          datetime.now(timezone.utc).isoformat(),
+                                    "strategy":           pos.get("model_source") or "unknown",
+                                })
+                            except Exception as _pc_aud_exc:
+                                log.warning("settlement_cleanup audit write failed for %s: %s",
+                                            ticker, _pc_aud_exc)
+                            if not cfg.PAPER_TRADE:
+                                try:
+                                    executor.log_exit_fill(
+                                        ticker            = ticker,
+                                        pos               = pos,
+                                        fill_cents        = int(last_cents),
+                                        contracts_filled  = _pc_qty,
+                                        reason            = _pc_reason,
+                                        order_id          = "settlement",
+                                        mode              = "live",
+                                    )
+                                except Exception as _pc_csv_exc:
+                                    log.warning("settlement_cleanup CSV log failed for %s: %s",
+                                                ticker, _pc_csv_exc)
+
                             await positions.close(ticker)
                             _s = pos["side"]
                             if _s in ("yes", "buy"):
