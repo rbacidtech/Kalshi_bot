@@ -192,7 +192,13 @@ Legacy paper-trading state and ad-hoc log. Not used in live accounting.
 - All open positions were closed-via-cleanup before the 300s poll could see them as resolved.
 - SQLite write is failing with a non-raising error.
 
-### Gap #3 — Nobody calls `/portfolio/settlements`
+### Gap #3 — Nobody calls `/portfolio/settlements` (Phase 3 attempt reverted 2026-05-02)
+
+Phase 3 attempt commit `70d107b` (settlement reconciler) was reverted by `209422f` after empirical testing on production data revealed a design flaw: the reconciler wrote a settlement `position_history` row for EVERY Kalshi settlement, regardless of whether the position was already closed via internal exit logic. Result: double-attribution in Postgres position_history for tickers exited internally before settlement (concrete: KXNBAGAME-26APR28ATLNYK-ATL got both a -$121.77 stop_loss row AND a -$161.80 settlement row, $40 of phantom over-attribution). 71 ghost rows remain in `position_history` with `settlement_ts IS NOT NULL` totaling -$1,600.49 false P&L; ep:performance and the dashboard are unaffected because trades.csv FIFO 1:1 pairing drops the orphan settlement exits.
+
+The schema columns and partial unique index remain on the live table for future use. The next Phase 3 attempt must check for prior internal exit and either skip the write or use the actual realized P&L from the existing row.
+
+
 
 The Kalshi API exposes a settlement-history endpoint that gives definitive `revenue` and `fee_cost` for every settled market. **Zero references in our codebase.** Adding a settlement reconciliation loop that reads this endpoint and writes synthetic `position_history` rows would fix Gap #1 retroactively (backfill) AND going forward (live reconciliation).
 
