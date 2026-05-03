@@ -2050,10 +2050,22 @@ async def _exit_checker(
                                 "Post-resolution cleanup: %s closed %.1fh ago — removing",
                                 ticker, hours_past,
                             )
-                            executor._exit_position(
+                            _cleanup_oid = executor._exit_position(
                                 ticker, pos, last_cents,
                                 f"market_resolved ({hours_past:.1f}h past close)",
                             )
+
+                            # Phase 5b gate (2026-05-03): on HTTP 409 market_closed
+                            # _exit_position returns "" — no order was placed, so
+                            # skip the phantom audit/CSV/ExecReport writes.  Without
+                            # this gate, position_sync re-adopting the ticker every
+                            # 30 min compounded ~22 phantom settlement_cleanup rows
+                            # in 5h on 2026-05-03.  positions.close() still runs so
+                            # this iteration's state stays consistent; the deeper
+                            # re-adoption fix is tracked separately (Phase 4).
+                            if not _cleanup_oid:
+                                await positions.close(ticker)
+                                continue
 
                             # ── Audit asymmetry close (Phase 2): position_history + CSV ──
                             # Settlement cleanup — market closed >2h ago.  No fee
