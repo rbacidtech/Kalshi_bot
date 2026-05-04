@@ -1600,6 +1600,18 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int, disable_
         if 0.50 <= _p_win < 0.70:
             continue
 
+        # Backtest-driven city-specific filter (2026-05-04, n=21 evidence).
+        # KXHIGHCHI T-strike (temp > threshold) markets at raw fair_value
+        # ∈ [0.50, 0.85) lost 21/21 in backtest_per_entry.csv — model
+        # systematically over-predicts Chicago heat-threshold YES probability
+        # in this band. Total realized: −$24.15 across 21 trades, 0% wins.
+        # Probability of 0/21 vs 50% expected ≈ 5e-7 — clear systematic bias.
+        # Other (city, strike, fv-band) combinations are profitable and kept.
+        if (ticker.startswith("KXHIGHCHI")
+                and strike_type == "greater"
+                and 0.50 <= fair_value < 0.85):
+            continue
+
         # Confidence tiers based on source count and inter-model spread.
         # 3+ sources strongly agreeing → near-FOMC tier confidence.
         n_src        = len(set(source_tag))
