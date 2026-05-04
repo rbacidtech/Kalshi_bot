@@ -1314,8 +1314,13 @@ def _precip_prob_above(forecast_sum: Optional[float], precip_pct: Optional[float
     return max(0.01, min(0.99, p_above))
 
 
-async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[Signal]:
-    """Score weather markets using Open-Meteo (primary) and NOAA NWS (secondary)."""
+async def scan_weather_markets(markets: list[dict], max_contracts: int, disable_ecmwf: bool = False) -> list[Signal]:
+    """Score weather markets using Open-Meteo (primary) and NOAA NWS (secondary).
+
+    disable_ecmwf: when True, ignore ECMWF data and revert to gfs+noaa blend.
+    Set via ep:config:override_weather_disable_ecmwf after backtest evidence
+    showed the ECMWF blend cratered direction-accuracy (2026-05-04).
+    """
     signals = []
 
     weather_markets = [
@@ -1400,6 +1405,10 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         om_gfs, om_ecmwf, _nws_daily_raw, _nws_hourly_raw = (
             None if isinstance(r, Exception) else r for r in _results
         )
+        # ep:config kill-switch — drop ECMWF after backtest showed broken
+        # calibration in [0.30,0.50)∪[0.95,1.00) bands (2026-05-04).
+        if disable_ecmwf:
+            om_ecmwf = None
         nws       = _parse_nws_daily(_nws_daily_raw, target)  if _nws_daily_raw  else None
         nws_hrly  = _parse_nws_hourly(_nws_hourly_raw, target) if _nws_hourly_raw else None
 
@@ -1577,14 +1586,16 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int) -> list[
         if fee_edge < MIN_EDGE_GROSS * 0.5:
             continue
 
-        # Skip the broken-calibration mid-confidence zone.
-        # Backtest on 254 resolved weather entries: when the model puts
-        # P(this-side-wins) in [0.50, 0.70), realized win rate is 13% vs
-        # predicted 55-65% — a 50pp miscalibration. Dropping this band
-        # lifts fee-adjusted P&L from $33.81 → $110.00 (+$76.19, +3.3x)
-        # over the historical sample. See output/weather_blend_comparison.csv.
-        _p_win = fair_value if side == "yes" else (1 - fair_value)
-        if 0.50 <= _p_win < 0.70:
+        # Skip broken-calibration bands on raw fair_value (P(YES), pre-side-flip).
+        # Backtest on 254 resolved weather entries (output/weather_blend_comparison.csv):
+        #   fv_blend [0.30, 0.50): n=33, predicted 40% YES → actual 0.0%   (gap −40%)
+        #   fv_blend [0.50, 0.70): n=3,  predicted 60% YES → actual 0.0%   (gap −60%)
+        #   fv_blend [0.95, 1.00): n=52, predicted 98% YES → actual 0.0%   (gap −98%)
+        # The [0.95, 1.00) bucket drove this week's losses (high-confidence NO bets at
+        # 50-65¢ entries that resolved YES, −28 to −39¢ per contract avg).
+        # Skipping these bands eliminates the dominant loss vector while preserving
+        # the calibrated low-fv NO bets and the high-fv YES bets that actually pay.
+        if 0.30 <= fair_value < 0.50 or fair_value >= 0.95:
             continue
 
         # Confidence tiers based on source count and inter-model spread.
@@ -3975,6 +3986,7 @@ async def fetch_signals_async(
     min_yes_entry_price: Optional[float] = None,  # calibrated override from ep_advisor
     edge_threshold_overrides: Optional[dict] = None,  # category → float (from Redis)
     min_confidence_overrides: Optional[dict] = None,  # category → float
+    weather_disable_ecmwf: bool = False,              # ep:config kill-switch — drop ECMWF from blend
 ) -> list[Signal]:
     """
     Main signal-generation entry point — runs all enabled strategy scanners and
@@ -4085,7 +4097,7 @@ async def fetch_signals_async(
     # 3. Weather
     if enable_weather:
         try:
-            weather_sigs = await scan_weather_markets(all_markets, max_contracts)
+            weather_sigs = await scan_weather_markets(all_markets, max_contracts, disable_ecmwf=weather_disable_ecmwf)
             weather_sigs = [s for s in weather_sigs if s.fee_adjusted_edge >= _category_edge_floor(s.category, edge_threshold_overrides, edge_threshold)]
             all_signals.extend(weather_sigs)
             if weather_sigs:

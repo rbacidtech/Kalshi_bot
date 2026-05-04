@@ -1780,6 +1780,7 @@ async def intel_main() -> None:
             _ov_hbc    = await bus.get_config_override("override_hours_before_close")
             _ov_rate   = await bus.get_config_override("CURRENT_FED_RATE")
             _ov_myep   = await bus.get_config_override("override_min_yes_entry_price")
+            _ov_no_ec  = await bus.get_config_override("override_weather_disable_ecmwf")
 
             # Global overrides (None = use per-category code defaults)
             try:
@@ -1919,6 +1920,7 @@ async def intel_main() -> None:
                         min_yes_entry_price      = _min_yep,
                         edge_threshold_overrides = edge_threshold_overrides or None,
                         min_confidence_overrides = min_confidence_overrides or None,
+                        weather_disable_ecmwf    = bool(_ov_no_ec) and str(_ov_no_ec) not in ("0","false","False",""),
                     ),
                     timeout=90.0,
                 )
