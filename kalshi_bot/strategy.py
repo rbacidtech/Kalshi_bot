@@ -1586,16 +1586,18 @@ async def scan_weather_markets(markets: list[dict], max_contracts: int, disable_
         if fee_edge < MIN_EDGE_GROSS * 0.5:
             continue
 
-        # Skip broken-calibration bands on raw fair_value (P(YES), pre-side-flip).
-        # Backtest on 254 resolved weather entries (output/weather_blend_comparison.csv):
-        #   fv_blend [0.30, 0.50): n=33, predicted 40% YES → actual 0.0%   (gap −40%)
-        #   fv_blend [0.50, 0.70): n=3,  predicted 60% YES → actual 0.0%   (gap −60%)
-        #   fv_blend [0.95, 1.00): n=52, predicted 98% YES → actual 0.0%   (gap −98%)
-        # The [0.95, 1.00) bucket drove this week's losses (high-confidence NO bets at
-        # 50-65¢ entries that resolved YES, −28 to −39¢ per contract avg).
-        # Skipping these bands eliminates the dominant loss vector while preserving
-        # the calibrated low-fv NO bets and the high-fv YES bets that actually pay.
-        if 0.30 <= fair_value < 0.50 or fair_value >= 0.95:
+        # Skip the broken-calibration mid-confidence zone.
+        # Backtest on 254 resolved weather entries: when the model puts
+        # P(this-side-wins) in [0.50, 0.70), realized win rate is 13% vs
+        # predicted 55-65% — a 50pp miscalibration. Dropping this band
+        # lifts fee-adjusted P&L from $33.81 → $110.00 (+$76.19, +3.3x)
+        # over the historical sample. See output/weather_blend_comparison.csv.
+        # 2026-05-04 audit: a wider skip on raw fair_value was tested and
+        # reverted — backtest_per_entry showed [0.30, 0.50) is +31c/ct
+        # avg (44% win) and [0.95, 1.00) had zero live trades. Original
+        # [0.50, 0.70) on _p_win remains the empirically best filter.
+        _p_win = fair_value if side == "yes" else (1 - fair_value)
+        if 0.50 <= _p_win < 0.70:
             continue
 
         # Confidence tiers based on source count and inter-model spread.
