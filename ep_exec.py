@@ -320,6 +320,38 @@ async def _process_signal(
                 status        = "duplicate",
                 reject_reason = "DUPLICATE",
             )
+        # Hard contract cap on top-ups (belt-and-suspenders for the bankroll-anchor
+        # MARKET_LIMIT below, which silently degrades when ep:bankroll_anchor:YYYYMMDD
+        # is unset, expired, or set to an unrepresentative value — empirically
+        # observed 2026-05-02 when 14 top-ups stacked into 111 contracts on
+        # KXHIGHNY-26MAY02-B60.5, ~78% of bankroll on one ticker, settled at
+        # -$39.65). Default 20 contracts/ticker; override via
+        # `redis-cli hset ep:config max_contracts_per_ticker N`.
+        _existing_ct_cap = int(_existing_pos.get("contracts_filled")
+                               or _existing_pos.get("contracts", 0))
+        try:
+            _ov_max_pt = await bus._r.hget("ep:config", "max_contracts_per_ticker")
+            _max_per_ticker = int(float(_ov_max_pt)) if _ov_max_pt else 20
+        except (ValueError, TypeError):
+            _max_per_ticker = 20
+        # Use suggested_size as a pre-Kelly upper-bound estimate. Actual
+        # contracts is computed later by risk_engine.size; this gate runs
+        # before that to short-circuit. Conservative: if suggested_size
+        # alone overflows the cap, no Kelly outcome would fit either.
+        if _existing_ct_cap + sig.suggested_size > _max_per_ticker:
+            log.info(
+                "MAX_CONTRACTS_PER_TICKER: %s existing=%d + new=%d > cap=%d — skipping topup",
+                sig.ticker, _existing_ct_cap, sig.suggested_size, _max_per_ticker,
+            )
+            return ExecutionReport(
+                signal_id     = sig.signal_id,
+                ticker        = sig.ticker,
+                asset_class   = sig.asset_class,
+                side          = sig.side,
+                mode          = "paper" if cfg.PAPER_TRADE else "live",
+                status        = "rejected",
+                reject_reason = "MAX_CONTRACTS_PER_TICKER",
+            )
         _is_topup = True
         log.info(
             "Weather top-up candidate: %s  existing=%d×%s@%d¢  new_signal edge=%.3f",
