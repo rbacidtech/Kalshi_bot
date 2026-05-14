@@ -4277,6 +4277,40 @@ async def _business_health_loop(bus: RedisBus, kalshi_client=None, interval: int
             except Exception as _strat_exc:
                 log.debug("Strategy circuit breaker check failed: %s", _strat_exc)
 
+            # ── Supervisor heartbeat check (Engineering S.3 §5 GAP fix) ───────
+            # The supervisor runs in a separate systemd unit and writes
+            # ep:supervisor:heartbeat every 10s. If we don't see a fresh
+            # heartbeat within 120s, the supervisor process is dead or
+            # wedged — defensive-halt per Engineering S.3: "if supervisor
+            # dead >60s, trader defensive-halts."
+            try:
+                _hb_raw = await bus._r.get("ep:supervisor:heartbeat")
+                _hb_age_s: float = 999.0
+                if _hb_raw:
+                    try:
+                        _hb_us = int(_hb_raw)
+                        _hb_age_s = (time.time() * 1_000_000 - _hb_us) / 1_000_000
+                    except (TypeError, ValueError):
+                        _hb_age_s = 999.0
+                if _hb_age_s > 120:
+                    _halt_cur = await bus._r.hget("ep:config", "HALT_TRADING")
+                    if _halt_cur not in (b"1", "1"):
+                        await bus._r.hset("ep:config", "HALT_TRADING", "1")
+                        await bus._r.hset("ep:halt", mapping={
+                            "reason":         "supervisor_unhealthy",
+                            "tripped_at_us":  str(int(time.time() * 1_000_000)),
+                            "heartbeat_age_s": f"{_hb_age_s:.0f}",
+                            "source":         "trader_defensive",
+                        })
+                        log.warning(
+                            "Supervisor heartbeat stale (age=%.0fs > 120s) — "
+                            "trader defensive-halt set. Investigate edgepulse-supervisor.service.",
+                            _hb_age_s,
+                        )
+                        issues.append(f"SUPERVISOR_UNHEALTHY: heartbeat age {_hb_age_s:.0f}s")
+            except Exception as _sup_exc:
+                log.debug("Supervisor heartbeat check failed: %s", _sup_exc)
+
             # ── Hard halt transition detection (Phase 1.3 S.3.4) ──────────────
             # When the flag file first appears (operator did `touch .hard_halt`
             # or set_hard_halt() was called by a future automatic trigger),

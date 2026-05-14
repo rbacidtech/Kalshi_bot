@@ -1,0 +1,40 @@
+[Unit]
+Description=EdgePulse Supervisor — kill-switch enforcement (out-of-process)
+PartOf=edgepulse.target
+After=edgepulse-redis.service network-online.target
+Wants=edgepulse-redis.service network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Engineering S.3 §5 mandate: this process runs INDEPENDENTLY of the trader
+# (edgepulse-exec) so trader failure modes (deadlock, OOM, infinite loop) do
+# not take down the kill-switch checker. The supervisor's only job is to
+# evaluate halt conditions every 10s and set HALT_TRADING in Redis when any
+# condition trips.
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MODE=supervisor
+
+# Wait for Redis socket before starting
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do redis-cli -s /run/redis/redis.sock ping 2>/dev/null | grep -q PONG && exit 0; sleep 2; done; echo "Redis not ready after 60s"; exit 1'
+
+ExecStart=/root/EdgePulse/.venv/bin/python3 -u ep_supervisor.py
+
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+
+# Hardening — supervisor needs only Redis socket access + filesystem read
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/root/EdgePulse /run/redis
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=edgepulse.target
