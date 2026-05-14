@@ -38,5 +38,99 @@
       "search_log": "grep across /root/research/EdgePulse_Backtest_*.md, EdgePulse_Engineering_*.md, EdgePulse_Operating_*.md, and /root/research/wealth_transfer_drafts/ returned no citation for this specific 40-48% range. No becker_benchmarks.json predated this file. No *.ipynb on the server. Closest documented Optimism-Tax claim is the maker NO vs YES asymmetry (covered above).",
       "to_enable": "Provide a primary source (Becker paper section, repo notebook cell, or direct measurement against the transformed parquet) for the 40-48% range. Add fields `min_pct` and `max_pct` here, then remove the @pytest.mark.skip on test_assertion_3_yes_taker_share_1_to_10c_bin in parity_test.py."
     }
-  ]
+  ],
+
+  "_per_strategy_doc": "Engineering S.4 per-strategy backtest parity expectations. Each verdict strategy with verdict-doc-reported annual P&L, trade count, mean return, win rate. tests/test_per_strategy_parity.py iterates these and asserts production scanner output matches within 10% P&L / 1% signal-count tolerance per Engineering S.4. Source: /root/research/EdgePulse_Backtest_Verdict_2026.md §3-4 per-strategy tables.",
+  "per_strategy_pnl_tolerance_pct": 10.0,
+  "per_strategy_count_tolerance_pct": 1.0,
+  "per_strategy": {
+    "h2h_sum_to_1_KXMLBGAME": {
+      "verdict_section": "§3.1",
+      "annual_pnl_usd": 5494,
+      "trade_count": 1112,
+      "mean_return_pct": 5.28,
+      "win_rate_pct": 100.0,
+      "ticker_prefix": "KXMLBGAME"
+    },
+    "h2h_sum_to_1_KXMLSGAME": {
+      "verdict_section": "§3.1",
+      "annual_pnl_usd": 4827,
+      "trade_count": 258,
+      "mean_return_pct": 18.25,
+      "win_rate_pct": 100.0,
+      "ticker_prefix": "KXMLSGAME"
+    },
+    "h2h_sum_to_1_KXWTAMATCH": {
+      "verdict_section": "§3.1",
+      "annual_pnl_usd": 4314,
+      "trade_count": 654,
+      "mean_return_pct": 5.06,
+      "win_rate_pct": 100.0,
+      "ticker_prefix": "KXWTAMATCH"
+    },
+    "h2h_sum_to_1_KXATPMATCH": {
+      "verdict_section": "§3.1",
+      "annual_pnl_usd": 3473,
+      "trade_count": 626,
+      "mean_return_pct": 4.56,
+      "win_rate_pct": 100.0,
+      "ticker_prefix": "KXATPMATCH"
+    },
+    "h2h_sum_to_1_KXNCAAMBGAME": {
+      "verdict_section": "§3.1",
+      "annual_pnl_usd": 2112,
+      "trade_count": 220,
+      "mean_return_pct": 1.92,
+      "win_rate_pct": 100.0,
+      "ticker_prefix": "KXNCAAMBGAME"
+    },
+    "h2h_sum_to_1_KXNCAAFGAME": {
+      "verdict_section": "§3.1",
+      "annual_pnl_usd": 1599,
+      "trade_count": 302,
+      "mean_return_pct": 2.64,
+      "win_rate_pct": 100.0,
+      "ticker_prefix": "KXNCAAFGAME"
+    },
+    "h2h_sum_to_1_KXNHLGAME": {
+      "verdict_section": "§3.1",
+      "annual_pnl_usd": 1235,
+      "trade_count": 190,
+      "mean_return_pct": 7.69,
+      "win_rate_pct": 100.0,
+      "ticker_prefix": "KXNHLGAME"
+    },
+    "kxmve_nfl_singlegame_longshot": {
+      "verdict_section": "§4.1",
+      "annual_pnl_usd": 8635,
+      "trade_count": 25490,
+      "mean_return_pct": 1.35,
+      "win_rate_pct": null,
+      "ticker_prefix": "KXMVENFLSINGLEGAME"
+    },
+    "kxmve_nfl_multigame_longshot": {
+      "verdict_section": "§4.1",
+      "annual_pnl_usd": 7084,
+      "trade_count": 31295,
+      "mean_return_pct": 0.91,
+      "win_rate_pct": null,
+      "ticker_prefix": "KXMVENFLMULTIGAMEEXTENDED"
+    },
+    "weather_longshot_KXHIGHAUS": {
+      "verdict_section": "§4.2",
+      "annual_pnl_usd": 1489,
+      "trade_count": 1424,
+      "mean_return_pct": 4.18,
+      "win_rate_pct": null,
+      "ticker_prefix": "KXHIGHAUS"
+    },
+    "weather_longshot_KXHIGHDEN": {
+      "verdict_section": "§4.2",
+      "annual_pnl_usd": 1384,
+      "trade_count": 1298,
+      "mean_return_pct": 4.26,
+      "win_rate_pct": null,
+      "ticker_prefix": "KXHIGHDEN"
+    }
+  }
 }
