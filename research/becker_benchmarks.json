@@ -1,0 +1,42 @@
+{
+  "_doc": "Source-of-truth benchmarks for tests/parity_test.py. Do not embed these values in the test file — read from here so the spec is reviewable and changeable without touching test code.",
+  "source": {
+    "primary": "/root/research/EdgePulse_Backtest_DataPipeline.md §1.4 (lines 92-99)",
+    "dataset": "Jon-Becker/prediction-market-analysis — 5M-row stratified sample of 67M-row resolved-trades materialization (2023-08 through 2025-11)",
+    "methodology_ref": "/root/research/EdgePulse_Backtest_DataPipeline.md §4"
+  },
+  "tolerance_pp": 0.10,
+  "_tolerance_doc": "User-specified ±0.10 percentage points per Step 3 directive 2026-05-14. Research docs originally cited 0.05 pp; widened tolerance accommodates the 0.02-0.05 pp drift documented in DataPipeline.md §1.4 between Becker (2026) and this pipeline.",
+  "benchmarks": {
+    "maker_excess_return_pct": {
+      "becker_2026": 1.12,
+      "this_pipeline_documented": 1.14,
+      "description": "Average maker-side excess return across all resolved trades. Becker's headline figure."
+    },
+    "maker_no_excess_return_pct": {
+      "becker_2026": 1.25,
+      "this_pipeline_documented": 1.30,
+      "description": "Maker excess return on trades where the taker took the YES side (so the maker is on NO). Higher than YES-side; constitutes the Optimism Tax."
+    },
+    "maker_yes_excess_return_pct": {
+      "becker_2026": 0.77,
+      "this_pipeline_documented": 0.77,
+      "description": "Maker excess return on trades where the taker took the NO side (so the maker is on YES). Lower than NO-side; underside of the Optimism Tax."
+    }
+  },
+  "directional_invariant_no_gt_yes": {
+    "description": "Optimism Tax — maker NO excess must exceed maker YES excess. Asymmetric retail pricing of cheap YES outcomes.",
+    "expected_gap_pp_min": 0.30,
+    "_gap_doc": "Becker reference gap is 1.25 - 0.77 = 0.48 pp. Min threshold 0.30 pp gives ~40% headroom for pipeline drift while still detecting a structural sign flip."
+  },
+  "unverified_assertions": [
+    {
+      "name": "yes_taker_volume_share_1_to_10c_bin",
+      "user_suggested_range_pct": [40, 48],
+      "description": "User-specified Step 3 assertion: YES taker volume at 1-10¢ price bin is 40-48% of total taker volume in that bin.",
+      "status": "MISSING_SOURCE",
+      "search_log": "grep across /root/research/EdgePulse_Backtest_*.md, EdgePulse_Engineering_*.md, EdgePulse_Operating_*.md, and /root/research/wealth_transfer_drafts/ returned no citation for this specific 40-48% range. No becker_benchmarks.json predated this file. No *.ipynb on the server. Closest documented Optimism-Tax claim is the maker NO vs YES asymmetry (covered above).",
+      "to_enable": "Provide a primary source (Becker paper section, repo notebook cell, or direct measurement against the transformed parquet) for the 40-48% range. Add fields `min_pct` and `max_pct` here, then remove the @pytest.mark.skip on test_assertion_3_yes_taker_share_1_to_10c_bin in parity_test.py."
+    }
+  ]
+}
