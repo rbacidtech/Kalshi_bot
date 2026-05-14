@@ -630,14 +630,27 @@ def scan_h2h_sum_to_1_arb(
         if sum_ask >= sum_threshold:
             continue
 
-        gross_edge = 1.0 - sum_ask
+        gross_edge_at_ask = 1.0 - sum_ask
+        # Engineering S.1: place limit at YES_BID (maker), not at ASK (taker).
+        # Threshold check stays at ASK (conservative — taker would still profit
+        # here). Order placement uses BID so the order rests on the book and
+        # we earn the +2.5% maker premium per Becker. Falls back to ASK if
+        # bid is unavailable (preserves backward compat).
+        try:
+            from ep_maker_tracker import maker_price_for_yes_buy
+            m1_limit = maker_price_for_yes_buy(m1, ask1)
+            m2_limit = maker_price_for_yes_buy(m2, ask2)
+        except Exception:
+            m1_limit, m2_limit = ask1, ask2
+        sum_at_limit = m1_limit + m2_limit
+        gross_edge = 1.0 - sum_at_limit
         # Per-contract fees: Kalshi taker fee ≈ 7¢ × p × (1-p), maxing at $0.0175
-        # when p=0.5. For a 2-leg arb the fees on both sides are paid; conservative
-        # upper bound = 2 × 0.0175 = 3.5¢/contract. Use the exact formula when
-        # we have both prices.
+        # when p=0.5. Maker fee is ~25% of taker (~0.0044 at p=0.5). When we
+        # place at bid, fills come as maker — but conservatively use taker
+        # fees in the net_edge calc so size-scaling doesn't over-fire.
         fee_per_contract = (
-            round(KALSHI_FEE_RATE * ask1 * (1 - ask1), 4)
-            + round(KALSHI_FEE_RATE * ask2 * (1 - ask2), 4)
+            round(KALSHI_FEE_RATE * m1_limit * (1 - m1_limit), 4)
+            + round(KALSHI_FEE_RATE * m2_limit * (1 - m2_limit), 4)
         )
         net_edge = gross_edge - fee_per_contract
         # NOTE: the verdict §3.1 threshold (sum_ask < 0.98) is the only gate;
@@ -646,37 +659,38 @@ def scan_h2h_sum_to_1_arb(
         # positive. Skipping all trades below MIN_EDGE_GROSS would lose the
         # high-volume tail. Do NOT add a net-edge filter here.
 
-        # Size: scale with gross edge magnitude, cap at max_contracts.
-        # Use gross (not net) because the size scaling is about position
-        # magnitude, not edge filtering.
+        # Size: scale with gross edge at the LIMIT price (what we'd pay if
+        # filled). Capped at max_contracts.
         contracts = min(max_contracts, max(1, int(gross_edge * 50)))
 
         sig = Signal(
             ticker            = m1["ticker"],
             title             = (
-                f"H2H ARB: Buy {m1['ticker']} YES + Buy {m2['ticker']} YES "
-                f"(sum_ask={sum_ask:.4f}, gross={gross_edge*100:.2f}¢)"
+                f"H2H ARB MAKER: Buy {m1['ticker']} YES@{m1_limit:.4f} + "
+                f"Buy {m2['ticker']} YES@{m2_limit:.4f} "
+                f"(sum_ask={sum_ask:.4f} sum_limit={sum_at_limit:.4f} gross={gross_edge*100:.2f}¢)"
             ),
             category          = "arb",
             side              = "yes",
             fair_value        = 1.0 - ask2,                # what m1 yes "should be" in 2-outcome
-            market_price      = ask1,
+            market_price      = m1_limit,                  # MAKER price — bid + 0¢
             edge              = gross_edge,
             fee_adjusted_edge = net_edge,
             contracts         = contracts,
             confidence        = 0.95,
             model_source      = "h2h_sum_to_1_arb",
             arb_legs          = [
-                {"ticker": m1["ticker"], "side": "yes", "price_cents": int(round(ask1 * 100))},
-                {"ticker": m2["ticker"], "side": "yes", "price_cents": int(round(ask2 * 100))},
+                {"ticker": m1["ticker"], "side": "yes", "price_cents": int(round(m1_limit * 100))},
+                {"ticker": m2["ticker"], "side": "yes", "price_cents": int(round(m2_limit * 100))},
             ],
             close_time        = m1.get("close_time"),
         )
         signals.append(sig)
         log.info(
-            "H2H ARB: %s yes=%.4f + %s yes=%.4f sum=%.4f gross=%.2f¢ net=%.2f¢ ×%d",
-            m1["ticker"], ask1, m2["ticker"], ask2, sum_ask,
-            gross_edge * 100, net_edge * 100, contracts,
+            "H2H ARB MAKER: %s yes=%.4f→limit=%.4f + %s yes=%.4f→limit=%.4f "
+            "sum_ask=%.4f sum_limit=%.4f gross=%.2f¢ net=%.2f¢ ×%d",
+            m1["ticker"], ask1, m1_limit, m2["ticker"], ask2, m2_limit,
+            sum_ask, sum_at_limit, gross_edge * 100, net_edge * 100, contracts,
         )
 
     if signals:
