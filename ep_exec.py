@@ -20,6 +20,10 @@ from typing import Optional
 
 from ep_config import cfg, NODE_ID, REDIS_URL, EXIT_INTERVAL, EP_PRICES, log, sd_notify
 from strategies import verdict_doc_alignment_check
+from ep_pnl_attribution import (
+    record_signal as _a5_record_signal,
+    rollover_loop as _a5_pnl_rollover_loop,
+)
 from kalshi_bot.auth     import KalshiAuth, NoAuth
 from kalshi_bot.client   import KalshiClient
 from kalshi_bot.executor import Executor
@@ -1449,6 +1453,14 @@ async def _signal_consumer(
             log.warning("HALT_TRADING set — acking signal %s without executing", sig.ticker)
             await bus.ack_signal(entry_id)
             continue
+
+        # Engineering A.5 — per-strategy signal counter (intraday realtime).
+        # Increments before any reject/accept so signal_count reflects supply,
+        # not just deployed capital. Rolled over to strategy_pnl_daily at 00:00 UTC.
+        try:
+            await _a5_record_signal(bus._r, sig.model_source or "<unknown>")
+        except Exception as _a5_exc:
+            log.debug("A.5 record_signal failed: %s", _a5_exc)
 
         # Clear per-signal held set — Redis ep:positions is the session dedup;
         # _held prevents duplicate entry within a single atomic operation only.
@@ -4691,6 +4703,7 @@ async def exec_main() -> None:
             _midnight_reset_loop(bus, risk_engine),
             kelly_calib_loop(bus),
             _divergence_monitor_loop(bus, positions),
+            _a5_pnl_rollover_loop(bus),   # Engineering A.5 — daily UTC-midnight strategy P&L rollover
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         log.info("Exec loop cancelled.")

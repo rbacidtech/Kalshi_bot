@@ -553,6 +553,17 @@ async def reconcile_one_settlement(
     except Exception as exc:
         log.warning("settle: audit write failed for %s: %s", ticker, exc)
 
+    # ── 1b. Engineering A.5 — per-strategy P&L attribution realtime hook ──────
+    # Increments ep:strategy_pnl_realtime counters for the originating strategy.
+    # Rolled over to strategy_pnl_daily Postgres table at 00:00 UTC by
+    # ep_pnl_attribution.rollover_loop (launched from ep_exec.exec_main).
+    try:
+        from ep_pnl_attribution import record_settlement as _a5_record_settlement
+        _a5_strat = (pos_snapshot or {}).get("strategy") or "settlement"
+        await _a5_record_settlement(bus_redis, _a5_strat, int(pnl_cents))
+    except Exception as _a5_exc:
+        log.debug("settle: A.5 record_settlement failed for %s: %s", ticker, _a5_exc)
+
     # ── 2. trades.csv synthetic exit row (live-mode only) ────────────────────
     if executor is not None:
         try:
