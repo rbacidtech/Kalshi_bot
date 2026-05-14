@@ -4005,6 +4005,10 @@ async def cancel_and_tombstone(
 async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
     """Check business-logic invariants every 5 min; surface issues via /health."""
     log.info("Business health check started (interval=%ds)", interval)
+    # Phase 1.3 S.3.2: rolling balance history for velocity check.
+    # 12 entries × 5min interval = 1h window; we use the oldest entry as the
+    # reference point and look for unexplained drops vs that t-60min snapshot.
+    _balance_history: list[tuple[float, int]] = []
     while True:
         await asyncio.sleep(interval)
         issues: list = []
@@ -4104,6 +4108,83 @@ async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
                                 )
             except Exception as _dpnl_exc:
                 log.debug("Daily P&L halt check failed: %s", _dpnl_exc)
+
+            # ── Balance velocity check (Phase 1.3 S.3.2) ───────────────────────
+            # "Unexplained" balance drop = balance fell >X% with no executions
+            # AND no settlements observed in the same window. This catches
+            # scenarios the daily P&L check doesn't: manual withdrawals,
+            # Kalshi-side bugs, compromised account.
+            try:
+                _bv_pct_raw = await bus._r.hget("ep:config", "override_balance_velocity_pct")
+                _bv_threshold = abs(float(_bv_pct_raw)) if _bv_pct_raw else 10.0
+            except (ValueError, TypeError):
+                _bv_threshold = 10.0
+
+            try:
+                _balances_all = await bus.get_all_balances()
+                _intel_bal = next(
+                    (v for k, v in _balances_all.items() if "intel" in k.lower()), None,
+                )
+                if _intel_bal is not None:
+                    _cur_bal = int(_intel_bal.get("balance_cents", 0) or 0)
+                    _balance_history.append((time.time(), _cur_bal))
+                    if len(_balance_history) > 12:
+                        _balance_history.pop(0)
+
+                    if len(_balance_history) >= 6:   # need ≥30 min of history
+                        _oldest_ts, _oldest_bal = _balance_history[0]
+                        _delta = _cur_bal - _oldest_bal
+                        _anchor_key = f"ep:bankroll_anchor:{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                        _anchor_raw = await bus._r.get(_anchor_key)
+                        _bankroll = int(_anchor_raw) if _anchor_raw else _cur_bal
+                        if _bankroll > 0 and _delta < 0:
+                            _drop_pct = abs(_delta) / _bankroll * 100
+                            if _drop_pct >= _bv_threshold:
+                                # Activity check in window
+                                _ws_unix = int(_oldest_ts)
+                                _ws_stream_id = f"{int(_oldest_ts * 1000)}-0"
+                                _exec_n = 0
+                                try:
+                                    _exec_e = await bus._r.xrange(
+                                        "ep:executions", _ws_stream_id, "+", count=1,
+                                    )
+                                    _exec_n = len(_exec_e)
+                                except Exception:
+                                    _exec_n = 1   # safe default: assume activity, don't halt
+                                _settle_n = 0
+                                try:
+                                    _settle_n = await bus._r.zcount(
+                                        "ep:settle:seen", _ws_unix, "+inf",
+                                    )
+                                except Exception:
+                                    _settle_n = 1   # safe default
+                                if _exec_n == 0 and _settle_n == 0:
+                                    _halt_cur = await bus._r.hget("ep:config", "HALT_TRADING")
+                                    if _halt_cur not in (b"1", "1"):
+                                        await bus._r.hset("ep:config", "HALT_TRADING", "1")
+                                        await bus._r.hset("ep:halt", mapping={
+                                            "reason":             "balance_velocity_unexplained",
+                                            "tripped_at_us":      str(int(time.time() * 1_000_000)),
+                                            "delta_cents":        str(_delta),
+                                            "drop_pct":           f"{_drop_pct:.2f}",
+                                            "threshold_pct":      f"{_bv_threshold:.2f}",
+                                            "window_start_unix":  str(_ws_unix),
+                                            "exec_count_window":  "0",
+                                            "settle_count_window":"0",
+                                        })
+                                        log.warning(
+                                            "Balance velocity halt: -$%.2f drop (%.2f%% of $%.2f bankroll) "
+                                            "in %.0f min with zero executions AND zero settlements. "
+                                            "HALT_TRADING set; investigate before clearing.",
+                                            abs(_delta) / 100, _drop_pct, _bankroll / 100,
+                                            (time.time() - _oldest_ts) / 60,
+                                        )
+                                        issues.append(
+                                            f"BALANCE_VELOCITY_HALT: -{_drop_pct:.2f}% in "
+                                            f"{(time.time() - _oldest_ts) / 60:.0f}min, no activity"
+                                        )
+            except Exception as _bv_exc:
+                log.debug("Balance velocity check failed: %s", _bv_exc)
 
             # Merge into /health state without overwriting infra keys
             existing = metrics._health.copy()
