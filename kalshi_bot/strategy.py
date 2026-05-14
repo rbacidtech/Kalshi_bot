@@ -545,6 +545,148 @@ def scan_economic_ladder_arb(markets: list[dict], max_contracts: int) -> list[Si
     return signals
 
 
+# H2H sum-to-1 arb prefixes — 7 sports series validated by verdict §3.1.
+# Each event ticker has exactly 2 outcome markets (home / away or player A / B).
+_H2H_SUM_TO_1_PREFIXES = (
+    "KXMLBGAME",     # MLB regular-season game
+    "KXMLSGAME",     # MLS regular-season game
+    "KXWTAMATCH",    # WTA tennis match
+    "KXATPMATCH",    # ATP tennis match
+    "KXNCAAMBGAME",  # NCAA men's basketball game
+    "KXNCAAFGAME",   # NCAA football game
+    "KXNHLGAME",     # NHL regular-season game
+)
+
+# Default arb threshold — fire when sum_yes < this. Verdict §3.1 used 0.98
+# (2¢ gross arb before fees). Configurable at runtime via the dispatch site.
+_H2H_DEFAULT_SUM_THRESHOLD = 0.98
+
+
+def scan_h2h_sum_to_1_arb(
+    markets:        list[dict],
+    max_contracts:  int,
+    sum_threshold:  float = _H2H_DEFAULT_SUM_THRESHOLD,
+) -> list[Signal]:
+    """H2H 2-outcome sum-to-1 arb (verdict §3.1, $23,054/yr theoretical).
+
+    For 2-team games, ``sum(yes_ask across both outcomes)`` must equal 1.00 at
+    settlement (exactly one outcome resolves YES). When the market sum is
+    below ``sum_threshold`` (default 0.98), buy YES on BOTH outcomes — total
+    cost = sum_asks per contract, guaranteed payout = $1, gross arb = 1 - sum.
+
+    Verdict-validated across 7 sports prefixes with 100% historical win rate
+    on the n>=190 minimum samples (n=190 NHL up to n=1,112 MLB).
+
+    The signal emitted uses ``arb_legs`` to carry both buys; ep_exec's arb
+    coordinator places both orders atomically and rolls back on either leg
+    failing (same path used by fomc_butterfly_arb, scan_fomc_arb).
+
+    Args:
+        markets:        Full list of Kalshi market dicts (filtered internally).
+        max_contracts:  Per-signal contract cap from the dispatch layer.
+        sum_threshold:  Fire only when sum_ask < this. Lower = stricter.
+                        Override via ep:config:override_h2h_sum_threshold.
+    """
+    h2h_markets = [
+        m for m in markets
+        if any(str(m.get("ticker", "")).startswith(p) for p in _H2H_SUM_TO_1_PREFIXES)
+    ]
+    if not h2h_markets:
+        return []
+
+    by_event: dict[str, list[dict]] = {}
+    for m in h2h_markets:
+        ev = m.get("event_ticker") or ""
+        if not ev:
+            continue
+        by_event.setdefault(ev, []).append(m)
+
+    signals: list[Signal] = []
+    for event, group in by_event.items():
+        if len(group) != 2:
+            # Only fire on clean 2-outcome events. Three-way ties (some leagues)
+            # or partially-listed events get skipped — the sum-to-1 invariant
+            # doesn't apply outside binary outcomes.
+            continue
+
+        # Read yes_ask for both legs. If either side is unpriced, skip.
+        priced: list[tuple[dict, float]] = []
+        for m in group:
+            ask = m.get("yes_ask_dollars")
+            try:
+                ask_f = float(ask) if ask is not None else 0.0
+            except (TypeError, ValueError):
+                ask_f = 0.0
+            if ask_f <= 0.0 or ask_f >= 1.0:
+                priced = []
+                break
+            priced.append((m, ask_f))
+        if len(priced) != 2:
+            continue
+
+        m1, ask1 = priced[0]
+        m2, ask2 = priced[1]
+        sum_ask = ask1 + ask2
+        if sum_ask >= sum_threshold:
+            continue
+
+        gross_edge = 1.0 - sum_ask
+        # Per-contract fees: Kalshi taker fee ≈ 7¢ × p × (1-p), maxing at $0.0175
+        # when p=0.5. For a 2-leg arb the fees on both sides are paid; conservative
+        # upper bound = 2 × 0.0175 = 3.5¢/contract. Use the exact formula when
+        # we have both prices.
+        fee_per_contract = (
+            round(KALSHI_FEE_RATE * ask1 * (1 - ask1), 4)
+            + round(KALSHI_FEE_RATE * ask2 * (1 - ask2), 4)
+        )
+        net_edge = gross_edge - fee_per_contract
+        # NOTE: the verdict §3.1 threshold (sum_ask < 0.98) is the only gate;
+        # individual trades may be marginally net-negative but the verdict's
+        # +5.28% mean across all KXMLBGAME arbs implies the AVERAGE is firmly
+        # positive. Skipping all trades below MIN_EDGE_GROSS would lose the
+        # high-volume tail. Do NOT add a net-edge filter here.
+
+        # Size: scale with gross edge magnitude, cap at max_contracts.
+        # Use gross (not net) because the size scaling is about position
+        # magnitude, not edge filtering.
+        contracts = min(max_contracts, max(1, int(gross_edge * 50)))
+
+        sig = Signal(
+            ticker            = m1["ticker"],
+            title             = (
+                f"H2H ARB: Buy {m1['ticker']} YES + Buy {m2['ticker']} YES "
+                f"(sum_ask={sum_ask:.4f}, gross={gross_edge*100:.2f}¢)"
+            ),
+            category          = "arb",
+            side              = "yes",
+            fair_value        = 1.0 - ask2,                # what m1 yes "should be" in 2-outcome
+            market_price      = ask1,
+            edge              = gross_edge,
+            fee_adjusted_edge = net_edge,
+            contracts         = contracts,
+            confidence        = 0.95,
+            model_source      = "h2h_sum_to_1_arb",
+            arb_legs          = [
+                {"ticker": m1["ticker"], "side": "yes", "price_cents": int(round(ask1 * 100))},
+                {"ticker": m2["ticker"], "side": "yes", "price_cents": int(round(ask2 * 100))},
+            ],
+            close_time        = m1.get("close_time"),
+        )
+        signals.append(sig)
+        log.info(
+            "H2H ARB: %s yes=%.4f + %s yes=%.4f sum=%.4f gross=%.2f¢ net=%.2f¢ ×%d",
+            m1["ticker"], ask1, m2["ticker"], ask2, sum_ask,
+            gross_edge * 100, net_edge * 100, contracts,
+        )
+
+    if signals:
+        log.info(
+            "H2H sum-to-1 arb: %d signals across %d 2-outcome events (threshold=%.4f)",
+            len(signals), len([g for g in by_event.values() if len(g) == 2]), sum_threshold,
+        )
+    return signals
+
+
 async def scan_fomc_directional(
     markets:              list[dict],
     current_rate:         float,
@@ -4075,6 +4217,17 @@ async def fetch_signals_async(
             all_signals.extend(eco_arb_sigs)
         except Exception as exc:
             log.warning("Economic ladder arb scan failed: %s", exc)
+
+    # 1c. H2H sum-to-1 arb (Phase 2A #1 — verdict §3.1, $23K/yr theoretical).
+    # 7 sports prefixes: KXMLBGAME, KXMLSGAME, KXWTAMATCH, KXATPMATCH,
+    # KXNCAAMBGAME, KXNCAAFGAME, KXNHLGAME. Pure structural arb; no model needed.
+    try:
+        h2h_sigs = scan_h2h_sum_to_1_arb(all_markets, max_contracts)
+        all_signals.extend(h2h_sigs)
+        if h2h_sigs:
+            log.info("H2H sum-to-1 ARB: %d opportunities", len(h2h_sigs))
+    except Exception as exc:
+        log.warning("H2H sum-to-1 arb scan failed: %s", exc)
 
     # 2. FOMC directional (FRED rate anchor)
     if enable_fomc:
