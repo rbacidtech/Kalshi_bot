@@ -4186,6 +4186,64 @@ async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
             except Exception as _bv_exc:
                 log.debug("Balance velocity check failed: %s", _bv_exc)
 
+            # ── Per-strategy cumulative loss circuit breaker (Phase 1.3 S.3.3) ─
+            # When a strategy's 7d cumulative P&L drops below -X% of bankroll,
+            # auto-add it to disabled_model_sources. Operator re-enables manually.
+            # Persists the auto-disable event to ep:auto_disabled so the operator
+            # can distinguish algorithmic disables from manual ones.
+            try:
+                _strat_pct_raw = await bus._r.hget("ep:config", "override_strategy_loss_threshold_pct")
+                _strat_threshold_pct = abs(float(_strat_pct_raw)) if _strat_pct_raw else 10.0
+            except (ValueError, TypeError):
+                _strat_threshold_pct = 10.0
+
+            try:
+                _perf7_raw = await bus._r.get("ep:performance:7")
+                if _perf7_raw:
+                    _perf7 = json.loads(_perf7_raw)
+                    _by_strat = _perf7.get("by_strategy", {}) or {}
+                    _anchor_key = f"ep:bankroll_anchor:{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    _anchor_raw = await bus._r.get(_anchor_key)
+                    _bankroll_cents_strat = int(_anchor_raw) if _anchor_raw else 0
+                    if _bankroll_cents_strat > 0 and _by_strat:
+                        _loss_cap_cents = _bankroll_cents_strat * _strat_threshold_pct / 100
+                        _disabled_raw = await bus._r.hget("ep:config", "disabled_model_sources") or ""
+                        if isinstance(_disabled_raw, bytes):
+                            _disabled_raw = _disabled_raw.decode()
+                        _disabled_set = {s.strip() for s in _disabled_raw.split(",") if s.strip()}
+                        _newly_disabled: list[tuple[str, int]] = []
+                        for _strat_name, _strat_stats in _by_strat.items():
+                            if not _strat_name or _strat_name in _disabled_set:
+                                continue
+                            _strat_pnl = int(_strat_stats.get("pnl_cents", 0) or 0)
+                            if _strat_pnl < -_loss_cap_cents:
+                                _newly_disabled.append((_strat_name, _strat_pnl))
+                                _disabled_set.add(_strat_name)
+                        if _newly_disabled:
+                            _new_disabled_str = ",".join(sorted(_disabled_set))
+                            await bus._r.hset(
+                                "ep:config", "disabled_model_sources", _new_disabled_str,
+                            )
+                            _now_us = int(time.time() * 1_000_000)
+                            for _sn, _spnl in _newly_disabled:
+                                await bus._r.hset(
+                                    "ep:auto_disabled", _sn,
+                                    f"ts_us={_now_us}|pnl_cents={_spnl}|"
+                                    f"threshold_pct={_strat_threshold_pct:.2f}|window_days=7",
+                                )
+                                log.warning(
+                                    "Strategy circuit breaker: %s 7d_pnl=$%.2f exceeds "
+                                    "-%.2f%% bankroll cap ($%.2f). Auto-added to "
+                                    "disabled_model_sources; operator can re-enable manually.",
+                                    _sn, _spnl / 100, _strat_threshold_pct,
+                                    _loss_cap_cents / 100,
+                                )
+                                issues.append(
+                                    f"AUTO_DISABLED: {_sn} (7d pnl ${_spnl/100:.2f} > -${_loss_cap_cents/100:.2f})"
+                                )
+            except Exception as _strat_exc:
+                log.debug("Strategy circuit breaker check failed: %s", _strat_exc)
+
             # Merge into /health state without overwriting infra keys
             existing = metrics._health.copy()
             existing["business_issues"] = issues
