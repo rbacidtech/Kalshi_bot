@@ -1430,6 +1430,16 @@ async def _signal_consumer(
     log.info("Signal consumer started (consumer=%s)", consumer_name)
 
     async for entry_id, sig in bus.consume_signals(consumer_name):
+        # Phase 1.3 S.3.4: hard halt — filesystem-flag check, must come BEFORE
+        # the Redis HALT_TRADING check. The hard halt persists across Redis
+        # outages and explicitly requires operator action (rm /root/EdgePulse/.hard_halt)
+        # to clear — distinct from the soft HALT_TRADING which can be flipped via redis-cli.
+        from ep_hard_halt import is_hard_halted as _is_hard_halted
+        if _is_hard_halted():
+            log.warning("HARD HALT active (filesystem flag) — acking signal %s without executing", sig.ticker)
+            await bus.ack_signal(entry_id)
+            continue
+
         # Check ops-level halt before processing every signal.
         # Intel also checks this and stops publishing when halted, but signals
         # already queued in ep:signals before the halt must be refused here too.
@@ -4002,13 +4012,22 @@ async def cancel_and_tombstone(
         return False
 
 
-async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
-    """Check business-logic invariants every 5 min; surface issues via /health."""
+async def _business_health_loop(bus: RedisBus, kalshi_client=None, interval: int = 300) -> None:
+    """Check business-logic invariants every 5 min; surface issues via /health.
+
+    `kalshi_client` is required for Phase 1.3 S.3.4 hard-halt transition
+    detection (cancels resting orders when the flag file first appears).
+    If None (e.g., paper mode), the cancel step is skipped but the halt
+    is still recorded.
+    """
     log.info("Business health check started (interval=%ds)", interval)
     # Phase 1.3 S.3.2: rolling balance history for velocity check.
     # 12 entries × 5min interval = 1h window; we use the oldest entry as the
     # reference point and look for unexplained drops vs that t-60min snapshot.
     _balance_history: list[tuple[float, int]] = []
+    # Phase 1.3 S.3.4: hard-halt transition detector. Edge-triggered: cancel
+    # resting orders on the False→True transition only.
+    _last_hard_halt: bool = False
     while True:
         await asyncio.sleep(interval)
         issues: list = []
@@ -4243,6 +4262,41 @@ async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
                                 )
             except Exception as _strat_exc:
                 log.debug("Strategy circuit breaker check failed: %s", _strat_exc)
+
+            # ── Hard halt transition detection (Phase 1.3 S.3.4) ──────────────
+            # When the flag file first appears (operator did `touch .hard_halt`
+            # or set_hard_halt() was called by a future automatic trigger),
+            # cancel all resting Kalshi orders and record the trip to ep:halt.
+            # Subsequent cycles see the same state and don't re-cancel.
+            try:
+                from ep_hard_halt import is_hard_halted as _is_hh, set_hard_halt as _set_hh
+                _now_hh = _is_hh()
+                if _now_hh and not _last_hard_halt:
+                    log.warning("Hard halt flag file appeared — invoking cancel-all-resting")
+                    _hh_result = _set_hh(
+                        reason="filesystem_flag_detected",
+                        kalshi_client=kalshi_client,
+                    )
+                    try:
+                        await bus._r.hset("ep:halt", mapping={
+                            "reason":            "hard_halt",
+                            "tripped_at_us":     str(_hh_result["tripped_at_us"]),
+                            "cancelled_orders":  str(_hh_result["cancelled_orders"]),
+                            "cancel_errors":     str(_hh_result["cancel_errors"]),
+                            "flag_path":         _hh_result["flag_path"],
+                        })
+                    except Exception as _hh_redis_exc:
+                        log.warning("Hard halt: failed to write ep:halt mapping: %s", _hh_redis_exc)
+                    issues.append(
+                        f"HARD_HALT: cancelled {_hh_result['cancelled_orders']} resting orders "
+                        f"({_hh_result['cancel_errors']} errors)"
+                    )
+                elif _now_hh and _last_hard_halt:
+                    # Steady state — flag still present, no action needed.
+                    issues.append("HARD_HALT: active (operator must rm flag file to clear)")
+                _last_hard_halt = _now_hh
+            except Exception as _hh_exc:
+                log.debug("Hard halt transition check failed: %s", _hh_exc)
 
             # Merge into /health state without overwriting infra keys
             existing = metrics._health.copy()
@@ -4631,7 +4685,7 @@ async def exec_main() -> None:
             settlement_recon_loop(client, bus, executor),
             _fill_poll_loop(positions, client, executor, bus, db),
             _performance_publisher_loop(bus),
-            _business_health_loop(bus),
+            _business_health_loop(bus, kalshi_client=client),
             _midnight_reset_loop(bus, risk_engine),
             kelly_calib_loop(bus),
             _divergence_monitor_loop(bus, positions),
