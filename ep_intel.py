@@ -22,6 +22,7 @@ from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional
 
 from ep_config import cfg, NODE_ID, REDIS_URL, EP_PRICES, log, sd_notify
+from strategies import verdict_doc_alignment_check
 from kalshi_bot.auth      import KalshiAuth, NoAuth
 from kalshi_bot.client    import KalshiClient
 from kalshi_bot.state     import BotState
@@ -2937,6 +2938,8 @@ async def intel_main() -> None:
 
 if __name__ == "__main__":
     import signal as _signal
+
+    verdict_doc_alignment_check()
 
     async def _run():
         loop = asyncio.get_running_loop()
