@@ -4243,6 +4243,43 @@ async def fetch_signals_async(
     except Exception as exc:
         log.warning("H2H sum-to-1 arb scan failed: %s", exc)
 
+    # 1d-1h. Phase 2 verdict-validated strategies (verdict §3-§4).
+    # All 12 scanners from kalshi_bot/strategy_phase2.py — wired here so they
+    # run alongside the existing scanners. Per-strategy enablement via
+    # ep:config:disabled_model_sources at the exec gate.
+    try:
+        from kalshi_bot.strategy_phase2 import (
+            scan_spread_monotonicity,
+            scan_total_monotonicity,
+            scan_nfl_prop_yardage_monot,
+            scan_crypto_threshold_monot,
+            scan_a2_cross_market_arb,
+            scan_kxmve_nfl_singlegame_longshot,
+            scan_kxmve_nfl_multigame_longshot,
+            scan_kxmve_nba_singlegame_longshot,
+            scan_kxmve_sports_multigame_longshot,
+            scan_weather_city_highs_longshot,
+            scan_a1_mention_no,
+            scan_crypto_daily_longshot,
+            scan_political_longshot,
+        )
+        for fn in (
+            scan_spread_monotonicity, scan_total_monotonicity,
+            scan_nfl_prop_yardage_monot, scan_crypto_threshold_monot,
+            scan_a2_cross_market_arb,
+            scan_kxmve_nfl_singlegame_longshot, scan_kxmve_nfl_multigame_longshot,
+            scan_kxmve_nba_singlegame_longshot, scan_kxmve_sports_multigame_longshot,
+            scan_weather_city_highs_longshot, scan_a1_mention_no,
+            scan_crypto_daily_longshot, scan_political_longshot,
+        ):
+            try:
+                sigs = fn(all_markets, max_contracts)
+                all_signals.extend(sigs)
+            except Exception as exc:
+                log.warning("%s scan failed: %s", fn.__name__, exc)
+    except Exception as exc:
+        log.warning("Phase 2 scanners import failed: %s", exc)
+
     # 2. FOMC directional (FRED rate anchor)
     if enable_fomc:
         try:
