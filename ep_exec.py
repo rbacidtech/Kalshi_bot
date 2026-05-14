@@ -24,6 +24,7 @@ from ep_pnl_attribution import (
     record_signal as _a5_record_signal,
     rollover_loop as _a5_pnl_rollover_loop,
 )
+import ep_position_store_sqlite as _s2_sqlite  # Engineering S.2 durability backup
 from kalshi_bot.auth     import KalshiAuth, NoAuth
 from kalshi_bot.client   import KalshiClient
 from kalshi_bot.executor import Executor
@@ -4277,6 +4278,53 @@ async def _business_health_loop(bus: RedisBus, kalshi_client=None, interval: int
             except Exception as _strat_exc:
                 log.debug("Strategy circuit breaker check failed: %s", _strat_exc)
 
+            # ── S.2 SQLite durability snapshot + recovery check ──────────────
+            # Snapshot ep:positions → SQLite WAL store every cycle so we have
+            # a durable backup if Redis is lost. Also detect drift between
+            # Redis and SQLite and record to the reconciliations audit table.
+            try:
+                _positions_raw = await bus._r.hgetall("ep:positions")
+                _redis_positions: dict[str, str] = {}
+                for _pk, _pv in (_positions_raw or {}).items():
+                    _pk_s = _pk.decode() if isinstance(_pk, bytes) else _pk
+                    _pv_s = _pv.decode() if isinstance(_pv, bytes) else _pv
+                    _redis_positions[_pk_s] = _pv_s
+                _sqlite_before = _s2_sqlite.read_all_positions()
+                _divergences = _s2_sqlite.detect_drift(_redis_positions, _sqlite_before)
+                _sqlite_count = _s2_sqlite.snapshot_from_redis(_redis_positions)
+                _s2_sqlite.record_reconciliation(
+                    source="periodic",
+                    redis_count=len(_redis_positions),
+                    sqlite_count=_sqlite_count,
+                    divergences=_divergences if _divergences else None,
+                    resolution="auto_reconciled" if _divergences else "no_action",
+                )
+                if _divergences:
+                    log.info(
+                        "S.2 snapshot: Redis=%d SQLite_prev=%d divergences=%d (auto-reconciled)",
+                        len(_redis_positions), len(_sqlite_before), len(_divergences),
+                    )
+                # Recovery flag check — trader defensive-halts if operator
+                # hasn't cleared the boot-recovery flag (Engineering S.2 §3).
+                if _s2_sqlite.is_recovery_pending():
+                    _halt_cur = await bus._r.hget("ep:config", "HALT_TRADING")
+                    if _halt_cur not in (b"1", "1"):
+                        await bus._r.hset("ep:config", "HALT_TRADING", "1")
+                        await bus._r.hset("ep:halt", mapping={
+                            "reason":        "recovery_pending",
+                            "tripped_at_us": str(int(time.time() * 1_000_000)),
+                            "flag_path":     str(_s2_sqlite._RECOVERY_FLAG),
+                            "source":        "trader_defensive_s2",
+                        })
+                        log.warning(
+                            "S.2 recovery flag detected at %s — HALT_TRADING set. "
+                            "Operator must review SQLite state vs Kalshi before clearing.",
+                            _s2_sqlite._RECOVERY_FLAG,
+                        )
+                        issues.append(f"S2_RECOVERY_PENDING: rm {_s2_sqlite._RECOVERY_FLAG}")
+            except Exception as _s2_exc:
+                log.debug("S.2 SQLite snapshot/recovery check failed: %s", _s2_exc)
+
             # ── Supervisor heartbeat check (Engineering S.3 §5 GAP fix) ───────
             # The supervisor runs in a separate systemd unit and writes
             # ep:supervisor:heartbeat every 10s. If we don't see a fresh
@@ -4559,6 +4607,13 @@ async def exec_main() -> None:
     log.info("=" * 60)
     log.info("EdgePulse Exec   node=%s  mode=%s", NODE_ID, mode_label)
     log.info("=" * 60)
+
+    # Engineering S.2 — ensure SQLite WAL schema before any reconciliation.
+    try:
+        _s2_sqlite.ensure_schema()
+        log.info("S.2 SQLite store ready at %s", _s2_sqlite._DB_PATH)
+    except Exception as _s2_init_exc:
+        log.warning("S.2 SQLite ensure_schema failed (non-fatal): %s", _s2_init_exc)
 
     # ── Auth + clients ────────────────────────────────────────────────────────
     auth   = NoAuth() if (cfg.PAPER_TRADE and not cfg.API_KEY_ID) else \
