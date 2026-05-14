@@ -87,15 +87,17 @@ def benchmarks() -> dict:
 @pytest.fixture(scope="module")
 def trades_df() -> pd.DataFrame:
     p = _resolve_trades_parquet()
-    df = pd.read_parquet(p)
-    required_cols = {"price", "side", "outcome", "volume"}
-    missing = required_cols - set(df.columns)
-    if missing:
+    # Project to just the headline-parity columns. The per-strategy harness
+    # adds more columns (ticker/event_ticker/created_time) which would push
+    # this fixture past OOM on the full 67M-row dataset.
+    needed = ["price", "side", "outcome", "volume"]
+    try:
+        df = pd.read_parquet(p, columns=needed)
+    except (KeyError, ValueError) as e:
         raise RuntimeError(
-            f"Becker parquet at {p} missing columns {missing}. "
-            f"Expected schema per DataPipeline.md §2: "
-            f"price, side, is_taker_buy, outcome, category, volume."
-        )
+            f"Becker parquet at {p} missing required columns {needed}: {e}"
+        ) from e
+    df["side"] = df["side"].astype("category")
     return df
 
 

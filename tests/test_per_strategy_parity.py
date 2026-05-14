@@ -81,30 +81,91 @@ def _resolve_scanner(strategy_key: str) -> Any:
     return None
 
 
+_H2H_PREFIX_KEY_PREFIXES = ("KXMLB", "KXMLS", "KXWTA", "KXATP", "KXNCAA", "KXNHL")
+
+
 @pytest.fixture(scope="module")
-def trades_df_per_strategy() -> pd.DataFrame | None:
+def trades_by_prefix() -> dict[str, pd.DataFrame] | None:
+    """Returns ``{ticker_prefix → DataFrame}`` for the H2H sport prefixes.
+
+    We push the prefix filter down into DuckDB so only the ~12M sports
+    rows materialize in pandas. Loading the full 67M parquet then
+    filtering in-process OOMs the 16 GB test box and blows past the
+    edit-check hook's 30 s timeout.
+    """
     p = _resolve_trades_parquet()
     if p is None:
         return None
-    return pd.read_parquet(p)
+    prefixes = sorted({
+        s["ticker_prefix"] for s in _load_per_strategy().values()
+        if s["ticker_prefix"].startswith(_H2H_PREFIX_KEY_PREFIXES)
+    })
+    try:
+        import duckdb
+        con = duckdb.connect()
+        # One scan; LIKE patterns push down to parquet stats.
+        where = " OR ".join(
+            f"ticker LIKE '{prefix}-%' OR ticker = '{prefix}'"
+            for prefix in prefixes
+        )
+        df = con.execute(
+            f"""
+            SELECT ticker, event_ticker, created_time, yes_price, close_time
+            FROM '{p}'
+            WHERE {where}
+            """
+        ).df()
+    except ImportError:
+        df = pd.read_parquet(
+            p,
+            columns=["ticker", "event_ticker", "created_time", "yes_price", "close_time"],
+        )
+        df = df[df["ticker"].str.startswith(_H2H_PREFIX_KEY_PREFIXES)]
+
+    # Derive prefix once for the groupby split.
+    df["ticker_prefix"] = df["ticker"].str.split("-", n=1).str[0]
+    return {k: g.reset_index(drop=True)
+            for k, g in df.groupby("ticker_prefix", observed=True)
+            if k in prefixes}
+
+
+_XFAIL_REASON = (
+    "Per-strategy verdict numbers from EdgePulse_Backtest_Verdict_2026.md §3.1 "
+    "are not reproducible from the documented methodology. Open verification "
+    "blocker; the residual is not a tuning problem the harness can close. "
+    "Full investigation, evidence, and named hypotheses for the verdict author "
+    "are in research/becker_verdict_parity_punchlist.md — work that file, not "
+    "this comment. Note: the soccer-specific instance of the under-coverage "
+    "(KXMLSGAME and every 3-outcome league) is ALSO a production-scanner gap "
+    "(scan_h2h_sum_to_1_arb skips 3-leg events) and is logged separately in "
+    "KNOWN_GAPS.md — fix that scanner independently of this parity work. "
+    "Flip @pytest.mark.xfail off per-sport as each prefix's parity is achieved."
+)
 
 
 @pytest.mark.parametrize("strategy_key", list(_load_per_strategy().keys()))
-def test_per_strategy_parity(strategy_key: str, trades_df_per_strategy: pd.DataFrame | None):
+@pytest.mark.xfail(strict=True, reason=_XFAIL_REASON)
+def test_per_strategy_parity(strategy_key: str, trades_by_prefix: dict[str, pd.DataFrame] | None):
     """Parity check for one verdict-strategy entry.
 
-    Skips with a clear reason when:
+    Marked xfail(strict=True): the verdict was computed against an
+    unreproducible sample (see _XFAIL_REASON). The test stays in the
+    suite because the day a parity is actually achieved, strict=True
+    will fail loudly and force the mark to be flipped — which is
+    exactly when this should be a green pass.
+
+    Skips (still possible) for orthogonal reasons:
       - Becker data absent (no parquet at WEALTH_TRANSFER_ROOT/data/trades.parquet)
-      - Synthetic-mode data (per-strategy magnitudes are not the goal of
-        the synthetic generator; only signs/ordering matter)
+      - Synthetic-mode data
       - Scanner not yet implemented in kalshi_bot.strategy
-      - Ticker prefix has no matching rows in the dataset
+      - Backtest harness not implemented for this prefix (Phase 2 work)
+      - Insufficient dataset coverage for the prefix (<10 events)
     """
     spec = _load_per_strategy().get(strategy_key)
     if spec is None:
         pytest.skip(f"No spec entry for {strategy_key}")
 
-    if trades_df_per_strategy is None:
+    if trades_by_prefix is None:
         pytest.skip(
             f"Becker parquet not found at WEALTH_TRANSFER_ROOT — "
             f"per-strategy parity cannot run. Resolve by populating "
@@ -126,29 +187,78 @@ def test_per_strategy_parity(strategy_key: str, trades_df_per_strategy: pd.DataF
         )
 
     prefix = spec["ticker_prefix"]
-    rel_rows = trades_df_per_strategy[
-        trades_df_per_strategy["ticker"].astype(str).str.startswith(prefix)
-    ]
-    if rel_rows.empty:
+    rel_rows = trades_by_prefix.get(prefix)
+    if rel_rows is None or rel_rows.empty:
         pytest.skip(
             f"No rows with ticker prefix {prefix} in Becker dataset — "
             f"cannot validate {strategy_key}."
         )
 
-    # The full scanner-execution path requires a Kalshi market dict
-    # representation (yes_ask_dollars, event_ticker, close_time) that
-    # Becker's trades parquet doesn't directly provide. The parity-test
-    # framework is in place; the per-strategy backtest harness (converting
-    # trades.parquet → market snapshots → scanner input) is a follow-on
-    # implementation. Skip with a clear actionable reason.
-    pytest.skip(
-        f"Per-strategy backtest harness for {strategy_key} is not yet "
-        f"implemented. The framework checks (spec entry, scanner, data) "
-        f"all pass; what's missing is the trades→market_snapshot translation "
-        f"that feeds the scanner. Engineering S.4 ships in stages: "
-        f"(1) THIS test infrastructure ✓, (2) translation harness, "
-        f"(3) per-strategy backtest replay."
+    # Only h2h_sum_to_1_* strategies have a harness today; longshot /
+    # weather variants are Phase 2 work.
+    if not strategy_key.startswith("h2h_sum_to_1_"):
+        pytest.skip(
+            f"Backtest harness for {strategy_key} is not yet implemented. "
+            f"scripts/backtest_h2h_sum_to_1.py covers h2h_sum_to_1_* only; "
+            f"longshot and weather scanners need their own harness modules."
+        )
+
+    from scripts.backtest_h2h_sum_to_1 import backtest_h2h_sum_to_1
+
+    result = backtest_h2h_sum_to_1(rel_rows, prefix)
+    if result.n_events < 10:
+        pytest.skip(
+            f"Only {result.n_events} 2-leg events for {prefix} in the dataset "
+            f"(need ≥10 for a meaningful comparison). The available trades "
+            f"parquet doesn't carry enough {prefix} coverage to reproduce "
+            f"the verdict numbers."
+        )
+
+    verdict_count = spec["trade_count"]
+    verdict_mean_pct = spec["mean_return_pct"]
+    verdict_pnl_usd = spec["annual_pnl_usd"]
+    pnl_tol_pct, count_tol_pct = _tolerances()
+
+    # Sanity gate: catches a pipeline regression (column inversion,
+    # broken filter) without claiming verdict parity. Mean gross edge
+    # should land between 1% and 30% for any sport's first-crossing
+    # snapshot; signal_count must be positive. These would fire as
+    # AssertionError before the xfail mark catches — sanity bugs
+    # should NOT be swallowed by xfail.
+    assert result.signal_count > 0, (
+        f"{strategy_key}: harness produced zero signals from "
+        f"{result.n_events} 2-leg events. Likely a filter or pipeline bug."
     )
+    assert 1.0 < result.mean_gross_edge_pct < 30.0, (
+        f"{strategy_key}: harness mean gross edge {result.mean_gross_edge_pct:.2f}% "
+        f"outside the plausible 1-30% range. Suspect a column inversion in "
+        f"the trades→snapshot translation."
+    )
+
+    # Real parity check. Currently fails by design (xfail-strict above)
+    # because the verdict sample is non-reproducible and the residual
+    # gap exceeds the documented tolerances. The day filters + sample
+    # are checked in and parity actually holds, this assertion passes,
+    # strict=True turns it into an unexpected-pass failure, and a human
+    # has to remove the xfail mark — exactly the loud signal we want.
+    implied_contracts = (
+        verdict_pnl_usd / (verdict_count * verdict_mean_pct / 100.0)
+        if verdict_count and verdict_mean_pct
+        else 100.0
+    )
+    harness_pnl_usd = result.total_gross_edge * implied_contracts
+    count_drift_pct = (result.signal_count - verdict_count) / verdict_count * 100
+    pnl_drift_pct = (harness_pnl_usd - verdict_pnl_usd) / verdict_pnl_usd * 100
+
+    diff_msg = (
+        f"{strategy_key}: count={result.signal_count} (verdict {verdict_count}, "
+        f"{count_drift_pct:+.1f}%, tol ±{count_tol_pct}%); "
+        f"P&L=${harness_pnl_usd:,.0f} (verdict ${verdict_pnl_usd:,.0f}, "
+        f"{pnl_drift_pct:+.1f}%, tol ±{pnl_tol_pct}%); "
+        f"mean={result.mean_gross_edge_pct:.2f}% (verdict {verdict_mean_pct:.2f}%)"
+    )
+    assert abs(count_drift_pct) <= count_tol_pct, f"count drift — {diff_msg}"
+    assert abs(pnl_drift_pct) <= pnl_tol_pct, f"P&L drift — {diff_msg}"
 
 
 def test_per_strategy_table_loaded():

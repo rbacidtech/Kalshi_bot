@@ -19,6 +19,39 @@ _Updated 2026-05-14 — Migration Plan Phase 0 actions: `edgepulse-advisor`, `ed
 
 ## Silently broken — needs fix
 
+- **`scan_h2h_sum_to_1_arb` is silently blind to every soccer market with a draw outcome.**
+  Discovered 2026-05-14 while building the Phase 1.1 S.4 per-strategy parity
+  harness against Becker's 67M-row trades dataset.
+  `kalshi_bot/strategy.py:612` rejects every event_ticker group whose
+  `len(group) != 2`. Soccer markets (KXMLSGAME, and by inference every
+  3-outcome league: EPL, La Liga, Serie A, Bundesliga, Ligue 1, UCL/UEL,
+  Premier League, World Cup, etc.) list **three** legs per event —
+  home win, away win, draw — and so are silently skipped. Empirical check
+  against the Becker tarball: `KXMLSGAME` has 313 resolved event_tickers
+  and 948 distinct tickers — exactly 3 tickers per event. The scanner
+  fires on zero of them. Verdict (`EdgePulse_Backtest_Verdict_2026.md`
+  §3.1) credits soccer with 258 sum-to-1 arbs / $4,827 annual P&L, all
+  of which production currently leaves on the table.
+
+  Sum-to-1 still holds for k-outcome events (exactly one outcome resolves
+  YES → guaranteed $1 payout for buying YES on all k legs), so the
+  arb math is unchanged — just sum across k prices instead of 2. Two paths:
+  - (a) **Extend the scanner to k-leg sum-to-1.** Replace the
+    `len(group) != 2` skip with `if len(group) < 2: continue` (or
+    `not in (2, 3)` if you want a hard cap), and let the existing
+    threshold + max_contracts logic work over the wider list of legs.
+    Production impact: real coverage of every 3-outcome soccer league.
+  - (b) **Document the soccer carve-out as intentional** with a reason
+    (e.g. "draw outcomes resolve too late for fee-net arb"). Either way,
+    don't leave the silent skip undocumented.
+
+  Action owed: pick (a) or (b) by operator; if (a), the existing
+  per-strategy harness (`tests/test_per_strategy_parity.py` +
+  `scripts/backtest_h2h_sum_to_1.py`) needs to be extended to handle 3-leg
+  events too, otherwise KXMLSGAME parity will keep skipping on data
+  sparsity even after the scanner ships. Logged here, NOT buried inside
+  the verdict-parity xfail reason where it would silently rot.
+
 - **`ep_pnl_snapshots.py` bypasses the audit-writer hardening.**
   Documented 2026-05-02 as part of Phase 1 (`PgAuditWriter` hardening).
   `ep_pnl_snapshots.py:67-91` writes Postgres directly via its own
