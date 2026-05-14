@@ -3,14 +3,15 @@
 # Run as root on QuantVPS.  Safe to run while live — systemd handles restart sequence.
 #
 # Usage:
-#   ./deploy.sh           # check tree, pull, deps, restart, health-check
-#   ./deploy.sh --force   # skip dirty-tree check (emergency use only)
+#   ./deploy.sh                       # check tree, pull, deps, parity, restart, health
+#   ./deploy.sh --force               # skip dirty-tree check (emergency only)
+#   ./deploy.sh --force-no-parity     # skip Phase 1.1 S.4 parity gate (logged)
+# Flags can be combined: ./deploy.sh --force --force-no-parity
 
 set -euo pipefail
 
 REPO_DIR="/root/EdgePulse"
 VENV="$REPO_DIR/.venv"
-FORCE="${1:-}"
 
 CRITICAL_SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api)
 ALL_SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api
@@ -18,8 +19,25 @@ ALL_SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api
 API_PORT=8502
 INTEL_PORT=9091
 
+# ── Argument parsing ──────────────────────────────────────────────────────────
+FORCE_DIRTY=0
+FORCE_NO_PARITY=0
+for arg in "$@"; do
+    case "$arg" in
+        --force)           FORCE_DIRTY=1 ;;
+        --force-no-parity) FORCE_NO_PARITY=1 ;;
+        -h|--help)
+            sed -n '2,9p' "$0"
+            exit 0 ;;
+        *)
+            echo "ERROR: unknown flag '$arg'." >&2
+            sed -n '2,9p' "$0" >&2
+            exit 2 ;;
+    esac
+done
+
 # ── Dirty-tree check ──────────────────────────────────────────────────────────
-if [[ "$FORCE" != "--force" ]]; then
+if [[ "$FORCE_DIRTY" != "1" ]]; then
     DIRTY=$(git -C "$REPO_DIR" status --porcelain 2>/dev/null || true)
     if [[ -n "$DIRTY" ]]; then
         echo "ERROR: working tree has uncommitted changes — deploy blocked." >&2
@@ -48,6 +66,36 @@ echo "[deploy] wrote $REPO_DIR/.deployed_sha"
 # ── Dependencies ──────────────────────────────────────────────────────────────
 echo "[deploy] syncing Python dependencies..."
 "$VENV/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
+
+# ── Parity gate (Phase 1.1 S.4 Step 4) ────────────────────────────────────────
+# Two-stage check: (a) verdict-doc alignment of the strategy spec module,
+# (b) parity_test.py against Becker's market-microstructure benchmarks.
+# Either failure blocks deploy unless --force-no-parity is set.
+if [[ "$FORCE_NO_PARITY" != "1" ]]; then
+    echo "[deploy] verifying strategy spec alignment..."
+    if ! "$VENV/bin/python" -c "from strategies import verdict_doc_alignment_check; verdict_doc_alignment_check()" 2>&1; then
+        echo "ERROR: strategy spec alignment failed — deploy blocked." >&2
+        echo "  See strategies/specs.py and Migration Plan §4.1 Step 1." >&2
+        echo "  To override in emergency: $0 --force-no-parity" >&2
+        exit 1
+    fi
+
+    echo "[deploy] running parity test (Becker microstructure benchmarks)..."
+    if ! "$VENV/bin/python" -m pytest "$REPO_DIR/tests/parity_test.py" -v --tb=short; then
+        echo "ERROR: parity test failed — deploy blocked." >&2
+        echo "  See tests/parity_test.py and research/becker_benchmarks.json." >&2
+        echo "  Common causes: pipeline price-column inversion (DataPipeline.md §5.1)," >&2
+        echo "  spec drift from verdict doc, or upstream data corruption." >&2
+        echo "  To override in emergency: $0 --force-no-parity" >&2
+        exit 1
+    fi
+    echo "[deploy] parity OK."
+else
+    OVERRIDE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    OVERRIDE_LOG="$REPO_DIR/.parity_override.log"
+    echo "${OVERRIDE_TS} deploy.sh --force-no-parity SHA=${SHA} user=$(whoami) host=$(hostname)" >> "$OVERRIDE_LOG"
+    echo "[deploy] WARNING: --force-no-parity set; bypass logged to $OVERRIDE_LOG" >&2
+fi
 
 # ── Restart ───────────────────────────────────────────────────────────────────
 echo "[deploy] restarting edgepulse.target..."
