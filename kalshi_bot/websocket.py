@@ -325,7 +325,12 @@ class KalshiWebSocket:
         )
 
     def _handle_trade(self, msg: dict):
-        """Process a matched trade — update last traded price."""
+        """Process a matched trade — update last traded price.
+
+        Engineering A.1: also append to the in-memory trade-history deque
+        used by longshot strategies for median-yes-price snapshots over
+        a time window. ep_market_snapshot.append_trade() handles deduping
+        and 26h age cutoff internally; failure is non-fatal."""
         ticker = msg.get("market_ticker") or msg.get("ticker", "")
         data   = msg.get("msg", msg)
         price  = data.get("yes_price") or data.get("price")
@@ -333,3 +338,9 @@ class KalshiWebSocket:
         if ticker and price is not None:
             self.state.update_market(ticker, last_price=int(price))
             log.debug("Trade: %s @ %d¢", ticker, price)
+            # A.1 market snapshot deque feed
+            try:
+                from ep_market_snapshot import append_trade as _a1_append_trade
+                _a1_append_trade(ticker, float(price) / 100.0)
+            except Exception as _a1_exc:  # never block trade processing
+                log.debug("A.1 append_trade failed for %s: %s", ticker, _a1_exc)

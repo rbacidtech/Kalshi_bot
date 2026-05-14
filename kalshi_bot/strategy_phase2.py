@@ -254,7 +254,16 @@ def _scan_longshot_no(
     Filters to `prefixes`, requires yes_price ≤ `yes_max` AND
     `min_hours_to_close ≤ T_to_close ≤ max_hours_to_close`. Emits a NO
     signal at fair_value computed from longshot-bias correction.
+
+    Engineering S.1 maker-first: when no_bid is available, places the
+    NO buy at no_bid (rests as maker). Signal.market_price stays on the
+    YES axis (= 1 - no_bid) per convention.
     """
+    try:
+        from ep_maker_tracker import maker_price_for_no_buy
+    except Exception:  # pragma: no cover — defensive only
+        maker_price_for_no_buy = None  # type: ignore[assignment]
+
     out: list[Signal] = []
     for m in markets:
         ticker = str(m.get("ticker", ""))
@@ -278,13 +287,20 @@ def _scan_longshot_no(
         if net_edge < MIN_EDGE_GROSS * 0.5:
             continue
         contracts = min(max_contracts, max(1, int(edge * 50)))
+        # S.1 maker-first: place at no_bid (rests as maker). When unavailable
+        # falls back to no_price (= 1 - yes_mid). Signal.market_price holds
+        # the YES-equivalent (= 1 - limit_no_price).
+        if maker_price_for_no_buy is not None:
+            yes_market_price = maker_price_for_no_buy(m, yes_mid)
+        else:
+            yes_market_price = yes_mid
         out.append(Signal(
             ticker            = ticker,
-            title             = f"{model_source} NO at yes={yes_mid:.3f} T-{h:.1f}h",
+            title             = f"{model_source} NO at yes={yes_mid:.3f} T-{h:.1f}h limit_no={(1-yes_market_price):.3f}",
             category          = "longshot",
             side              = "no",
             fair_value        = fair_yes,
-            market_price      = yes_mid,
+            market_price      = yes_market_price,
             edge              = edge,
             fee_adjusted_edge = net_edge,
             contracts         = contracts,
@@ -293,7 +309,7 @@ def _scan_longshot_no(
             close_time        = m.get("close_time"),
         ))
     if out:
-        log.info("%s: %d signals", model_source, len(out))
+        log.info("%s: %d signals (maker-priced)", model_source, len(out))
     return out
 
 

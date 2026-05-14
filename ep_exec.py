@@ -24,6 +24,9 @@ from ep_pnl_attribution import (
     record_signal as _a5_record_signal,
     rollover_loop as _a5_pnl_rollover_loop,
 )
+from ep_settlement_audit import weekly_audit_loop as _b3_weekly_audit_loop
+import ep_correlation_caps as _a4_caps              # Engineering A.4 pre-trade caps
+import ep_capital_allocator as _a2_alloc            # Engineering A.2 slot allocator
 import ep_position_store_sqlite as _s2_sqlite  # Engineering S.2 durability backup
 from kalshi_bot.auth     import KalshiAuth, NoAuth
 from kalshi_bot.client   import KalshiClient
@@ -796,6 +799,49 @@ async def _process_signal(
         log.info("Risk rejected %s: %s  signal_id=%.8s", sig.ticker, reason, sig.signal_id)
         return _rejected(reason or "RISK_GATE_KALSHI")
 
+    # ── A.4 correlation caps + A.2 capital allocator (Phase 2 wire-up) ──────
+    # Last gates before order placement. Both can downsize `contracts` or
+    # reject. Failures-during-check default to "allow" to avoid blocking
+    # signals on a transient Redis hiccup; the post-fill accounting below
+    # enforces consistency over time.
+    if sig.asset_class == "kalshi":
+        _price_cents_for_cap = (
+            int(sig.market_price * 100) if sig.side == "yes"
+            else int((1.0 - sig.market_price) * 100)
+        )
+        try:
+            _a4_check = await _a4_caps.check_candidate(
+                bus._r, sig.ticker, contracts, _price_cents_for_cap,
+            )
+            if _a4_check["allowed_contracts"] == 0:
+                return _rejected(_a4_check.get("reason") or "CORRELATION_CAP")
+            if _a4_check["allowed_contracts"] < contracts:
+                log.info(
+                    "A.4 cap downsize: %s %d → %d (binding=%s)",
+                    sig.ticker, contracts, _a4_check["allowed_contracts"],
+                    _a4_check.get("binding"),
+                )
+                contracts = _a4_check["allowed_contracts"]
+        except Exception as _a4_exc:
+            log.debug("A.4 cap check failed (allowing through): %s", _a4_exc)
+
+        try:
+            _a2_check = await _a2_alloc.allocate(
+                bus._r, sig.model_source or "", contracts,
+                _price_cents_for_cap, balance_cents,
+            )
+            if not _a2_check["accepted"]:
+                return _rejected(_a2_check.get("reason") or "ALLOCATOR_REJECT")
+            if _a2_check["contracts_allowed"] < contracts:
+                log.info(
+                    "A.2 allocator downsize: %s %d → %d (%s)",
+                    sig.ticker, contracts, _a2_check["contracts_allowed"],
+                    _a2_check.get("notes", ""),
+                )
+                contracts = _a2_check["contracts_allowed"]
+        except Exception as _a2_exc:
+            log.debug("A.2 allocator check failed (allowing through): %s", _a2_exc)
+
     # ── Pre-write pending position (crash protection) ────────────────────────
     # Write before executing so a crash between execute() and positions.open()
     # cannot create a live order with no Redis record.  On failure we delete;
@@ -1483,6 +1529,22 @@ async def _signal_consumer(
                     await positions.update_fields(report.ticker, {"exec_id": report.exec_id})
                 except Exception:
                     pass
+                # A.4 + A.2 post-fill accounting — increment cap counters + slot reservations
+                # so subsequent allocate/check_candidate decisions reflect the new exposure.
+                try:
+                    _filled_price_cents = (
+                        int(report.fill_price * 100) if report.side == "yes"
+                        else int((1.0 - report.fill_price) * 100)
+                    )
+                    await _a4_caps.record_fill(
+                        bus._r, report.ticker, report.contracts, _filled_price_cents,
+                    )
+                    await _a2_alloc.reserve_slot(
+                        bus._r, sig.model_source or "",
+                        report.contracts * _filled_price_cents,
+                    )
+                except Exception as _post_fill_exc:
+                    log.debug("A.4/A.2 post-fill accounting failed: %s", _post_fill_exc)
             await bus.publish_execution(report)
         except Exception:
             log.exception("Unhandled error processing %s", sig.ticker)
@@ -4615,6 +4677,19 @@ async def exec_main() -> None:
     except Exception as _s2_init_exc:
         log.warning("S.2 SQLite ensure_schema failed (non-fatal): %s", _s2_init_exc)
 
+    # Engineering B.1 — ensure alerting SQLite schema. Existing telegram.send_alert
+    # call sites are NOT yet replaced with ep_alerting.emit() (deferred to avoid
+    # regressing 6+ message-format sites). When ready, the pattern is:
+    #   from ep_alerting import emit, Severity
+    #   await emit(bus._r, Severity.ERROR, alert_type, msg, metadata,
+    #              push_fn=telegram.send_alert)
+    try:
+        from ep_alerting import ensure_schema as _b1_ensure_schema
+        _b1_ensure_schema()
+        log.info("B.1 alerting SQLite ready")
+    except Exception as _b1_init_exc:
+        log.warning("B.1 alerting ensure_schema failed (non-fatal): %s", _b1_init_exc)
+
     # ── Auth + clients ────────────────────────────────────────────────────────
     auth   = NoAuth() if (cfg.PAPER_TRADE and not cfg.API_KEY_ID) else \
              KalshiAuth(api_key_id=cfg.API_KEY_ID, private_key_path=cfg.PRIVATE_KEY_PATH)
@@ -4793,6 +4868,7 @@ async def exec_main() -> None:
             kelly_calib_loop(bus),
             _divergence_monitor_loop(bus, positions),
             _a5_pnl_rollover_loop(bus),   # Engineering A.5 — daily UTC-midnight strategy P&L rollover
+            _b3_weekly_audit_loop(bus._r),  # Engineering B.3 — Sunday 03:00 UTC settlement audit
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         log.info("Exec loop cancelled.")
