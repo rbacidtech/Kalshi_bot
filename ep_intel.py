@@ -1611,18 +1611,67 @@ async def intel_main() -> None:
                 await bus.set_balance(balance_cents, state.mode, _portfolio_value_cents)
                 metrics.update_balance(balance_cents)
 
-            # Daily bankroll anchor: stable denominator for per-market risk cap so
-            # top-ups can't ratchet on intra-day balance changes. SETNX so the
-            # first successful fetch of the UTC day wins. Gated on a real Kalshi
-            # fetch to avoid anchoring on the $1k paper fallback or a stale
-            # _last_balance_cents after a failed first-cycle fetch.
-            if _fresh_balance_fetched and balance_cents > 0:
+            # Daily bankroll anchor: stable denominator for per-market risk cap.
+            # Phase 1.2 S.2 redesign (Migration Plan §4.2):
+            #   S.2.1 — use TOTAL bankroll (cash + portfolio_value), not cash-only,
+            #           so a UTC-day-rollover that catches positions mid-settlement
+            #           doesn't underestimate real bankroll.
+            #   S.2.2 — rolling-max over past 7 days, so a transient cash drain
+            #           (e.g. 2026-05-04 lock-in at $0.15 cash) can't freeze the cap.
+            #           Per EdgePulse_Operating_S2_PositionState.md §10.
+            #   S.2.3 — low-anchor health check; warns + ep:health flag when the
+            #           per-market cap falls below $1.
+            # SETNX semantics preserved: first writer of UTC day wins.
+            if _fresh_balance_fetched and balance_cents >= 0:
                 try:
-                    _anchor_key = f"ep:bankroll_anchor:{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-                    if await bus._r.setnx(_anchor_key, balance_cents):
-                        await bus._r.expire(_anchor_key, 172_800)   # 48h cleanup
-                        log.info("Bankroll anchor set for %s: $%.2f",
-                                 _anchor_key.rsplit(":", 1)[-1], balance_cents / 100)
+                    _now_utc = datetime.now(timezone.utc)
+                    _today_total_bankroll = balance_cents + _portfolio_value_cents
+                    _anchor_value = _today_total_bankroll
+                    for _i in range(1, 8):
+                        _past_date = (_now_utc - timedelta(days=_i)).strftime("%Y%m%d")
+                        try:
+                            _past_raw = await bus._r.get(f"ep:bankroll_anchor:{_past_date}")
+                            if _past_raw:
+                                _anchor_value = max(_anchor_value, int(_past_raw))
+                        except Exception:
+                            continue
+                    _anchor_key = f"ep:bankroll_anchor:{_now_utc.strftime('%Y%m%d')}"
+                    if await bus._r.setnx(_anchor_key, _anchor_value):
+                        await bus._r.expire(_anchor_key, 8 * 86_400)   # 8d covers 7d rolling window
+                        log.info(
+                            "Bankroll anchor set for %s: $%.2f  (today_total=$%.2f, 7d-rolling-max=$%.2f)",
+                            _anchor_key.rsplit(":", 1)[-1], _anchor_value / 100,
+                            _today_total_bankroll / 100, _anchor_value / 100,
+                        )
+                    # S.2.3 — low-anchor health check (runs every cycle, regardless of SETNX result).
+                    try:
+                        _mlpm_raw = await bus._r.hget("ep:config", "override_max_loss_per_market_pct")
+                        _mlpm = float(_mlpm_raw) if _mlpm_raw else 0.20
+                    except (ValueError, TypeError):
+                        _mlpm = 0.20
+                    _eff_anchor_raw = await bus._r.get(_anchor_key)
+                    _eff_anchor = int(_eff_anchor_raw) if _eff_anchor_raw else _anchor_value
+                    _cap_cents = _eff_anchor * _mlpm
+                    if _cap_cents < 100:   # less than $1 per market
+                        log.warning(
+                            "LOW BANKROLL ANCHOR: anchor=$%.2f × max_loss_per_market_pct=%.0f%% "
+                            "= cap=$%.4f, below $1 threshold. Bot will reject most signals as "
+                            "MARKET_LIMIT until anchor recovers. Operator override: "
+                            "redis-cli -s /run/redis/redis.sock set %s <cents>",
+                            _eff_anchor / 100, _mlpm * 100, _cap_cents / 100, _anchor_key,
+                        )
+                        try:
+                            await bus._r.hset(
+                                "ep:health", "bankroll_anchor_low",
+                                f"{_now_utc.isoformat()}|anchor_cents={_eff_anchor}|cap_cents={int(_cap_cents)}",
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await bus._r.hdel("ep:health", "bankroll_anchor_low")
+                        except Exception:
+                            pass
                 except Exception as _anchor_exc:
                     log.warning("Bankroll anchor write failed: %s", _anchor_exc)
 
