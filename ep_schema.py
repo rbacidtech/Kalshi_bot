@@ -194,6 +194,13 @@ class ExecutionReport:
     order_id:    str   = ""
     mode:        str   = "paper"   # "paper" | "live"
 
+    # ── Slippage attribution (Phase 1.4 S.1.1) ────────────────────────────────
+    # The signal's quoted market_price at the time the signal was emitted, used
+    # by ep_pg_audit.py to compute the side-aware slippage_cents column on
+    # INSERT. 0.0 = unset (paths that don't carry signal context; rejects).
+    # The slippage column on executions is NULLed when this is unset.
+    market_price_at_signal: float = 0.0
+
     # ── Cost accounting ───────────────────────────────────────────────────────
     cost_cents:    int   = 0     # fill_price * contracts * 100
     fee_cents:     int   = 0     # estimated Kalshi fee on this trade

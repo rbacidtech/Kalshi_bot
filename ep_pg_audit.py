@@ -235,6 +235,37 @@ class PgAuditWriter:
                 records,
             )
 
+    @staticmethod
+    def _compute_slippage_cents(r: Dict) -> Optional[int]:
+        """Phase 1.4 S.1.1 — side-aware adverse slippage in cents.
+
+        Positive = adverse (paid more / received less than quoted at signal time).
+        Negative = favorable. Returns None when not computable: non-filled,
+        missing market_price_at_signal (paper-mode or pre-migration code paths),
+        or unknown side.
+
+        Formula:
+            YES: (fill_price - market_price_at_signal) * 100 * contracts
+            NO:  (market_price_at_signal - fill_price) * 100 * contracts
+        """
+        if r.get("status") != "filled":
+            return None
+        fill = r.get("fill_price")
+        mkt = r.get("market_price_at_signal")
+        if fill is None or mkt is None or float(mkt) == 0.0:
+            return None
+        contracts = int(r.get("contracts") or 0)
+        if contracts <= 0:
+            return None
+        side = (r.get("side") or "").lower()
+        if side == "yes":
+            per_contract = (float(fill) - float(mkt)) * 100
+        elif side == "no":
+            per_contract = (float(mkt) - float(fill)) * 100
+        else:
+            return None
+        return int(round(per_contract * contracts))
+
     async def _insert_executions(self, rows: List[Dict]) -> None:
         records = []
         for r in rows:
@@ -258,6 +289,7 @@ class PgAuditWriter:
                 json.dumps(r),
                 r.get("predicted_edge"),       # added 2026-04-29 (entry-only)
                 r.get("realized_pnl_cents"),   # added 2026-04-29 (exit-only)
+                self._compute_slippage_cents(r),   # added 2026-05-14 (Phase 1.4 S.1.1)
             ))
         async with self._pool.acquire() as conn:
             await conn.executemany(
@@ -266,8 +298,8 @@ class PgAuditWriter:
                     (exec_id, signal_id, reported_at, status, reject_reason,
                      ticker, side, asset_class, contracts, fill_price,
                      fee_cents, cost_cents, edge_captured, order_id, mode, payload,
-                     predicted_edge, realized_pnl_cents)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                     predicted_edge, realized_pnl_cents, slippage_cents)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
                 ON CONFLICT (exec_id) DO NOTHING
                 """,
                 records,

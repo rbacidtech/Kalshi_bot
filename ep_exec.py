@@ -1105,18 +1105,19 @@ async def _process_signal(
             len(sig.arb_legs), sig.ticker, _arb_cost, sig.signal_id,
         )
         return ExecutionReport(
-            signal_id      = sig.signal_id,
-            ticker         = sig.ticker,
-            asset_class    = sig.asset_class,
-            side           = sig.side,
-            contracts      = len(sig.arb_legs),
-            fill_price     = sig.market_price,
-            status         = "filled",
-            mode           = "paper" if cfg.PAPER_TRADE else "live",
-            cost_cents     = _arb_cost,
-            fee_cents      = _arb_fee,
-            edge_captured  = sig.edge - (_arb_fee / 100),       # deprecated, keep for back-compat
-            predicted_edge = sig.edge - (_arb_fee / 100),       # entry: same value
+            signal_id              = sig.signal_id,
+            ticker                 = sig.ticker,
+            asset_class            = sig.asset_class,
+            side                   = sig.side,
+            contracts              = len(sig.arb_legs),
+            fill_price             = sig.market_price,
+            market_price_at_signal = sig.market_price,
+            status                 = "filled",
+            mode                   = "paper" if cfg.PAPER_TRADE else "live",
+            cost_cents             = _arb_cost,
+            fee_cents              = _arb_fee,
+            edge_captured          = sig.edge - (_arb_fee / 100),       # deprecated, keep for back-compat
+            predicted_edge         = sig.edge - (_arb_fee / 100),       # entry: same value
         )
 
     # ── Confirm position (remove pending flag, store order_id) ───────────────
@@ -1336,18 +1337,19 @@ async def _process_signal(
             log.debug("ARB partner %s already held — skipping second leg", sig.arb_partner)
 
     return ExecutionReport(
-        signal_id      = sig.signal_id,
-        ticker         = sig.ticker,
-        asset_class    = sig.asset_class,
-        side           = sig.side,
-        contracts      = contracts,
-        fill_price     = sig.market_price,
-        status         = "filled",
-        mode           = "paper" if cfg.PAPER_TRADE else "live",
-        cost_cents     = cost_cents,
-        fee_cents      = fee_cents,
-        edge_captured  = sig.edge - (cfg.FEE_CENTS * contracts) / 100,   # deprecated; legacy formula has unit error
-        predicted_edge = sig.edge - (cfg.FEE_CENTS / 100),               # per-contract decimal, fees per-contract
+        signal_id              = sig.signal_id,
+        ticker                 = sig.ticker,
+        asset_class            = sig.asset_class,
+        side                   = sig.side,
+        contracts              = contracts,
+        fill_price             = sig.market_price,
+        market_price_at_signal = sig.market_price,
+        status                 = "filled",
+        mode                   = "paper" if cfg.PAPER_TRADE else "live",
+        cost_cents             = cost_cents,
+        fee_cents              = fee_cents,
+        edge_captured          = sig.edge - (cfg.FEE_CENTS * contracts) / 100,   # deprecated; legacy formula has unit error
+        predicted_edge         = sig.edge - (cfg.FEE_CENTS / 100),               # per-contract decimal, fees per-contract
     )
 
 
