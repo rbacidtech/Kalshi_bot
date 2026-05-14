@@ -7,6 +7,8 @@ between the spec module and the verdict-doc total halt service startup.
 """
 
 from .specs import (
+    BOT_STRATEGIES,
+    BotStrategyImpl,
     VERDICT_DOC_TOTAL_USD,
     VERDICT_STRATEGIES,
     VERDICT_TOLERANCE_USD,
@@ -15,6 +17,8 @@ from .specs import (
 )
 
 __all__ = [
+    "BOT_STRATEGIES",
+    "BotStrategyImpl",
     "VERDICT_DOC_TOTAL_USD",
     "VERDICT_STRATEGIES",
     "VERDICT_TOLERANCE_USD",
