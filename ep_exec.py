@@ -799,6 +799,25 @@ async def _process_signal(
         log.info("Risk rejected %s: %s  signal_id=%.8s", sig.ticker, reason, sig.signal_id)
         return _rejected(reason or "RISK_GATE_KALSHI")
 
+    # ── A.3 hot-path verification for H2H sum-to-1 arb (Engineering A.3) ────
+    # H2H signals get one final integer-only re-verification via the hot-path
+    # detector. If the math no longer holds (e.g., price moved between intel
+    # publish and exec receive), reject with HOT_PATH_STALE rather than place
+    # a stale arb. Skip for non-H2H signals (their windows are 6-12h+, stale
+    # signals would have been caught by other gates).
+    if (sig.model_source or "").lower() == "h2h_sum_to_1_arb" and sig.arb_legs:
+        try:
+            from strategies.hot_path.h2h_fast import detect_arb as _a3_detect
+            _yes_a = sig.arb_legs[0].get("price_cents", 0) if len(sig.arb_legs) >= 1 else 0
+            _yes_b = sig.arb_legs[1].get("price_cents", 0) if len(sig.arb_legs) >= 2 else 0
+            _a3_result = _a3_detect(_yes_a, _yes_b, threshold_cents=98)
+            if _a3_result is None:
+                log.info("H2H hot-path verify: stale (sum=%d+%d=%d >= 98) — rejecting %s",
+                         _yes_a, _yes_b, _yes_a + _yes_b, sig.ticker)
+                return _rejected("HOT_PATH_STALE")
+        except Exception as _a3_exc:
+            log.debug("A.3 hot-path verify failed (allowing through): %s", _a3_exc)
+
     # ── A.4 correlation caps + A.2 capital allocator (Phase 2 wire-up) ──────
     # Last gates before order placement. Both can downsize `contracts` or
     # reject. Failures-during-check default to "allow" to avoid blocking
@@ -1126,11 +1145,22 @@ async def _process_signal(
                     _kalshi_api_failures,
                 )
                 try:
-                    await telegram.send_alert(
-                        f"KALSHI_API_CIRCUIT_OPEN: {_kalshi_api_failures} consecutive "
-                        "executor failures — check Kalshi API health",
-                        level="warning",
-                    )
+                    # Engineering B.1: route via emit() for cooldown + audit.
+                    try:
+                        from ep_alerting import emit as _b1_emit, Severity as _b1_Sev
+                        await _b1_emit(
+                            bus._r, _b1_Sev.ERROR, "kalshi_api_circuit_open",
+                            f"KALSHI_API_CIRCUIT_OPEN: {_kalshi_api_failures} consecutive "
+                            "executor failures — check Kalshi API health",
+                            metadata={"failures": _kalshi_api_failures},
+                            push_fn=lambda m: telegram.send_alert(m, level="warning"),
+                        )
+                    except Exception:
+                        await telegram.send_alert(
+                            f"KALSHI_API_CIRCUIT_OPEN: {_kalshi_api_failures} consecutive "
+                            "executor failures — check Kalshi API health",
+                            level="warning",
+                        )
                 except Exception:
                     pass
     else:
@@ -1225,6 +1255,20 @@ async def _process_signal(
              sig.ticker, sig.side, contracts, sig.market_price, cost_cents / 100, sig.signal_id)
 
     try:
+        # B.1 audit-only: preserve existing telegram send_trade_alert path,
+        # add SQLite audit record for B.4 review. Severity INFO = no push.
+        try:
+            from ep_alerting import emit as _b1_emit_t, Severity as _b1_Sev_t
+            await _b1_emit_t(
+                bus._r, _b1_Sev_t.INFO, f"trade_open_{sig.side}",
+                f"{sig.ticker} {sig.side} ×{contracts} @ {_entry_cents}¢",
+                metadata={"ticker": sig.ticker, "side": sig.side,
+                          "contracts": contracts, "entry_cents": _entry_cents,
+                          "strategy": getattr(sig, "strategy", "") or ""},
+                push_fn=None,   # INFO never pushes
+            )
+        except Exception:
+            pass
         await telegram.send_trade_alert(
             ticker      = sig.ticker,
             side        = sig.side,
@@ -1236,6 +1280,19 @@ async def _process_signal(
         pass
 
     try:
+        try:
+            from ep_alerting import emit as _b1_emit_f, Severity as _b1_Sev_f
+            await _b1_emit_f(
+                bus._r, _b1_Sev_f.INFO, f"fill_{sig.side}",
+                f"FILL {sig.ticker} {sig.side} ×{contracts} @ {int(sig.market_price * 100)}¢",
+                metadata={"ticker": sig.ticker, "side": sig.side,
+                          "contracts": contracts,
+                          "price_cents": int(sig.market_price * 100),
+                          "mode": "paper" if cfg.PAPER_TRADE else "live"},
+                push_fn=None,
+            )
+        except Exception:
+            pass
         await telegram.send_fill(
             ticker      = sig.ticker,
             side        = sig.side,
@@ -1398,20 +1455,31 @@ async def _process_signal(
         else:
             log.debug("ARB partner %s already held — skipping second leg", sig.arb_partner)
 
+    # B.2 plumbing — bid/ask context for slippage decomposition. Defaults
+    # to 0 (skip decomposition) for paths where SignalMessage didn't carry
+    # bid/ask data.
+    _yb_cents = int(round(float(getattr(sig, "yes_bid_dollars", 0) or 0) * 100))
+    _ya_cents = int(round(float(getattr(sig, "yes_ask_dollars", 0) or 0) * 100))
+    _mid_cents = (_yb_cents + _ya_cents) // 2 if (_yb_cents and _ya_cents) else 0
     return ExecutionReport(
-        signal_id              = sig.signal_id,
-        ticker                 = sig.ticker,
-        asset_class            = sig.asset_class,
-        side                   = sig.side,
-        contracts              = contracts,
-        fill_price             = sig.market_price,
-        market_price_at_signal = sig.market_price,
-        status                 = "filled",
-        mode                   = "paper" if cfg.PAPER_TRADE else "live",
-        cost_cents             = cost_cents,
-        fee_cents              = fee_cents,
-        edge_captured          = sig.edge - (cfg.FEE_CENTS * contracts) / 100,   # deprecated; legacy formula has unit error
-        predicted_edge         = sig.edge - (cfg.FEE_CENTS / 100),               # per-contract decimal, fees per-contract
+        signal_id                  = sig.signal_id,
+        ticker                     = sig.ticker,
+        asset_class                = sig.asset_class,
+        side                       = sig.side,
+        contracts                  = contracts,
+        contracts_requested        = sig.contracts,        # B.2: pre-downsize size
+        fill_price                 = sig.market_price,
+        market_price_at_signal     = sig.market_price,
+        yes_bid_at_placement_cents = _yb_cents,
+        yes_ask_at_placement_cents = _ya_cents,
+        mid_at_placement_cents     = _mid_cents,
+        mid_at_fill_cents          = _mid_cents,           # paper-fill = placement mid; live fills can update
+        status                     = "filled",
+        mode                       = "paper" if cfg.PAPER_TRADE else "live",
+        cost_cents                 = cost_cents,
+        fee_cents                  = fee_cents,
+        edge_captured              = sig.edge - (cfg.FEE_CENTS * contracts) / 100,
+        predicted_edge             = sig.edge - (cfg.FEE_CENTS / 100),
     )
 
 
@@ -3065,6 +3133,23 @@ return cnt
                     if cfg.PAPER_TRADE or asset_class == "btc_spot":
                         await bus.publish_execution(exit_report)
 
+                    # B.1 audit on exit (severity NOTICE for visibility on losses)
+                    try:
+                        from ep_alerting import emit as _b1_emit_e, Severity as _b1_Sev_e
+                        _sev_exit = _b1_Sev_e.NOTICE if pnl_cents < 0 else _b1_Sev_e.INFO
+                        await _b1_emit_e(
+                            bus._r, _sev_exit, f"exit_{exit_reason}",
+                            f"EXIT {ticker} {side} ×{contracts} @ {current_cents}¢ "
+                            f"pnl={pnl_cents/100:+.2f}$ ({exit_reason})",
+                            metadata={"ticker": ticker, "side": side,
+                                      "contracts": contracts,
+                                      "current_cents": current_cents,
+                                      "reason": exit_reason,
+                                      "pnl_cents": pnl_cents},
+                            push_fn=None,
+                        )
+                    except Exception:
+                        pass
                     await telegram.send_exit(
                         ticker        = ticker,
                         side          = side,
@@ -3248,6 +3333,22 @@ async def _fill_poll_loop(
                                             ticker, _lf_rpt_exc)
 
                         try:
+                            try:
+                                from ep_alerting import emit as _b1_emit_lf, Severity as _b1_Sev_lf
+                                _sev_lf = _b1_Sev_lf.NOTICE if _lf_pnl < 0 else _b1_Sev_lf.INFO
+                                await _b1_emit_lf(
+                                    bus._r, _sev_lf, f"exit_live_{_lf_reason}",
+                                    f"EXIT(live) {ticker} {_lf_side} ×{_lf_fill} @ {_lf_cents}¢ "
+                                    f"pnl={_lf_pnl/100:+.2f}$ ({_lf_reason})",
+                                    metadata={"ticker": ticker, "side": _lf_side,
+                                              "contracts": _lf_fill,
+                                              "current_cents": _lf_cents,
+                                              "reason": _lf_reason,
+                                              "pnl_cents": _lf_pnl},
+                                    push_fn=None,
+                                )
+                            except Exception:
+                                pass
                             await telegram.send_exit(
                                 ticker        = ticker,
                                 side          = _lf_side,

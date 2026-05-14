@@ -49,6 +49,9 @@ def kalshi_signal_to_message(sig: Signal, node_id: str) -> SignalMessage:
         model_source      = sig.model_source,
         arb_partner       = getattr(sig, "arb_partner", None),
         arb_legs          = getattr(sig, "arb_legs", None),
+        # Engineering B.2 — order-book context for slippage decomposition
+        yes_bid_dollars   = float(getattr(sig, "yes_bid_dollars", 0.0) or 0.0),
+        yes_ask_dollars   = float(getattr(sig, "yes_ask_dollars", 0.0) or 0.0),
     )
 
 
@@ -70,4 +73,7 @@ def message_to_kalshi_signal(msg: SignalMessage) -> Signal:
         meeting           = msg.meeting or "",
         outcome           = msg.outcome or "",
         arb_partner       = msg.arb_partner,
+        # B.2 plumbing — bid/ask copied back for fill-time ExecutionReport population
+        yes_bid_dollars   = float(getattr(msg, "yes_bid_dollars", 0.0) or 0.0),
+        yes_ask_dollars   = float(getattr(msg, "yes_ask_dollars", 0.0) or 0.0),
     )

@@ -175,6 +175,12 @@ class Signal:
     # Set on butterfly and any future N-leg structural arbs.
     arb_legs:          Optional[list] = None
     close_time:        Optional[str] = None
+    # Engineering B.2 — order-book context at signal emission. Used by
+    # ep_pg_audit to compute spread_cost / partial_fill / adverse_move
+    # decomposition columns on the executions table. 0.0 = unset (legacy
+    # path / paper mode); decomposition stays NULL.
+    yes_bid_dollars:   float = 0.0
+    yes_ask_dollars:   float = 0.0
 
     def net_payout(self) -> float:
         """Expected net profit per dollar risked after fees."""
@@ -684,6 +690,9 @@ def scan_h2h_sum_to_1_arb(
                 {"ticker": m2["ticker"], "side": "yes", "price_cents": int(round(m2_limit * 100))},
             ],
             close_time        = m1.get("close_time"),
+            # B.2 plumbing
+            yes_bid_dollars   = float(m1.get("yes_bid_dollars") or 0.0),
+            yes_ask_dollars   = float(m1.get("yes_ask_dollars") or 0.0),
         )
         signals.append(sig)
         log.info(

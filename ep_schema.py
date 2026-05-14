@@ -46,6 +46,12 @@ class SignalMessage:
 
     # ── Pricing ───────────────────────────────────────────────────────────────
     market_price:      float = 0.0   # current mid  (0–1 Kalshi, USD BTC)
+    # Engineering B.2 — order-book context at signal emission. Plumbed by
+    # ep_adapters.kalshi_signal_to_message from Signal.yes_bid_dollars /
+    # yes_ask_dollars. ep_exec copies these into ExecutionReport so
+    # ep_pg_audit can populate B.2 decomposition columns. 0.0 = unset.
+    yes_bid_dollars:   float = 0.0
+    yes_ask_dollars:   float = 0.0
     fair_value:        float = 0.0   # model-derived fair value (same units)
     edge:              float = 0.0   # abs(fair_value - market_price)
     fee_adjusted_edge: float = 0.0   # edge after estimated exchange fees

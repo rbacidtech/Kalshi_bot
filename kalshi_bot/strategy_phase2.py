@@ -307,6 +307,9 @@ def _scan_longshot_no(
             confidence        = confidence,
             model_source      = model_source,
             close_time        = m.get("close_time"),
+            # B.2 plumbing — order-book context for slippage decomposition
+            yes_bid_dollars   = float(m.get("yes_bid_dollars") or 0.0),
+            yes_ask_dollars   = float(m.get("yes_ask_dollars") or 0.0),
         ))
     if out:
         log.info("%s: %d signals (maker-priced)", model_source, len(out))
