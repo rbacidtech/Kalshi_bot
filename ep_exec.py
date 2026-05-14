@@ -1022,7 +1022,18 @@ async def _process_signal(
             except Exception:
                 pass
             try:
-                await telegram.send_alert(f"[CRITICAL] {_alert_msg}", level="critical")
+                # Engineering B.1: route critical alerts through emit() for cooldown + SQLite audit.
+                # Falls back to direct telegram if alerting module fails (defensive).
+                try:
+                    from ep_alerting import emit as _b1_emit, Severity as _b1_Severity
+                    await _b1_emit(
+                        bus._r, _b1_Severity.CRITICAL, "arb_rollback_failed",
+                        f"[CRITICAL] {_alert_msg}",
+                        metadata={"signal_id": sig.signal_id, "ticker": sig.ticker},
+                        push_fn=lambda m: telegram.send_alert(m, level="critical"),
+                    )
+                except Exception:
+                    await telegram.send_alert(f"[CRITICAL] {_alert_msg}", level="critical")
             except Exception:
                 pass
         except RuntimeError as _arb_exc:

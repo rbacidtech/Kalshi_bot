@@ -266,10 +266,39 @@ class PgAuditWriter:
             return None
         return int(round(per_contract * contracts))
 
+    @staticmethod
+    def _compute_decomp_components(r: Dict) -> tuple:
+        """Engineering B.2 — compute 3 of 4 slippage components.
+        cancel_replace remains NULL until order lifecycle logging lands.
+        Returns (spread_cost_cents, adverse_move_cents, partial_fill_cents).
+        """
+        try:
+            from ep_slippage_decomposition import decompose_fill_slippage
+        except Exception:
+            return (None, None, None)
+        if r.get("status") != "filled":
+            return (None, None, None)
+        out = decompose_fill_slippage(
+            side                       = (r.get("side") or "").lower(),
+            contracts_requested        = int(r.get("contracts_requested") or r.get("contracts") or 0),
+            contracts_filled           = int(r.get("contracts") or 0),
+            fill_price_cents           = int(round(float(r.get("fill_price") or 0) * 100)),
+            yes_bid_at_placement_cents = int(r.get("yes_bid_at_placement_cents") or 0),
+            yes_ask_at_placement_cents = int(r.get("yes_ask_at_placement_cents") or 0),
+            mid_at_placement_cents     = int(r.get("mid_at_placement_cents") or 0),
+            mid_at_fill_cents          = int(r.get("mid_at_fill_cents") or 0),
+        )
+        return (
+            out.get("spread_cost_cents"),
+            out.get("adverse_move_cents"),
+            out.get("partial_fill_cents"),
+        )
+
     async def _insert_executions(self, rows: List[Dict]) -> None:
         records = []
         for r in rows:
             ts_us = r.get("ts_us") or 0
+            _spread, _adverse, _partial = self._compute_decomp_components(r)
             records.append((
                 r.get("exec_id"),
                 r.get("signal_id") or None,
@@ -287,9 +316,12 @@ class PgAuditWriter:
                 r.get("order_id"),
                 r.get("mode"),
                 json.dumps(r),
-                r.get("predicted_edge"),       # added 2026-04-29 (entry-only)
-                r.get("realized_pnl_cents"),   # added 2026-04-29 (exit-only)
-                self._compute_slippage_cents(r),   # added 2026-05-14 (Phase 1.4 S.1.1)
+                r.get("predicted_edge"),
+                r.get("realized_pnl_cents"),
+                self._compute_slippage_cents(r),
+                _spread,     # B.2 spread_cost_cents
+                _adverse,    # B.2 adverse_move_cents
+                _partial,    # B.2 partial_fill_cents
             ))
         async with self._pool.acquire() as conn:
             await conn.executemany(
@@ -298,8 +330,9 @@ class PgAuditWriter:
                     (exec_id, signal_id, reported_at, status, reject_reason,
                      ticker, side, asset_class, contracts, fill_price,
                      fee_cents, cost_cents, edge_captured, order_id, mode, payload,
-                     predicted_edge, realized_pnl_cents, slippage_cents)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                     predicted_edge, realized_pnl_cents, slippage_cents,
+                     spread_cost_cents, adverse_move_cents, partial_fill_cents)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
                 ON CONFLICT (exec_id) DO NOTHING
                 """,
                 records,

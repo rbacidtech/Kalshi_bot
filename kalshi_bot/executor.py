@@ -228,20 +228,44 @@ class Executor:
         return True
 
     def _live_entry(self, signal: Signal) -> str:
-        """Place a live limit order. Returns the Kalshi order_id on success, "" on failure."""
+        """Place a live limit order. Returns the Kalshi order_id on success, "" on failure.
+
+        Engineering S.1 per-strategy time-in-force (TIF) policy:
+          - H2H sum-to-1 arb         → 5s expiry  (orderbook lifetime ~50-200ms)
+          - Other arbs / monotonicity → 120s     (2-min — mispricings are transient)
+          - Behavioral longshots      → 1800s    (30-min — bias persists over window)
+          - Everything else           → 600s     (default; matches existing TTL)
+        Kalshi's order endpoint accepts `expiration_ts` (unix seconds). When
+        unset, orders are GTC. Per-strategy expiry enforces S.1 spec without
+        relying on cancel-replace polling.
+        """
         market_price = signal.market_price
         if not (0.01 <= market_price <= 0.99):
             log.error("Price %s out of valid range [0.01, 0.99] — refusing order for %s", market_price, signal.ticker)
             return ""
         price_cents = int(market_price * 100) if signal.side == "yes" else int((1.0 - market_price) * 100)
         price_key   = "yes_price" if signal.side == "yes" else "no_price"
+        # S.1 TIF policy lookup by model_source. Defaults intentionally
+        # conservative; operator override via Kalshi-server-side configuration
+        # is not exposed.
+        import time as _time
+        _ms = (signal.model_source or "").lower()
+        if _ms == "h2h_sum_to_1_arb":
+            _expiry_s = 5
+        elif _ms.endswith("_arb") or "monot" in _ms:
+            _expiry_s = 120
+        elif "longshot" in _ms or "mention" in _ms:
+            _expiry_s = 1800
+        else:
+            _expiry_s = 600
         payload = {
-            "action":  "buy",
-            "type":    "limit",
-            "ticker":  signal.ticker,
-            "side":    signal.side,
-            "count":   signal.contracts,
-            price_key: price_cents,
+            "action":         "buy",
+            "type":           "limit",
+            "ticker":         signal.ticker,
+            "side":           signal.side,
+            "count":          signal.contracts,
+            "expiration_ts":  int(_time.time()) + _expiry_s,
+            price_key:        price_cents,
         }
         try:
             resp     = self.client.post("/portfolio/orders", payload)

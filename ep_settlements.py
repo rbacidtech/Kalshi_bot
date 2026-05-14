@@ -564,6 +564,18 @@ async def reconcile_one_settlement(
     except Exception as _a5_exc:
         log.debug("settle: A.5 record_settlement failed for %s: %s", ticker, _a5_exc)
 
+    # ── 1c. Engineering A.2 — capital allocator slot release ──────────────────
+    # Decrement ep:allocator:slots_open + tier1_open when a position closes.
+    # Idempotency: release_slot floors counters at 0, so double-calls are safe.
+    # Model_source resolution mirrors A.5 above so behavior is consistent.
+    try:
+        from ep_capital_allocator import release_slot as _a2_release_slot
+        _a2_strat = (pos_snapshot or {}).get("strategy") or ""
+        if _a2_strat and _a2_strat != "settlement":
+            await _a2_release_slot(bus_redis, _a2_strat)
+    except Exception as _a2_exc:
+        log.debug("settle: A.2 release_slot failed for %s: %s", ticker, _a2_exc)
+
     # ── 2. trades.csv synthetic exit row (live-mode only) ────────────────────
     if executor is not None:
         try:

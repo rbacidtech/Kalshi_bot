@@ -1,0 +1,17 @@
+[Unit]
+Description=EdgePulse Cost Accounting — monthly attribution snapshot (Engineering B.5)
+PartOf=edgepulse.target
+After=edgepulse-redis.service postgresql.service
+Wants=edgepulse-redis.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/EdgePulse
+EnvironmentFile=/etc/edgepulse/edgepulse.env
+Environment=PYTHONUNBUFFERED=1
+
+# Invoked monthly by edgepulse-cost-accounting.timer. Computes per-strategy
+# activity-based cost allocation for the prior month + writes attribution rows.
+# Idempotent — re-running for the same month upserts.
+ExecStart=/root/EdgePulse/.venv/bin/python3 -c "import asyncio, sys; sys.path.insert(0, '/root/EdgePulse'); from ep_cost_accounting import ensure_schema, payback_status, annual_kill_or_continue; from datetime import date; ensure_schema(); ps = payback_status(date.today()); print(f'Payback: {ps}'); akoc = annual_kill_or_continue(); print(f'Annual review: {akoc}')"

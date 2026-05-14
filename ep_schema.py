@@ -201,6 +201,16 @@ class ExecutionReport:
     # The slippage column on executions is NULLed when this is unset.
     market_price_at_signal: float = 0.0
 
+    # ── Slippage decomposition (Engineering B.2) ──────────────────────────────
+    # Order-book context at placement + fill — enables the 4-component
+    # decomposition computed by ep_pg_audit. All values in cents (0-100).
+    # 0 = unset (legacy paths / paper mode); decomposition columns NULL.
+    yes_bid_at_placement_cents: int = 0
+    yes_ask_at_placement_cents: int = 0
+    mid_at_placement_cents:     int = 0
+    mid_at_fill_cents:          int = 0
+    contracts_requested:        int = 0   # for partial_fill component
+
     # ── Cost accounting ───────────────────────────────────────────────────────
     cost_cents:    int   = 0     # fill_price * contracts * 100
     fee_cents:     int   = 0     # estimated Kalshi fee on this trade
