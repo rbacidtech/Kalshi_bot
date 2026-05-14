@@ -15,6 +15,7 @@ _Updated 2026-04-24 05:45 UTC — third-round full audit complete. 5 CRITICALs p
 _Updated 2026-04-24 06:00 UTC — third-round HIGH sweep: 9 of 13 patched (commits 9ce8c92, 2c7d60f, d3caea5, ce2664f, 894d93c, 7c89d9e). 3 false positives (H2 strike filter direction, H6 PEL drain boundary, H10 report-month heuristic). 1 deferred (H3 weather double-flip — needs domain evidence)._
 _Updated 2026-04-24 06:10 UTC — third-round MEDIUM sweep: 7 of 14 patched (commits 3deb7f8, 2354759). 7 deferred (scanner capability additions, calibration choices, stale-response windows)._
 _Updated 2026-04-24 06:15 UTC — third-round LOW sweep: 5 items patched (commit 07ed840). Non-correctness hygiene: 401 hint log, SR3 zombie removal, fed_sentiment regex, schema doc clarifications._
+_Updated 2026-05-14 — Migration Plan Phase 0 actions: `edgepulse-advisor`, `edgepulse-llm.service`+`.timer`, and `edgepulse-arb` permanently disabled (Option B for advisor, retire for arb per `EdgePulse_Migration_Plan_2026.md` §2.B/§2.C). HALT_TRADING restored to 1 (had been overwritten to 0 by `edgepulse-llm.timer` between 05-04 stop and today). Phase 1.1 S.4 begins next._
 
 ## Silently broken — needs fix
 
