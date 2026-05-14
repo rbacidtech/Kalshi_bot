@@ -4062,6 +4062,49 @@ async def _business_health_loop(bus: RedisBus, interval: int = 300) -> None:
                     if not (0 <= ec <= 100):
                         issues.append(f"{ticker}: INVARIANT FAIL entry_cents={ec}")
 
+            # ── Daily P&L loss soft-halt trigger (Phase 1.3 S.3.1) ─────────────
+            # 24h realized P&L < -X% of bankroll anchor → set HALT_TRADING.
+            # Default threshold X = 5.0; override via ep:config:override_daily_pnl_halt_pct.
+            # Same HALT_TRADING flag the drawdown breaker uses; soft halt — operator un-halts.
+            try:
+                _dpnl_pct_raw = await bus._r.hget("ep:config", "override_daily_pnl_halt_pct")
+                _dpnl_threshold = abs(float(_dpnl_pct_raw)) if _dpnl_pct_raw else 5.0
+            except (ValueError, TypeError):
+                _dpnl_threshold = 5.0
+
+            try:
+                _perf_raw = await bus._r.get("ep:performance:1")
+                if _perf_raw:
+                    _perf_1d = json.loads(_perf_raw)
+                    _day_pnl = int(float(_perf_1d.get("total_pnl_cents", 0) or 0))
+                    _anchor_key = f"ep:bankroll_anchor:{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                    _anchor_raw = await bus._r.get(_anchor_key)
+                    _bankroll_cents = int(_anchor_raw) if _anchor_raw else 0
+                    if _bankroll_cents > 0 and _day_pnl < 0:
+                        _loss_pct = abs(_day_pnl) / _bankroll_cents * 100
+                        if _loss_pct >= _dpnl_threshold:
+                            _halt_current = await bus._r.hget("ep:config", "HALT_TRADING")
+                            if _halt_current not in (b"1", "1"):
+                                await bus._r.hset("ep:config", "HALT_TRADING", "1")
+                                await bus._r.hset("ep:halt", mapping={
+                                    "reason":          "daily_pnl_loss",
+                                    "tripped_at_us":   str(int(time.time() * 1_000_000)),
+                                    "daily_pnl_cents": str(_day_pnl),
+                                    "bankroll_cents":  str(_bankroll_cents),
+                                    "loss_pct":        f"{_loss_pct:.2f}",
+                                    "threshold_pct":   f"{_dpnl_threshold:.2f}",
+                                })
+                                log.warning(
+                                    "Daily P&L halt: 24h P&L %+.2f$ = %.2f%% of $%.2f bankroll, "
+                                    "exceeds %.2f%% threshold. HALT_TRADING set; operator must clear.",
+                                    _day_pnl / 100, _loss_pct, _bankroll_cents / 100, _dpnl_threshold,
+                                )
+                                issues.append(
+                                    f"DAILY_PNL_HALT: 24h loss {_loss_pct:.2f}% >= {_dpnl_threshold:.2f}%"
+                                )
+            except Exception as _dpnl_exc:
+                log.debug("Daily P&L halt check failed: %s", _dpnl_exc)
+
             # Merge into /health state without overwriting infra keys
             existing = metrics._health.copy()
             existing["business_issues"] = issues
@@ -4114,7 +4157,7 @@ async def _performance_publisher_loop(bus: RedisBus, interval: int = 3600) -> No
     log.info("Performance publisher started (interval=%ds)", interval)
     while True:
         try:
-            for d in (7, 30, 90):
+            for d in (1, 7, 30, 90):
                 perf = await get_performance_summary(days=d)
                 if perf["total_trades"] > 0:
                     await bus._r.set(f"ep:performance:{d}", json.dumps(perf), ex=90000)
