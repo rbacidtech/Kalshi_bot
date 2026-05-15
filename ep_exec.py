@@ -663,6 +663,14 @@ async def _process_signal(
         for _p in _all_pos.values():
             if _p.get("arb_id"):
                 continue
+            if _p.get("user_bet"):
+                # Operator's personal bets — not bot-managed (per
+                # _BOT_TRADED_PREFIXES auto-mark + operator manual marks
+                # in Redis). They must not consume the bot's own
+                # LONG_LIMIT / SHORT_LIMIT exposure budget, otherwise the
+                # bot freezes itself on positions it has explicitly
+                # disclaimed (the 2026-05-15 freeze incident).
+                continue
             _t_c = _p.get("contracts_filled") or _p.get("contracts", 1)
             _t_e = _p.get("entry_cents", 0)
             if _p.get("side") == "no":
