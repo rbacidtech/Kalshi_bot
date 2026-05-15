@@ -169,6 +169,43 @@ _BOT_TRADED_PREFIXES = (
 )
 
 
+def _compute_side_exposures(all_pos: dict) -> tuple[int, int]:
+    """Cost-basis-cents sum of bot-managed long vs short exposure.
+
+    Iterates the executor's full position view and accumulates per-side
+    cost basis (entry_cents × contracts) in CENT units. The two rows
+    that are explicitly excluded:
+
+      * ``arb_id``-flagged rows — atomic arb legs; sized as a unit, not
+        as independent positions.
+      * ``user_bet``-flagged rows — operator's personal bets, either
+        auto-marked because the ticker prefix is outside
+        ``_BOT_TRADED_PREFIXES`` (see ``_sync_positions_with_kalshi``)
+        or set manually in Redis. These positions are out-of-scope for
+        the bot's own exposure budget; if they were included, the bot
+        would freeze itself on positions it has explicitly disclaimed
+        (the 2026-05-15 incident).
+
+    Returns (long_exp_cents, short_exp_cents). YES-side positions accrue
+    to long; NO-side positions accrue to short with cost basis
+    ``100 - entry_cents`` per contract (entry_cents is always the YES
+    price; see SCHEMA.md).
+    """
+    long_exp = short_exp = 0
+    for p in all_pos.values():
+        if p.get("arb_id"):
+            continue
+        if p.get("user_bet"):
+            continue
+        t_c = p.get("contracts_filled") or p.get("contracts", 1)
+        t_e = p.get("entry_cents", 0)
+        if p.get("side") == "no":
+            short_exp += (100 - t_e) * t_c
+        else:
+            long_exp += t_e * t_c
+    return long_exp, short_exp
+
+
 def _tiered_take_profit(base_tp: int, hours_remaining: float) -> int:
     """
     Scale take-profit threshold down for shorter-dated positions so they
@@ -659,25 +696,7 @@ async def _process_signal(
         _sig_cost = ((100 - int(sig.market_price * 100)) if sig.side == "no"
                      else int(sig.market_price * 100)) * contracts
 
-        _long_exp = _short_exp = 0
-        for _p in _all_pos.values():
-            if _p.get("arb_id"):
-                continue
-            if _p.get("user_bet"):
-                # Operator's personal bets — not bot-managed (per
-                # _BOT_TRADED_PREFIXES auto-mark + operator manual marks
-                # in Redis). They must not consume the bot's own
-                # LONG_LIMIT / SHORT_LIMIT exposure budget, otherwise the
-                # bot freezes itself on positions it has explicitly
-                # disclaimed (the 2026-05-15 freeze incident).
-                continue
-            _t_c = _p.get("contracts_filled") or _p.get("contracts", 1)
-            _t_e = _p.get("entry_cents", 0)
-            if _p.get("side") == "no":
-                _short_exp += (100 - _t_e) * _t_c
-            else:
-                _long_exp += _t_e * _t_c
-
+        _long_exp, _short_exp = _compute_side_exposures(_all_pos)
         _side_exp = _long_exp if sig.side == "yes" else _short_exp
         _side_cap = balance_cents * (_MAX_LONG_PCT if sig.side == "yes" else _MAX_SHORT_PCT)
         _cap_name = "LONG_LIMIT" if sig.side == "yes" else "SHORT_LIMIT"
