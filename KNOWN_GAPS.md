@@ -16,6 +16,7 @@ _Updated 2026-04-24 06:00 UTC — third-round HIGH sweep: 9 of 13 patched (commi
 _Updated 2026-04-24 06:10 UTC — third-round MEDIUM sweep: 7 of 14 patched (commits 3deb7f8, 2354759). 7 deferred (scanner capability additions, calibration choices, stale-response windows)._
 _Updated 2026-04-24 06:15 UTC — third-round LOW sweep: 5 items patched (commit 07ed840). Non-correctness hygiene: 401 hint log, SR3 zombie removal, fed_sentiment regex, schema doc clarifications._
 _Updated 2026-05-14 — Migration Plan Phase 0 actions: `edgepulse-advisor`, `edgepulse-llm.service`+`.timer`, and `edgepulse-arb` permanently disabled (Option B for advisor, retire for arb per `EdgePulse_Migration_Plan_2026.md` §2.B/§2.C). HALT_TRADING restored to 1 (had been overwritten to 0 by `edgepulse-llm.timer` between 05-04 stop and today). Phase 1.1 S.4 begins next._
+_Updated 2026-05-21 — WS cold-start subscribe race (kalshi_bot/websocket.py:_on_open + ep_intel.py:1429). 20-min "connected but no subscribes sent" window on each fresh boot. Diagnosis + chosen fix (Option A: subscribe at connect with prefix-filtered list) recorded in DECISIONS.md. Not urgent — reboots are rare; self-recovers via market-discovery cycle. See DECISIONS.md for design + open implementation. Also: re-aligned services to engineering plan (advisor + llm.timer + arb stop+disabled — they were re-enabled by some intermediate session); anchor bumped to $159.00 to reflect today's deposit (SETNX-once-per-UTC-day didn't pick it up at morning balance fetch)._
 
 ## Silently broken — needs fix
 
