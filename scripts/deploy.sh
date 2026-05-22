@@ -15,7 +15,7 @@ VENV="$REPO_DIR/.venv"
 
 CRITICAL_SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api)
 ALL_SERVICES=(edgepulse-intel edgepulse-exec edgepulse-api
-              edgepulse-arb edgepulse-econ-release edgepulse-ob-depth)
+              edgepulse-econ-release edgepulse-ob-depth)
 API_PORT=8502
 INTEL_PORT=9091
 
