@@ -2008,7 +2008,18 @@ async def intel_main() -> None:
                 _bias   = await recency_bias_adj(_series, bus)
                 if _bias != 0.0:
                     _sig.fair_value = max(0.01, min(0.99, _sig.fair_value + _bias))
-                    _sig.edge       = _sig.fair_value - _sig.market_price
+                    # Edge sign depends on side. YES is profitable when fair > market
+                    # (underpriced); NO is profitable when market > fair (overpriced).
+                    # Mirrors the ask-adjust branch at ~line 2742.
+                    if _sig.side == "yes":
+                        _sig.edge = _sig.fair_value - _sig.market_price
+                    elif _sig.side == "no":
+                        _sig.edge = _sig.market_price - _sig.fair_value
+                    else:
+                        raise ValueError(
+                            f"recency_bias edge recompute: unsupported side "
+                            f"{_sig.side!r} for {_sig.ticker}"
+                        )
 
             state.set_signals([{
                 "ticker":       s.ticker,       "side":        s.side,
