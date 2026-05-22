@@ -132,6 +132,8 @@ def scan_nfl_prop_yardage_monot(markets: list[dict], max_contracts: int) -> list
     for s in sigs:
         s.model_source = "nfl_prop_yardage_monot"
         s.category = "arb"
+    if sigs:
+        log.info("NFL prop yardage monot: %d signals across %d ladders", len(sigs), len(groups))
     return sigs
 
 
@@ -150,6 +152,8 @@ def scan_crypto_threshold_monot(markets: list[dict], max_contracts: int) -> list
     for s in sigs:
         s.model_source = "crypto_threshold_monot"
         s.category = "arb"
+    if sigs:
+        log.info("Crypto threshold monot: %d signals across %d ladders", len(sigs), len(groups))
     return sigs
 
 
